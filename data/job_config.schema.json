@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GEO Monitor Job Config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target_brand", "industry", "queries"],
+  "properties": {
+    "target_brand": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_aliases": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "industry": {
+      "type": "string",
+      "minLength": 1
+    },
+    "market": {
+      "type": "string",
+      "description": "Optional market or region. Omit it for non-regional brands."
+    },
+    "queries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "additionalProperties": true,
+            "anyOf": [
+              {
+                "required": ["query"]
+              },
+              {
+                "required": ["text"]
+              }
+            ],
+            "properties": {
+              "query_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "query": {
+                "type": "string",
+                "minLength": 1
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1
+              },
+              "persona": {
+                "type": "string"
+              },
+              "stage": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "repeats": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 20
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "web_search_limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8
+    },
+    "start_interval_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0
+    }
+  }
+}

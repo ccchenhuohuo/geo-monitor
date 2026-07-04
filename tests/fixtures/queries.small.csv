@@ -1,0 +1,3 @@
+query_id,query,locale,market,category,tags
+q001,测试 query 1,zh-CN,CN,test,"a,b"
+q002,测试 query 2,zh-CN,CN,test,"b,c"

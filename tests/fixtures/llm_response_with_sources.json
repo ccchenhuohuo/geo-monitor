@@ -1,0 +1,29 @@
+{
+  "id": "resp_test",
+  "object": "response",
+  "output_text": "根据公开资料，TestEntityAlpha 和 TestEntityBeta 经常被提及。",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "根据公开资料，TestEntityAlpha 和 TestEntityBeta 经常被提及。",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "title": "Reference Source",
+              "url": "https://example.com/source-a",
+              "snippet": "Reference source snippet"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 34,
+    "total_tokens": 46
+  }
+}
