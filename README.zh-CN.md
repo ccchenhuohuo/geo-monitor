@@ -1,65 +1,58 @@
 # GEO Brand Monitor
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | 简体中文
 
-GEO Brand Monitor is a lightweight, audit-first GEO analysis engine for sampling
-LLM answers, measuring brand visibility, and generating reproducible local
-reports.
+GEO Brand Monitor 是一个轻量、可审计、CLI-first 的 GEO Analysis Engine，用于采样
+LLM 回答、分析品牌可见性，并生成可复现的本地报告。
 
-It is designed as an engine, CLI, Python package, and agent/tool building block.
-It is **not** a GEO SaaS product, not a scheduler, and not a data warehouse. The
-repository contains reusable engine code only; business queries, brand data, raw
-runs, DuckDB files, and dashboards belong in a user-owned external study
-workspace.
+它的定位是 engine、CLI、Python package，以及可嵌入到 Agent / Skill / Tool
+工作流中的能力模块。它不是 GEO SaaS，不是调度系统，也不是数据仓库。仓库只保存
+可复用的引擎代码；业务 query、品牌数据、raw runs、DuckDB 文件和 dashboard 都应放在
+用户自己的 external study workspace 中。
 
-## Project Status
+## 项目状态
 
-Early engine. The core workflow is usable locally:
+当前核心本地流程已经可用：
 
-- persona fan-out to frozen query manifests;
-- job-based sampling with raw JSONL audit logs;
-- brand/entity extraction and canonicalization;
-- visibility, SOV, recommendation, rank, sentiment, source, and stability CSVs;
-- rebuildable DuckDB analysis cache;
-- static local dashboard;
-- embeddable Python API for Plugin / Skill / Agent workflows.
+- persona fan-out 生成 frozen query manifest；
+- job-based sampling 和 raw JSONL audit log；
+- 品牌 / 实体抽取与 canonicalization；
+- visibility、SOV、recommendation、rank、sentiment、source、stability CSV；
+- 可重建的 DuckDB analysis cache；
+- 本地静态 dashboard；
+- 面向 Plugin / Skill / Agent workflow 的 Python API。
 
-License has not been specified yet.
+当前项目尚未声明 License。
 
-## What It Does
+## 这个项目解决什么问题
 
-GEO Brand Monitor helps answer:
+GEO Brand Monitor 用来回答：
 
-- Does the target brand appear in AI answers?
-- How often does it appear across repeated samples?
-- Which other brands or entities appear with it?
-- Is it merely mentioned, or also recommended, ranked, or described positively?
-- Which queries, personas, and source domains drive the results?
-- Are the samples complete and trustworthy enough to interpret?
+- 目标品牌是否出现在 AI 回答中？
+- 在重复采样中出现频率如何？
+- 哪些其他品牌或实体和它一起出现？
+- 它只是被提及，还是被推荐、排序、正向描述？
+- 哪些 query、persona、source domain 推动了结果？
+- 样本是否完整、质量是否足够可信？
 
-It does **not** claim market share, factual correctness, native app ranking, or
-SEO performance. It measures responses produced by an OpenAI-compatible
-Responses API under a controlled query manifest.
+它不声称衡量市场份额、事实正确性、原生 App 排名或 SEO 效果。它衡量的是在受控 query
+manifest 下，OpenAI-compatible Responses API 返回的回答样本。
 
-## Core Features
+## 核心功能
 
-- **CLI-first workflow**: build, run, analyze, export, query, and dashboard from
-  local commands.
-- **External study workspace**: long-running study data stays outside the
-  project repository.
-- **Persona fan-out**: turn seed prompts into deterministic query variants.
-- **Frozen query manifests**: stable inputs for reproducible repeated runs.
-- **Job workspaces**: each run is an auditable execution bundle.
-- **Raw audit logs**: every attempt is retained as JSONL with `query` and
-  `query_meta`.
-- **Brand extraction**: discover brands/entities from answers without a bundled
-  competitor list.
-- **Metrics and reports**: CSV, Markdown, HTML, and optional PDF outputs.
-- **DuckDB analysis layer**: rebuildable local cache for cross-run analysis.
-- **Static dashboard**: local HTML dashboard without a backend service.
-- **Python API**: structured result object for external agents and workflows.
+- **CLI-first 工作流**：本地完成 build、run、analyze、export、query、dashboard。
+- **External study workspace**：长期监测数据不放进项目仓库。
+- **Persona fan-out**：把 seed prompts 变成 deterministic persona query variants。
+- **Frozen query manifest**：稳定输入，保证重复运行可复现。
+- **Job workspace**：每次运行都是一个可审计的 execution bundle。
+- **Raw audit logs**：每条 attempt 都以 JSONL 保存，并包含 `query` 和 `query_meta`。
+- **Brand extraction**：从回答中发现品牌 / 实体，不依赖内置竞品列表。
+- **Metrics and reports**：输出 CSV、Markdown、HTML 和可选 PDF。
+- **DuckDB analysis layer**：本地可重建的跨 run 分析缓存。
+- **Static dashboard**：无后端服务的本地静态 HTML dashboard。
+- **Python API**：返回结构化结果，方便外部 Agent / workflow 调用。
 
-## Architecture
+## 架构
 
 ```mermaid
 flowchart LR
@@ -89,19 +82,19 @@ flowchart LR
     DuckDB --> API2["Python API / agent tools"]
 ```
 
-## Workspace Model
+## Workspace 模型
 
-Keep the engine, single-run artifacts, and long-running study data separate.
+项目刻意把 engine、单次执行产物、长期 study 数据分开：
 
 ```text
 geo-monitor project
   engine / CLI / package / skill code
-  no business data or long-running study state
+  不保存业务数据或长期 study 状态
 
 job workspace
-  one execution bundle under a runs directory
-  work/query_manifest.csv is temporary runner input
-  raw/, logs/, result/, job_manifest.json are retained audit artifacts
+  runs 目录下的一次执行 bundle
+  work/query_manifest.csv 是临时 runner 输入
+  raw/、logs/、result/、job_manifest.json 是保留的审计产物
 
 study workspace
   seed_prompts.yaml
@@ -111,19 +104,16 @@ study workspace
   dashboard/
 ```
 
-`work/query_manifest.csv` may be deleted after execution. Long-term analysis is
-reconstructed from `raw/attempts.jsonl`, where each new attempt includes the
-actual query text and a `query_meta` snapshot containing dimensions such as
-`seed_id`, `persona`, `intent`, `template_id`, and `variant_id`.
+`work/query_manifest.csv` 可以在运行后删除。长期分析依赖 `raw/attempts.jsonl`，每条新
+attempt 都包含实际发送给模型的 query text，以及 `query_meta` snapshot，例如
+`seed_id`、`persona`、`intent`、`template_id`、`variant_id`。
 
-For real studies, prefer a directory outside the repository. The repository also
-ignores common local study outputs such as `my-geo-study/`, `study/`, and
-`*.duckdb`.
+真实长期 study 建议放在仓库外部目录。仓库 `.gitignore` 也会忽略常见本地 study 输出，
+例如 `my-geo-study/`、`study/`、`*.duckdb`。
 
-## Data Boundary
+## 数据边界
 
-The model receives only user-like query text. Job-level business context is kept
-for analysis, not sent to the model.
+模型只接收用户式 query text。任务级业务上下文只用于本地分析，不发送给模型。
 
 ```mermaid
 flowchart TB
@@ -136,7 +126,7 @@ flowchart TB
     JobManifest -. "not sent to model" .-> Request
 ```
 
-Example live request shape:
+真实请求结构类似：
 
 ```json
 {
@@ -147,12 +137,11 @@ Example live request shape:
 }
 ```
 
-The request does not include `target_brand`, `industry`, `market`, or competitor
-names.
+请求中不会包含 `target_brand`、`industry`、`market` 或 competitor names。
 
-## Quick Start: Local Mock Run
+## 快速开始：本地 Mock Run
 
-This smoke test does not call an external API.
+下面这条 smoke test 不调用外部 API。
 
 ```bash
 python3 -m venv .venv
@@ -187,16 +176,15 @@ geo-monitor db build --runs "$RUNS_DIR" --output "$DB"
 geo-monitor dashboard build --db "$DB" --out "$DASHBOARD"
 ```
 
-Open:
+打开本地 dashboard：
 
 ```text
 /tmp/geo-monitor-study/dashboard/index.html
 ```
 
-## Live API Configuration
+## 真实 API 配置
 
-Copy `.env.example` to `.env` and configure an OpenAI-compatible Responses API
-provider.
+复制 `.env.example` 为 `.env`，填入 OpenAI-compatible Responses API provider 配置。
 
 ```bash
 cp .env.example .env
@@ -213,8 +201,8 @@ RETRY_MAX_ATTEMPTS=3
 CONCURRENCY=1
 ```
 
-Live sampling and live LLM extraction may incur provider costs. Commands that
-can produce live costs require explicit `--confirm-cost`.
+真实采样和真实 LLM extraction 可能产生 provider 成本。会产生 live 成本的命令需要显式
+传入 `--confirm-cost`。
 
 ```bash
 geo-monitor run-job "$JOB_DIR" --confirm-cost
@@ -223,8 +211,7 @@ geo-monitor analyze-job "$JOB_DIR" --confirm-cost
 
 ## Persona Fan-out
 
-Seed prompts describe stable business intents. Fan-out creates deterministic
-query variants by persona.
+Seed prompts 表示稳定的业务意图。Fan-out 会根据 persona 生成 deterministic query variants。
 
 ```yaml
 seeds:
@@ -241,7 +228,7 @@ seeds:
       - convenience_first
 ```
 
-Generate a frozen external manifest:
+生成 external frozen manifest：
 
 ```bash
 geo-monitor fanout \
@@ -249,8 +236,7 @@ geo-monitor fanout \
   --output ./study/manifests/query_manifest.v1.csv
 ```
 
-Fan-out output is byte-stable for the same input and version. It uses fixed CSV
-columns:
+相同输入和版本下，fan-out 输出 byte-stable。固定 CSV 字段如下：
 
 ```text
 query_id, variant_id, seed_id, seed_query, category, intent, persona,
@@ -258,9 +244,9 @@ template_id, query, language, generation_method, fanout_version,
 manifest_version, locked_at
 ```
 
-## Outputs
+## 输出产物
 
-Each job workspace contains:
+每个 job workspace 结构如下：
 
 ```text
 runs/{job_id}/
@@ -294,10 +280,9 @@ runs/{job_id}/
     report.html
 ```
 
-`work/` is temporary. `raw/`, `logs/`, `result/`, and `job_manifest.json` are
-retained for audit.
+`work/` 是临时目录。`raw/`、`logs/`、`result/` 和 `job_manifest.json` 会保留，用于审计。
 
-## Metrics
+## 指标模型
 
 ```mermaid
 flowchart LR
@@ -311,23 +296,22 @@ flowchart LR
     RawAnswer --> Quality["data_quality.json"]
 ```
 
-Current metrics include:
+当前核心指标包括：
 
-- **Mention rate**: responses mentioning a brand / successful responses.
-- **SOV response share**: responses mentioning a brand / all brand response hits.
-- **SOV event share**: eligible brand mention events / all eligible events.
-- **Query coverage**: queries where a brand appeared / planned query count.
-- **Recommendation rates**: recommendation signals over mentions and samples.
-- **Rank signals**: observed ranks, average rank, and top-3 presence.
-- **Sentiment signals**: positive, neutral, negative, and unknown rates.
-- **Stability**: repeated-answer similarity for brand sets.
-- **Source coverage**: source domain and URL occurrence / coverage.
-- **Data quality**: partial samples, malformed raw lines, duplicate units,
-  contract mismatches, and extraction errors.
+- **Mention rate**：提及某品牌的回答数 / 成功回答数。
+- **SOV response share**：提及某品牌的回答数 / 所有品牌回答命中数。
+- **SOV event share**：eligible brand mention events / 全部 eligible events。
+- **Query coverage**：品牌出现过的 query 数 / planned query 数。
+- **Recommendation rates**：推荐信号在提及样本和全样本中的比例。
+- **Rank signals**：排名观测率、平均排名、Top 3 presence。
+- **Sentiment signals**：positive、neutral、negative、unknown rate。
+- **Stability**：重复回答中的品牌集合相似度。
+- **Source coverage**：source domain 和 URL 的出现与覆盖。
+- **Data quality**：partial sample、bad raw lines、duplicate units、contract mismatch、extraction error。
 
-## DuckDB And Dashboard
+## DuckDB 和 Dashboard
 
-DuckDB is a rebuildable analysis cache. It does not replace raw JSONL.
+DuckDB 是可重建的本地分析缓存，不替代 raw JSONL。
 
 ```bash
 geo-monitor db build --runs ./study/runs --output ./study/geo.duckdb
@@ -336,7 +320,7 @@ geo-monitor db query --db ./study/geo.duckdb \
   "select seed_id, persona, count(*) from queries group by 1,2"
 ```
 
-Build a static dashboard:
+生成静态 dashboard：
 
 ```bash
 geo-monitor dashboard build \
@@ -344,8 +328,7 @@ geo-monitor dashboard build \
   --out ./study/dashboard
 ```
 
-The dashboard is static HTML. It does not require a backend service, login,
-React/Vue app, or hosted database.
+Dashboard 是静态 HTML，不需要后端服务、登录、React/Vue 应用或远程数据库。
 
 ## Python API
 
@@ -366,10 +349,10 @@ print(result.metrics)
 print(result.artifact_paths)
 ```
 
-High-level API calls require either `study_dir` or `runs_dir`. Explicit paths
-win. `query_manifest_path` is never guessed from a study directory.
+高层 API 需要显式传入 `study_dir` 或 `runs_dir`。显式路径优先。`query_manifest_path`
+不会从 study directory 自动猜测。
 
-## CLI Reference
+## CLI 命令
 
 ```text
 doctor
@@ -384,7 +367,7 @@ db build / db inspect / db query
 dashboard build
 ```
 
-## Repository Layout
+## 仓库结构
 
 ```text
 src/geo_monitor/
@@ -414,23 +397,20 @@ tests/
   fixtures/
 ```
 
-## Design Principles
+## 设计原则
 
-- **Lightweight**: local files, CLI commands, and small modules.
-- **Audit-first**: raw attempts and quality logs remain the source of truth.
-- **Engine-first**: no user system, hosted SaaS dashboard, or scheduler.
-- **Provider-neutral**: targets OpenAI-compatible Responses APIs.
-- **Study workspace boundary**: long-running business data stays outside the
-  project repository.
-- **Human-like prompt boundary**: the model receives only the query text.
-- **Open discovery**: competitors are discovered from answers instead of a
-  bundled alias list.
+- **Lightweight**：本地文件、CLI 命令、小模块。
+- **Audit-first**：raw attempts 和 quality logs 是事实源。
+- **Engine-first**：不做用户系统、SaaS dashboard 或调度系统。
+- **Provider-neutral**：面向 OpenAI-compatible Responses APIs。
+- **Study workspace boundary**：长期业务数据不进入项目仓库。
+- **Human-like prompt boundary**：模型只收到 query text。
+- **Open discovery**：竞品从回答中发现，而不是来自内置 alias list。
 
-## Development
+## 开发
 
 ```bash
 python -m pytest
 ```
 
-The repository intentionally excludes `.env`, `.runs/`, `.venv/`, local study
-workspaces, DuckDB files, cache directories, and generated task data.
+仓库默认排除 `.env`、`.runs/`、`.venv/`、local study workspace、DuckDB 文件、缓存目录和生成的任务数据。
