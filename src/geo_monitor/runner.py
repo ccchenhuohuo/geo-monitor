@@ -38,6 +38,7 @@ class MonitorRunner:
         queries: Iterable[QueryRecord],
         *,
         output_path: str | Path,
+        job_id: str | None = None,
         run_id: str | None = None,
         dry_run: bool = False,
         mock: bool = False,
@@ -66,6 +67,7 @@ class MonitorRunner:
 
         query_list = list(queries)
         actual_run_id = run_id or make_run_id()
+        actual_job_id = job_id
         done_hashes = successful_result_hashes(output_path) if resume else {}
         work_items = []
         results: list[MonitorResult] = []
@@ -100,6 +102,7 @@ class MonitorRunner:
             for item in work_items:
                 result = self._run_one(
                     item["query"],
+                    job_id=actual_job_id,
                     run_id=actual_run_id,
                     client=client,
                     dry_run=dry_run,
@@ -140,6 +143,7 @@ class MonitorRunner:
                     executor.submit(
                         self._run_one_with_sleep,
                         item["query"],
+                        job_id=actual_job_id,
                         run_id=actual_run_id,
                         client=client,
                         dry_run=dry_run,
@@ -161,6 +165,7 @@ class MonitorRunner:
         self,
         query: QueryRecord,
         *,
+        job_id: str | None,
         run_id: str,
         client: LLMResponsesClient | None,
         dry_run: bool,
@@ -175,6 +180,7 @@ class MonitorRunner:
     ) -> MonitorResult:
         result = self._run_one(
             query,
+            job_id=job_id,
             run_id=run_id,
             client=client,
             dry_run=dry_run,
@@ -194,6 +200,7 @@ class MonitorRunner:
         self,
         query: QueryRecord,
         *,
+        job_id: str | None,
         run_id: str,
         client: LLMResponsesClient | None,
         dry_run: bool,
@@ -210,17 +217,24 @@ class MonitorRunner:
         payload = payload or build_responses_payload(query, self.settings, model=model, web_search_limit=web_search_limit)
         request_hash = request_hash or compute_request_hash(payload)
         model_name = payload["model"]
+        query_meta = _query_meta(query)
+        run_scope_id = job_id or run_id
+        attempt_id = f"{run_scope_id}__{query.query_id}__r{repeat_index}__{request_hash}"
 
         common = {
+            "job_id": job_id,
+            "attempt_id": attempt_id,
             "run_id": run_id,
             "query_id": query.query_id,
             "repeat_index": repeat_index,
             "repeat_total": repeat_total,
             "request_hash": request_hash,
             "model": model_name,
+            "query": query.query,
             "input_query": query.query,
             "raw_request": payload,
             "metadata": query.metadata_with_tags(),
+            "query_meta": query_meta,
             "started_at": started_at,
         }
 
@@ -306,3 +320,28 @@ def _iter_units(
 
 def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def _query_meta(query: QueryRecord) -> dict[str, str]:
+    metadata = query.metadata_with_tags()
+
+    def text(key: str, default: str = "") -> str:
+        value = metadata.get(key, default)
+        if value in (None, ""):
+            return default
+        return str(value)
+
+    return {
+        "schema_version": "query-meta-v1",
+        "variant_id": text("variant_id"),
+        "seed_id": text("seed_id"),
+        "seed_query": text("seed_query"),
+        "category": str(query.category or metadata.get("category") or ""),
+        "intent": text("intent"),
+        "persona": text("persona"),
+        "template_id": text("template_id"),
+        "language": text("language", str(query.locale or "")),
+        "generation_method": text("generation_method", "config"),
+        "fanout_version": text("fanout_version"),
+        "manifest_version": text("manifest_version"),
+    }

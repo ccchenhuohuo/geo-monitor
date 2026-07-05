@@ -7,14 +7,21 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .db import build_duckdb, inspect_duckdb, query_duckdb
+from .dashboard import build_dashboard
 from .llm_client import LLMClientError
 from .config import get_settings
 from .dataset import DatasetError
 from .exporters import export_csv, read_jsonl_with_errors
+from .fanout import FanoutError, build_query_manifest
 from .job import JobError, build_job_bundle, cleanup_job_bundle, estimate_job_run, run_job_bundle, validate_job_config
 from .job_analysis import analyze_job_bundle, estimate_job_analysis
 
 app = typer.Typer(help="基于 OpenAI-compatible Responses API 的 GEO 品牌监测 MVP")
+db_app = typer.Typer(help="DuckDB 轻量分析层")
+dashboard_app = typer.Typer(help="静态 dashboard")
+app.add_typer(db_app, name="db")
+app.add_typer(dashboard_app, name="dashboard")
 console = Console()
 
 
@@ -55,22 +62,38 @@ def export_csv_command(
 def build_job_command(
     job_config: Annotated[Path, typer.Argument(help="job_config.json 任务配置")],
     out_dir: Annotated[Path | None, typer.Option("--out-dir", help="任务交付目录；不传则生成到 .runs/{job_id}")] = None,
+    runs_dir: Annotated[Path | None, typer.Option("--runs-dir", help="外部 study workspace 下的 runs 目录")] = None,
+    query_manifest: Annotated[Path | None, typer.Option("--query-manifest", help="外部 frozen query manifest CSV")] = None,
     force: bool = typer.Option(False, "--force", help="允许覆盖非空任务目录"),
 ) -> None:
     try:
-        result = build_job_bundle(job_config, out_dir, force=force)
+        result = build_job_bundle(job_config, out_dir, force=force, query_manifest_path=query_manifest, runs_dir=runs_dir)
     except JobError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]任务已生成：{result['bundle_dir']}[/green]")
     console.print(f"query_manifest: {result['query_manifest']}")
 
 
+@app.command("fanout")
+def fanout_command(
+    input_path: Annotated[Path, typer.Option("--input", help="seed_prompts.yaml 输入路径")],
+    output_path: Annotated[Path, typer.Option("--output", help="外部 frozen query_manifest.csv 输出路径")],
+    force: bool = typer.Option(False, "--force", help="允许覆盖已存在 manifest"),
+) -> None:
+    try:
+        result = build_query_manifest(input_path, output_path, force=force)
+    except FanoutError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"[green]fanout 完成：{result['output']}（{result['row_count']} 行）[/green]")
+
+
 @app.command("validate-job-config")
 def validate_job_config_command(
     job_config: Annotated[Path, typer.Argument(help="job_config.json 任务配置")],
+    query_manifest: Annotated[Path | None, typer.Option("--query-manifest", help="外部 frozen query manifest CSV；用于校验 external manifest 模式配置")] = None,
 ) -> None:
     try:
-        result = validate_job_config(job_config)
+        result = validate_job_config(job_config, query_manifest_path=query_manifest)
     except JobError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(
@@ -87,13 +110,23 @@ def run_job_command(
     mock: bool = typer.Option(False, "--mock", help="使用模拟响应，不调用 API"),
     limit: int | None = typer.Option(None, help="只运行前 N 条 query，用于小样本 smoke"),
     only_query_id: str | None = typer.Option(None, help="只运行指定 query_id，多个用逗号分隔"),
+    query_manifest: Path | None = typer.Option(None, "--query-manifest", help="work/query_manifest.csv 缺失或 hash mismatch 时使用的 replacement manifest"),
     sleep_seconds: float = typer.Option(0.0, help="每次调用后等待秒数"),
     start_interval_seconds: float | None = typer.Option(None, help="并发模式下每个请求启动之间的间隔秒数；不传则使用 job_manifest 配置"),
     confirm_cost: bool = typer.Option(False, "--confirm-cost", help="确认执行 live API 请求预算"),
 ) -> None:
     try:
         only_query_ids = _parse_ids(only_query_id)
-        estimate = estimate_job_run(bundle_dir, dry_run=dry_run, mock=mock, resume=resume, limit=limit, only_query_ids=only_query_ids)
+        estimate_kwargs = {
+            "dry_run": dry_run,
+            "mock": mock,
+            "resume": resume,
+            "limit": limit,
+            "only_query_ids": only_query_ids,
+        }
+        if query_manifest is not None:
+            estimate_kwargs["query_manifest_path"] = query_manifest
+        estimate = estimate_job_run(bundle_dir, **estimate_kwargs)
         console.print(
             "预检："
             f"计划采样单元 {estimate['planned_units']}，已完成 {estimate['completed_units']}，"
@@ -103,17 +136,19 @@ def run_job_command(
         )
         if not dry_run and not mock and estimate["sampling_requests_remaining"] > 0 and not confirm_cost:
             raise typer.BadParameter("真实 live 调用会产生 API 成本；请确认预算后添加 --confirm-cost")
-        result = run_job_bundle(
-            bundle_dir,
-            resume=resume,
-            dry_run=dry_run,
-            mock=mock,
-            sleep_seconds=sleep_seconds,
-            start_interval_seconds=start_interval_seconds,
-            limit=limit,
-            only_query_ids=only_query_ids,
-            confirm_cost=confirm_cost,
-        )
+        run_kwargs = {
+            "resume": resume,
+            "dry_run": dry_run,
+            "mock": mock,
+            "sleep_seconds": sleep_seconds,
+            "start_interval_seconds": start_interval_seconds,
+            "limit": limit,
+            "only_query_ids": only_query_ids,
+            "confirm_cost": confirm_cost,
+        }
+        if query_manifest is not None:
+            run_kwargs["query_manifest_path"] = query_manifest
+        result = run_job_bundle(bundle_dir, **run_kwargs)
     except (LLMClientError, DatasetError, JobError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if not dry_run and not mock and result["errors"]:
@@ -159,6 +194,52 @@ def cleanup_job_command(
     except JobError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]清理完成：removed_work_dir={result['removed_work_dir']}[/green]")
+
+
+@db_app.command("build")
+def db_build_command(
+    runs: Annotated[Path, typer.Option("--runs", help="study workspace 下的 runs 目录")],
+    output: Annotated[Path, typer.Option("--output", help="DuckDB 输出路径")],
+    query_manifest: Annotated[Path | None, typer.Option("--query-manifest", help="旧 run 缺失 query_meta 时的 fallback manifest")] = None,
+) -> None:
+    result = build_duckdb(runs, output, query_manifest=query_manifest)
+    console.print(f"[green]DuckDB 已生成：{result['db_path']}[/green]")
+
+
+@db_app.command("inspect")
+def db_inspect_command(
+    db: Annotated[Path, typer.Option("--db", help="DuckDB 文件路径")],
+) -> None:
+    result = inspect_duckdb(db)
+    table = Table(title=f"DuckDB: {result['db_path']}")
+    table.add_column("table")
+    table.add_column("rows", justify="right")
+    for row in result["tables"]:
+        table.add_row(str(row["table"]), str(row["row_count"]))
+    console.print(table)
+
+
+@db_app.command("query")
+def db_query_command(
+    db: Annotated[Path, typer.Option("--db", help="DuckDB 文件路径")],
+    sql: Annotated[str, typer.Argument(help="SQL 查询")],
+) -> None:
+    columns, rows = query_duckdb(db, sql)
+    table = Table()
+    for column in columns:
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*["" if value is None else str(value) for value in row])
+    console.print(table)
+
+
+@dashboard_app.command("build")
+def dashboard_build_command(
+    db: Annotated[Path, typer.Option("--db", help="DuckDB 文件路径")],
+    out: Annotated[Path, typer.Option("--out", help="dashboard 输出目录")],
+) -> None:
+    result = build_dashboard(db, out)
+    console.print(f"[green]Dashboard 已生成：{result['dashboard_path']}[/green]")
 
 if __name__ == "__main__":
     app()

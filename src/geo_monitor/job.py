@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -25,6 +27,10 @@ RESULT_DIR = "result"
 LOGS_DIR = "logs"
 QUERY_MANIFEST = f"{WORK_DIR}/query_manifest.csv"
 RAW_ATTEMPTS = "raw/attempts.jsonl"
+GEO_JOB_V1 = "geo-job-v1"
+GEO_JOB_V2 = "geo-job-v2"
+QUERY_MANIFEST_V1 = "query-manifest-v1"
+SLUG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 RUN_SUMMARY = "logs/run_summary.json"
 CLEANUP_SUMMARY = "logs/cleanup_summary.json"
 BUNDLE_LOCK = "logs/bundle.lock"
@@ -60,14 +66,39 @@ class JobError(ValueError):
     pass
 
 
-def build_job_bundle(config_path: str | Path, out_dir: str | Path | None = None, settings: Settings | None = None, *, force: bool = False) -> dict[str, Any]:
+def build_job_bundle(
+    config_path: str | Path,
+    out_dir: str | Path | None = None,
+    settings: Settings | None = None,
+    *,
+    force: bool = False,
+    query_manifest_path: str | Path | None = None,
+    runs_dir: str | Path | None = None,
+) -> dict[str, Any]:
     settings = settings or get_settings()
     config = _load_job_config(config_path)
     _validate_job_config_keys(config)
     job_id = _make_job_id()
-    bundle_dir = Path(out_dir) if out_dir else workspace_root() / RUNS_DIR / job_id
+    if out_dir is not None and runs_dir is not None:
+        raise JobError("--out-dir 和 --runs-dir 不能同时使用")
+    bundle_dir = Path(out_dir) if out_dir else Path(runs_dir) / job_id if runs_dir else workspace_root() / RUNS_DIR / job_id
 
-    queries = _normalize_queries(config.get("queries"))
+    external_query_manifest: Path | None = Path(query_manifest_path) if query_manifest_path else None
+    if external_query_manifest is not None:
+        queries = _query_rows_from_records(load_queries(external_query_manifest))
+        query_manifest_info = _query_manifest_info(external_query_manifest)
+        schema_version = GEO_JOB_V2
+    else:
+        queries = _normalize_queries(config.get("queries"))
+        query_manifest_info = {
+            "source_type": "config_inline",
+            "source_uri": str(config_path),
+            "source_uri_base": str(Path.cwd()),
+            "schema_version": QUERY_MANIFEST_V1,
+            "sha256": "",
+            "row_count": len(queries),
+        }
+        schema_version = GEO_JOB_V1
     repeats = _positive_int(config.get("repeats", 20), "repeats")
     web_search_limit = _bounded_int(config.get("web_search_limit", settings.web_search_limit), "web_search_limit", minimum=1, maximum=20)
     concurrency = _positive_int(config.get("concurrency", settings.concurrency), "concurrency")
@@ -83,7 +114,7 @@ def build_job_bundle(config_path: str | Path, out_dir: str | Path | None = None,
     target_aliases = _string_list(config.get("target_aliases"), "target_aliases")
 
     manifest = {
-        "schema_version": "geo-job-v1",
+        "schema_version": schema_version,
         "job_id": job_id,
         "status": "built",
         "target_brand": target_brand,
@@ -98,9 +129,11 @@ def build_job_bundle(config_path: str | Path, out_dir: str | Path | None = None,
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "query_count": len(queries),
-        "queries": queries,
+        "query_manifest": query_manifest_info,
         "paths": _manifest_paths(),
     }
+    if external_query_manifest is None:
+        manifest["queries"] = queries
     _validate_job_manifest(manifest)
 
     if bundle_dir.exists() and any(bundle_dir.iterdir()):
@@ -119,7 +152,11 @@ def _materialize_job_bundle(bundle_dir: Path, manifest: dict[str, Any], queries:
         (bundle_dir / name).mkdir(parents=True, exist_ok=True)
     _write_json(bundle_dir / JOB_MANIFEST, manifest)
     query_manifest = bundle_dir / QUERY_MANIFEST
-    _write_query_manifest(query_manifest, queries)
+    source_path = _resolve_query_manifest_source(manifest)
+    if source_path is not None and source_path.exists():
+        shutil.copyfile(source_path, query_manifest)
+    else:
+        _write_query_manifest(query_manifest, queries)
     return {
         "bundle_dir": str(bundle_dir),
         "job_manifest": str(bundle_dir / JOB_MANIFEST),
@@ -128,11 +165,23 @@ def _materialize_job_bundle(bundle_dir: Path, manifest: dict[str, Any], queries:
     }
 
 
-def validate_job_config(config_path: str | Path, settings: Settings | None = None) -> dict[str, Any]:
+def validate_job_config(
+    config_path: str | Path,
+    settings: Settings | None = None,
+    *,
+    query_manifest_path: str | Path | None = None,
+) -> dict[str, Any]:
     settings = settings or get_settings()
     config = _load_job_config(config_path)
     _validate_job_config_keys(config)
-    queries = _normalize_queries(config.get("queries"))
+    query_manifest_info: dict[str, Any] | None = None
+    if query_manifest_path is not None:
+        manifest_path = Path(query_manifest_path)
+        records = load_queries(manifest_path)
+        queries = _query_rows_from_records(records)
+        query_manifest_info = _query_manifest_info(manifest_path)
+    else:
+        queries = _normalize_queries(config.get("queries"))
     repeats = _positive_int(config.get("repeats", 20), "repeats")
     web_search_limit = _bounded_int(config.get("web_search_limit", settings.web_search_limit), "web_search_limit", minimum=1, maximum=20)
     concurrency = _positive_int(config.get("concurrency", settings.concurrency), "concurrency")
@@ -142,7 +191,7 @@ def validate_job_config(config_path: str | Path, settings: Settings | None = Non
     model = str(config.get("model") or settings.llm_model).strip()
     if not model:
         raise JobError("model 不能为空")
-    return {
+    result = {
         "target_brand": _required_str(config, "target_brand"),
         "target_aliases": _string_list(config.get("target_aliases"), "target_aliases"),
         "industry": _required_str(config, "industry"),
@@ -155,6 +204,9 @@ def validate_job_config(config_path: str | Path, settings: Settings | None = Non
         "concurrency": concurrency,
         "start_interval_seconds": start_interval_seconds,
     }
+    if query_manifest_info is not None:
+        result["query_manifest"] = query_manifest_info
+    return result
 
 
 def run_job_bundle(
@@ -167,18 +219,17 @@ def run_job_bundle(
     start_interval_seconds: float | None = None,
     limit: int | None = None,
     only_query_ids: list[str] | None = None,
+    query_manifest_path: str | Path | None = None,
     settings: Settings | None = None,
     confirm_cost: bool = False,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     root = Path(bundle_dir)
     manifest = load_job_manifest(root)
-    all_queries = load_job_queries(root, manifest, materialize=False)
-    queries = select_queries(all_queries, limit=limit, only_query_ids=only_query_ids)
     raw_path = root / RAW_ATTEMPTS
     started_at = utc_now_iso()
     with _job_lock(root / BUNDLE_LOCK):
-        query_manifest = ensure_query_manifest(root, manifest)
+        query_manifest = ensure_query_manifest(root, manifest, replacement_path=query_manifest_path)
         if not query_manifest.exists():
             raise JobError(f"缺少 query_manifest.csv：{query_manifest}")
         all_queries = load_queries(query_manifest)
@@ -195,6 +246,8 @@ def run_job_bundle(
             results = runner.run(
                 queries,
                 output_path=raw_path,
+                job_id=str(manifest["job_id"]),
+                run_id=str(manifest["job_id"]),
                 dry_run=dry_run,
                 mock=mock,
                 resume=resume,
@@ -217,6 +270,7 @@ def run_job_bundle(
         executed_completed = sum(1 for item in results if item.status in analysis_statuses)
         summary = {
             "job_id": manifest.get("job_id"),
+            "run_id": manifest.get("job_id"),
             "planned_units": planned_units,
             "job_planned_units": len(all_units),
             "completed_units": completed_units,
@@ -236,6 +290,7 @@ def run_job_bundle(
     return {
         "bundle_dir": str(root),
         "raw_jsonl": str(raw_path),
+        "run_id": str(manifest.get("job_id")),
         "executed": len(results),
         "errors": summary["errors"],
         "completed_units": summary["completed_units"],
@@ -252,12 +307,17 @@ def estimate_job_run(
     resume: bool = True,
     limit: int | None = None,
     only_query_ids: list[str] | None = None,
+    query_manifest_path: str | Path | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     root = Path(bundle_dir)
     manifest = load_job_manifest(root)
-    all_queries = load_job_queries(root, manifest, materialize=False)
+    if query_manifest_path is not None:
+        _ensure_manifest_file_fingerprint(Path(query_manifest_path), manifest)
+        all_queries = load_queries(query_manifest_path)
+    else:
+        all_queries = load_job_queries(root, manifest, materialize=False)
     queries = select_queries(all_queries, limit=limit, only_query_ids=only_query_ids)
     planned_units = len(queries) * int(manifest["repeats"])
     statuses = _run_completion_statuses(dry_run=dry_run, mock=mock)
@@ -297,8 +357,8 @@ def load_job_manifest(bundle_dir: str | Path) -> dict[str, Any]:
     if not path.exists():
         raise JobError(f"缺少 job_manifest.json：{path}")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("schema_version") != "geo-job-v1":
-        raise JobError("job_manifest schema_version 必须是 geo-job-v1")
+    if data.get("schema_version") not in {GEO_JOB_V1, GEO_JOB_V2}:
+        raise JobError("job_manifest schema_version 必须是 geo-job-v1 或 geo-job-v2")
     _validate_job_manifest(data)
     return data
 
@@ -317,6 +377,10 @@ def load_job_queries(bundle_dir: str | Path, manifest: dict[str, Any] | None = N
     query_manifest = resolve_query_manifest(root, manifest, materialize=materialize)
     if query_manifest.exists():
         return load_queries(query_manifest)
+    source = _resolve_query_manifest_source(manifest)
+    if source is not None and source.exists():
+        _ensure_manifest_file_fingerprint(source, manifest)
+        return load_queries(source)
     return _query_records_from_manifest(manifest)
 
 
@@ -329,14 +393,29 @@ def resolve_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | No
         return current
     queries = manifest.get("queries")
     if not isinstance(queries, list) or not queries:
+        if materialize:
+            source = _resolve_query_manifest_source(manifest)
+            if source is not None and source.exists():
+                _ensure_manifest_file_fingerprint(source, manifest)
+                current.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, current)
+                return current
         return current
     if materialize:
         _write_query_manifest(current, queries)
     return current
 
 
-def ensure_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | None = None) -> Path:
-    return resolve_query_manifest(bundle_dir, manifest, materialize=True)
+def ensure_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | None = None, *, replacement_path: str | Path | None = None) -> Path:
+    root = Path(bundle_dir)
+    manifest = manifest or load_job_manifest(root)
+    current = root / QUERY_MANIFEST
+    if replacement_path is not None:
+        replacement = Path(replacement_path)
+        _ensure_manifest_file_fingerprint(replacement, manifest)
+        current.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(replacement, current)
+    return resolve_query_manifest(root, manifest, materialize=True)
 
 
 def work_dir(bundle_dir: str | Path) -> Path:
@@ -396,8 +475,9 @@ def update_job_manifest(bundle_dir: str | Path, *, status: str | None = None, ex
 
 
 def query_set_hash(manifest: dict[str, Any]) -> str:
-    import hashlib
-
+    info = manifest.get("query_manifest")
+    if isinstance(info, dict) and info.get("sha256"):
+        return str(info["sha256"])[:16]
     queries = [{"query_id": str(row.get("query_id", "")), "query": str(row.get("query", ""))} for row in manifest.get("queries", [])]
     stable = json.dumps(queries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
@@ -464,6 +544,90 @@ def _write_query_manifest(path: Path, queries: list[dict[str, Any]]) -> None:
         writer.writerows(queries)
 
 
+def _query_rows_from_records(records: list[QueryRecord]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        _validate_slug_id(record.query_id, "query_id")
+        row: dict[str, Any] = {
+            "query_id": record.query_id,
+            "query": record.query,
+        }
+        if record.locale:
+            row["locale"] = record.locale
+        if record.market:
+            row["market"] = record.market
+        if record.category:
+            row["category"] = record.category
+        if record.tags:
+            row["tags"] = ",".join(record.tags)
+        row.update(record.metadata)
+        for key in ["seed_id", "persona", "template_id", "variant_id"]:
+            if row.get(key):
+                _validate_slug_id(str(row[key]), key)
+        rows.append(row)
+    return rows
+
+
+def _query_manifest_info(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise JobError(f"query manifest 不存在：{path}")
+    records = load_queries(path)
+    _query_rows_from_records(records)
+    return {
+        "source_type": "external_file",
+        "source_uri": str(path),
+        "source_uri_base": str(Path.cwd()),
+        "schema_version": QUERY_MANIFEST_V1,
+        "sha256": _file_sha256(path),
+        "row_count": len(records),
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_query_manifest_source(manifest: dict[str, Any]) -> Path | None:
+    info = manifest.get("query_manifest")
+    if not isinstance(info, dict):
+        return None
+    if info.get("source_type") != "external_file":
+        return None
+    source_uri = info.get("source_uri")
+    if not source_uri:
+        return None
+    path = Path(str(source_uri))
+    if path.is_absolute():
+        return path
+    base = info.get("source_uri_base")
+    return (Path(str(base)) / path) if base else path
+
+
+def _ensure_manifest_file_fingerprint(path: Path, manifest: dict[str, Any]) -> None:
+    if not path.exists():
+        raise JobError(f"query manifest 不存在：{path}")
+    info = manifest.get("query_manifest")
+    if not isinstance(info, dict):
+        return
+    expected_sha = str(info.get("sha256") or "")
+    expected_count = int(info.get("row_count") or 0)
+    if expected_sha and _file_sha256(path) != expected_sha:
+        raise JobError(f"query manifest sha256 不匹配：{path}")
+    records = load_queries(path)
+    if expected_count and len(records) != expected_count:
+        raise JobError(f"query manifest row_count 不匹配：{path}")
+    _query_rows_from_records(records)
+
+
+def _validate_slug_id(value: str, field: str) -> None:
+    if not SLUG_RE.fullmatch(value):
+        raise JobError(f"{field} 只能包含 [a-zA-Z0-9_-]：{value}")
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
@@ -490,16 +654,27 @@ def _manifest_paths() -> dict[str, str]:
 
 
 def _validate_job_manifest(data: dict[str, Any]) -> None:
-    required = ["schema_version", "job_id", "status", "target_brand", "industry", "market", "repeats", "model", "web_search_limit", "concurrency", "query_count", "queries"]
+    required = ["schema_version", "job_id", "status", "target_brand", "industry", "market", "repeats", "model", "web_search_limit", "concurrency", "query_count"]
     missing = [key for key in required if key not in data]
     if missing:
         raise JobError(f"job_manifest 缺少字段：{', '.join(missing)}")
+    schema_version = str(data.get("schema_version") or "")
     if str(data.get("status") or "") not in ALLOWED_STATUSES:
         raise JobError(f"job_manifest status 无效：{data.get('status')}")
-    if not isinstance(data.get("queries"), list) or not data["queries"]:
-        raise JobError("job_manifest queries 必须是非空数组")
-    if _positive_int(data.get("query_count"), "query_count") != len(data["queries"]):
-        raise JobError("job_manifest query_count 与 queries 数量不一致")
+    if schema_version == GEO_JOB_V1:
+        if not isinstance(data.get("queries"), list) or not data["queries"]:
+            raise JobError("job_manifest queries 必须是非空数组")
+        if _positive_int(data.get("query_count"), "query_count") != len(data["queries"]):
+            raise JobError("job_manifest query_count 与 queries 数量不一致")
+    else:
+        if not isinstance(data.get("query_manifest"), dict):
+            raise JobError("geo-job-v2 必须包含 query_manifest")
+        info = data["query_manifest"]
+        for key in ["source_type", "schema_version", "sha256", "row_count"]:
+            if key not in info:
+                raise JobError(f"query_manifest 缺少字段：{key}")
+        if _positive_int(data.get("query_count"), "query_count") != _positive_int(info.get("row_count"), "query_manifest.row_count"):
+            raise JobError("job_manifest query_count 与 query_manifest.row_count 不一致")
     _positive_int(data.get("repeats"), "repeats")
     _bounded_int(data.get("web_search_limit"), "web_search_limit", minimum=1, maximum=20)
     concurrency = _positive_int(data.get("concurrency"), "concurrency")
@@ -512,7 +687,8 @@ def _validate_job_manifest(data: dict[str, Any]) -> None:
     _string_list(data.get("target_aliases"), "target_aliases")
     _required_str(data, "industry")
     _optional_str(data, "market", default="未指定市场")
-    _validate_persisted_queries(data.get("queries"))
+    if schema_version == GEO_JOB_V1:
+        _validate_persisted_queries(data.get("queries"))
 
 
 def _make_job_id() -> str:
@@ -619,6 +795,9 @@ def _query_records_from_manifest(manifest: dict[str, Any]) -> list[QueryRecord]:
 
 
 def _ensure_query_manifest_matches(path: Path, manifest: dict[str, Any]) -> None:
+    if str(manifest.get("schema_version")) == GEO_JOB_V2:
+        _ensure_manifest_file_fingerprint(path, manifest)
+        return
     loaded_queries = load_queries(path)
     query_pairs = [(row.query_id, row.query) for row in loaded_queries]
     manifest_pairs = [(str(row.get("query_id")), str(row.get("query"))) for row in manifest.get("queries", [])]

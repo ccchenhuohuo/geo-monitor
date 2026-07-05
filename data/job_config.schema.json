@@ -3,7 +3,7 @@
   "title": "GEO Monitor Job Config",
   "type": "object",
   "additionalProperties": false,
-  "required": ["target_brand", "industry", "queries"],
+  "required": ["target_brand", "industry"],
   "properties": {
     "target_brand": {
       "type": "string",
@@ -26,6 +26,7 @@
       "description": "Optional market or region. Omit it for non-regional brands."
     },
     "queries": {
+      "description": "Inline queries for legacy/local jobs. Optional when the CLI/API call provides an external --query-manifest.",
       "type": "array",
       "minItems": 1,
       "items": {

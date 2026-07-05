@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 Status = Literal["success", "error", "dry_run", "mock"]
@@ -60,12 +60,16 @@ class ErrorRecord(BaseModel):
 
 
 class MonitorResult(BaseModel):
+    schema_version: str = "attempts-v2"
+    job_id: str | None = None
+    attempt_id: str | None = None
     run_id: str
     query_id: str
     repeat_index: int = 1
     repeat_total: int = 1
     request_hash: str | None = None
     model: str
+    query: str | None = None
     input_query: str
     status: Status
     response_text: str | None = None
@@ -76,8 +80,38 @@ class MonitorResult(BaseModel):
     raw_request: dict[str, Any] = Field(default_factory=dict)
     raw_response: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    query_meta: dict[str, Any] = Field(default_factory=dict)
     started_at: str
     completed_at: str
+
+    @model_validator(mode="after")
+    def ensure_attempts_v2_contract(self) -> "MonitorResult":
+        if self.schema_version != "attempts-v2":
+            return self
+        if not (self.query and self.query.strip()):
+            self.query = self.input_query.strip()
+        if not self.query:
+            raise ValueError("attempts-v2 requires top-level query")
+        meta = {key: "" if value is None else str(value) for key, value in dict(self.query_meta or {}).items()}
+        meta.setdefault("schema_version", "query-meta-v1")
+        for key in [
+            "variant_id",
+            "seed_id",
+            "seed_query",
+            "category",
+            "intent",
+            "persona",
+            "template_id",
+            "language",
+            "generation_method",
+            "fanout_version",
+            "manifest_version",
+        ]:
+            meta.setdefault(key, "")
+        if not meta["generation_method"]:
+            meta["generation_method"] = "config"
+        self.query_meta = meta
+        return self
 
     @property
     def source_count(self) -> int:

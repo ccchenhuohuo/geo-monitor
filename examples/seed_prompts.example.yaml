@@ -1,0 +1,12 @@
+seeds:
+  - seed_id: sample_beginner
+    category: sample_category
+    intent: product_recommendation
+    seed_query: "推荐一款适合新手的示例产品"
+    language: zh-CN
+    personas:
+      - budget_sensitive
+      - quality_oriented
+      - comparison_shopper
+      - beginner
+      - convenience_first

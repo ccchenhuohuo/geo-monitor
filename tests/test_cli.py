@@ -34,6 +34,37 @@ def test_validate_job_config_cli_smoke(tmp_path):
     assert "任务配置有效" in result.output
 
 
+def test_validate_job_config_cli_accepts_external_manifest_without_inline_queries(tmp_path):
+    config = tmp_path / "job_config.json"
+    seed = tmp_path / "seed_prompts.yaml"
+    manifest = tmp_path / "manifests" / "query_manifest.v1.csv"
+    config.write_text(
+        json.dumps(
+            {
+                "target_brand": "TestAEntity",
+                "industry": "TestIndustry",
+                "repeats": 1,
+                "model": "test-model",
+                "web_search_limit": 5,
+                "concurrency": 1,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    seed.write_text(
+        "seeds:\n  - seed_id: sample\n    seed_query: example query\n    personas:\n      - beginner\n",
+        encoding="utf-8",
+    )
+
+    fanout = CliRunner().invoke(app, ["fanout", "--input", str(seed), "--output", str(manifest)])
+    result = CliRunner().invoke(app, ["validate-job-config", str(config), "--query-manifest", str(manifest)])
+
+    assert fanout.exit_code == 0
+    assert result.exit_code == 0
+    assert "任务配置有效" in result.output
+
+
 def test_build_and_cleanup_job_cli_smoke(tmp_path):
     config = _write_job_config(tmp_path)
     bundle = tmp_path / "bundle"

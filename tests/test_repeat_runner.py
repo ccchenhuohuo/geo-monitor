@@ -39,6 +39,64 @@ def test_resume_skips_only_live_success(tmp_path):
     assert {row["status"] for row in rows} == {"mock", "dry_run"}
 
 
+def test_runner_attempt_contract_for_all_statuses(tmp_path, monkeypatch):
+    settings = Settings(llm_api_key=None)
+    queries = load_queries(FIXTURES / "queries.small.csv")
+    runner = MonitorRunner(settings)
+
+    runner.run(queries[:1], output_path=tmp_path / "dry.jsonl", dry_run=True, repeats=1, run_id="dry")
+    runner.run(queries[:1], output_path=tmp_path / "mock.jsonl", mock=True, repeats=1, run_id="mock")
+
+    class SuccessClient:
+        def create_response(self, payload):
+            return {"status": "completed", "output_text": "ok", "usage": {}}
+
+    monkeypatch.setattr("geo_monitor.runner.LLMResponsesClient", lambda settings: SuccessClient())
+    runner.run(queries[:1], output_path=tmp_path / "success.jsonl", repeats=1, run_id="success")
+
+    class ErrorClient:
+        def create_response(self, payload):
+            return {"status": "completed", "output_text": "", "usage": {}}
+
+    monkeypatch.setattr("geo_monitor.runner.LLMResponsesClient", lambda settings: ErrorClient())
+    runner.run(queries[:1], output_path=tmp_path / "error.jsonl", repeats=1, run_id="error")
+
+    rows = []
+    for name in ["dry.jsonl", "mock.jsonl", "success.jsonl", "error.jsonl"]:
+        rows.extend(read_jsonl(tmp_path / name))
+
+    assert {row["status"] for row in rows} == {"dry_run", "mock", "success", "error"}
+    for row in rows:
+        assert row["query"]
+        assert row["query"] == row["input_query"]
+        assert row["query_meta"]["schema_version"] == "query-meta-v1"
+        assert "generation_method" in row["query_meta"]
+
+
+def test_monitor_result_fills_attempts_v2_contract_for_manual_records(tmp_path):
+    out = tmp_path / "manual.jsonl"
+    append_jsonl(
+        out,
+        MonitorResult(
+            run_id="manual",
+            query_id="q001",
+            repeat_index=1,
+            repeat_total=1,
+            model="test-model",
+            input_query="manual query",
+            status="dry_run",
+            started_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T00:00:01+00:00",
+        ),
+    )
+
+    row = read_jsonl(out)[0]
+
+    assert row["query"] == "manual query"
+    assert row["query_meta"]["schema_version"] == "query-meta-v1"
+    assert row["query_meta"]["generation_method"] == "config"
+
+
 def test_resume_existing_row_without_request_hash_is_skipped(tmp_path):
     settings = Settings(llm_api_key=None)
     queries = load_queries(FIXTURES / "queries.small.csv")

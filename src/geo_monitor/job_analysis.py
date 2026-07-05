@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from .brand_extraction import BrandCanonicalizer, BrandMentionExtractor, LLMBrandExtractor, fallback_canonicalize, normalize_brand_name
 from .config import Settings, get_settings, redact_secret, workspace_root
 from .exporters import latest_records, read_jsonl, read_jsonl_with_errors, safe_result_key, sanitize_csv_cell, write_jsonl
-from .job import BUNDLE_LOCK, RUNS_DIR, load_job_manifest, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir, _cleanup_job_bundle_unlocked, _job_lock
+from .job import BUNDLE_LOCK, RUNS_DIR, load_job_manifest, load_job_queries, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir, _cleanup_job_bundle_unlocked, _job_lock
 from .reporting import build_html, table_cell, try_generate_pdf
 
 
@@ -177,6 +177,7 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False)
     if not raw_path.exists():
         raise ValueError(f"缺少 raw attempts：{raw_path}")
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
+    manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
     live_records = latest_records(raw_records, statuses={"success"})
     mock_records = latest_records(raw_records, statuses={"mock"}) if include_mock else []
     if live_records:
@@ -262,6 +263,7 @@ def _analyze_job_bundle_unlocked(
         path.mkdir(parents=True, exist_ok=True)
 
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
+    manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
     live_records = latest_records(raw_records, statuses={"success"})
     mock_records = latest_records(raw_records, statuses={"mock"}) if include_mock else []
     if live_records:
@@ -383,6 +385,73 @@ def _analyze_job_bundle_unlocked(
     if not keep_work:
         _cleanup_job_bundle_unlocked(root)
     return {"bundle_dir": str(root), "analysis_dir": str(result), "report_dir": str(result), **summary}
+
+
+def _manifest_with_queries_for_analysis(root: Path, manifest: dict[str, Any], raw_records: list[dict[str, Any]]) -> dict[str, Any]:
+    if isinstance(manifest.get("queries"), list) and manifest["queries"]:
+        return manifest
+    try:
+        records = load_job_queries(root, manifest, materialize=False)
+    except Exception:
+        records = []
+    if records:
+        hydrated = dict(manifest)
+        hydrated["queries"] = _query_rows_from_records(records)
+        hydrated["query_count"] = len(hydrated["queries"])
+        return hydrated
+    queries_by_id: dict[str, dict[str, Any]] = {}
+    for record in raw_records:
+        qid = str(record.get("query_id") or "").strip()
+        if not qid or qid in queries_by_id:
+            continue
+        query = str(record.get("query") or record.get("input_query") or "").strip()
+        if not query:
+            continue
+        meta = record.get("query_meta") if isinstance(record.get("query_meta"), dict) else {}
+        row = {
+            "query_id": qid,
+            "query": query,
+            "variant_id": str(meta.get("variant_id") or ""),
+            "seed_id": str(meta.get("seed_id") or ""),
+            "seed_query": str(meta.get("seed_query") or ""),
+            "category": str(meta.get("category") or ""),
+            "intent": str(meta.get("intent") or ""),
+            "persona": str(meta.get("persona") or ""),
+            "template_id": str(meta.get("template_id") or ""),
+            "language": str(meta.get("language") or ""),
+            "generation_method": str(meta.get("generation_method") or ""),
+            "fanout_version": str(meta.get("fanout_version") or ""),
+            "manifest_version": str(meta.get("manifest_version") or ""),
+        }
+        queries_by_id[qid] = {key: value for key, value in row.items() if value != ""}
+    if not queries_by_id:
+        return manifest
+    hydrated = dict(manifest)
+    expected_query_count = int((manifest.get("query_manifest") or {}).get("row_count") or manifest.get("query_count") or len(queries_by_id))
+    hydrated["queries"] = [queries_by_id[key] for key in sorted(queries_by_id)]
+    hydrated["query_count"] = expected_query_count
+    if len(hydrated["queries"]) < expected_query_count:
+        hydrated["_query_universe_incomplete"] = True
+        hydrated["_observed_query_count"] = len(hydrated["queries"])
+        hydrated["_missing_unknown_query_count"] = expected_query_count - len(hydrated["queries"])
+    return hydrated
+
+
+def _query_rows_from_records(records: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        row: dict[str, Any] = {"query_id": record.query_id, "query": record.query}
+        if record.locale:
+            row["locale"] = record.locale
+        if record.market:
+            row["market"] = record.market
+        if record.category:
+            row["category"] = record.category
+        if record.tags:
+            row["tags"] = ",".join(record.tags)
+        row.update(record.metadata)
+        rows.append(row)
+    return rows
 
 
 def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: list[dict], manifest: dict[str, Any]) -> dict[str, Any]:
@@ -845,6 +914,9 @@ def evaluate_data_quality(
     analysis_statuses: set[str],
 ) -> dict[str, Any]:
     expected_units = {(str(query["query_id"]), repeat) for query in manifest["queries"] for repeat in range(1, int(manifest["repeats"]) + 1)}
+    missing_unknown_units_count = 0
+    if manifest.get("_query_universe_incomplete"):
+        missing_unknown_units_count = int(manifest.get("_missing_unknown_query_count") or 0) * int(manifest["repeats"])
     actual_units = {key for record in analysis_records if (key := safe_result_key(record)) is not None}
     manifest_ids = {str(query["query_id"]) for query in manifest["queries"]}
     manifest_queries = {str(query["query_id"]): str(query["query"]) for query in manifest["queries"]}
@@ -866,10 +938,10 @@ def evaluate_data_quality(
     missing_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(expected_units - actual_units)]
     extra_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(actual_units - expected_units)]
     extra_query_ids = sorted({qid for qid, _, _ in raw_units if qid not in manifest_ids and qid != "None"})
-    partial = bool(missing_units or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches)
+    partial = bool(missing_units or missing_unknown_units_count or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches)
     conclusion_strength = "observational" if partial else "strong"
-    return {
-        "planned_units": len(expected_units),
+    result = {
+        "planned_units": len(expected_units) + missing_unknown_units_count,
         "analysis_record_count": len(analysis_records),
         "analysis_statuses": sorted(analysis_statuses),
         "partial_sample": partial,
@@ -882,6 +954,12 @@ def evaluate_data_quality(
         "contract_mismatches": contract_mismatches,
         "raw_read_errors": raw_read_errors,
     }
+    if missing_unknown_units_count:
+        result["query_manifest_unavailable"] = True
+        result["observed_query_count"] = int(manifest.get("_observed_query_count") or len(manifest["queries"]))
+        result["expected_query_count"] = int(manifest.get("query_count") or len(manifest["queries"]))
+        result["missing_unknown_units_count"] = missing_unknown_units_count
+    return result
 
 
 STAT_EXCLUDING_CONTRACT_FIELDS = {

@@ -5,12 +5,43 @@ It sends only user-like query text to an OpenAI-compatible Responses API, keeps 
 answer audit logs, extracts brand/entity mentions from the returned text, and produces
 brand visibility, SOV, source, and stability reports.
 
+It is a lightweight GEO analysis engine, not a GEO SaaS product. The repository and
+package contain engine code only. Business query data, brand data, frozen manifests,
+long-running study history, DuckDB files, and dashboards should live in a user-owned
+external study workspace.
+
 The project is intentionally neutral:
 
 - no bundled brand, industry, or query sample data;
 - no provider-specific client naming or default model binding;
 - no prebuilt competitor alias list;
 - task data lives in local runtime bundles, not in repository source files.
+
+## Study Workspace Model
+
+Use three separate layers:
+
+```text
+geo-monitor project
+  engine / CLI / package / skill code
+
+job workspace
+  one execution bundle under a runs directory
+  work/query_manifest.csv is temporary runner input
+  raw/, logs/, result/, job_manifest.json are audit artifacts
+
+study workspace
+  seed_prompts.yaml
+  manifests/query_manifest.v1.csv
+  runs/{job_id}/...
+  geo.duckdb
+  dashboard/
+```
+
+`work/query_manifest.csv` remains a working file and may be deleted by cleanup. Long-term
+analysis is reconstructed from `raw/attempts.jsonl`, where each new attempt includes the
+actual `query` and a `query_meta` snapshot with dimensions such as `seed_id`, `persona`,
+and `variant_id`.
 
 ## What It Measures
 
@@ -29,7 +60,10 @@ API-based monitoring and audit framework.
 
 ```mermaid
 flowchart LR
+    Study[External study workspace] --> Fanout[Persona fan-out]
+    Fanout --> Frozen[manifests/query_manifest.v1.csv]
     CLI[CLI commands] --> Job[Job lifecycle]
+    Frozen --> Job
     Job --> Manifest[job_manifest.json]
     Job --> QueryManifest[work/query_manifest.csv]
 
@@ -44,6 +78,8 @@ flowchart LR
     Metrics --> Results[result/*.csv]
     Metrics --> Report[report.md / report.html]
     Analyzer --> Logs[logs/*.json / *.jsonl]
+    Raw --> DuckDB[external geo.duckdb]
+    DuckDB --> Dashboard[external static dashboard]
 ```
 
 ## Job Lifecycle
@@ -219,14 +255,37 @@ Create a local config file such as `job_config.local.json`:
 }
 ```
 
-Run the lifecycle:
+Recommended external study workspace lifecycle:
 
 ```bash
-geo-monitor validate-job-config job_config.local.json
-geo-monitor build-job job_config.local.json
-geo-monitor run-job .runs/{job_id} --confirm-cost
-geo-monitor analyze-job .runs/{job_id} --confirm-cost
+STUDY_DIR=./my-geo-study
+mkdir -p "$STUDY_DIR/manifests" "$STUDY_DIR/runs"
+
+geo-monitor fanout \
+  --input "$STUDY_DIR/seed_prompts.yaml" \
+  --output "$STUDY_DIR/manifests/query_manifest.v1.csv"
+
+geo-monitor build-job job_config.local.json \
+  --query-manifest "$STUDY_DIR/manifests/query_manifest.v1.csv" \
+  --runs-dir "$STUDY_DIR/runs"
 ```
+
+Run a generated job:
+
+```bash
+geo-monitor validate-job-config job_config.local.json \
+  --query-manifest "$STUDY_DIR/manifests/query_manifest.v1.csv"
+geo-monitor run-job "$STUDY_DIR/runs/{job_id}" --confirm-cost
+geo-monitor analyze-job "$STUDY_DIR/runs/{job_id}" --confirm-cost
+```
+
+`validate-job-config` validates inline config queries by default. When using an
+external query manifest, pass `--query-manifest` so validation also checks the
+frozen manifest and reports the external query count.
+
+The repository `.gitignore` excludes common local study workspace outputs such
+as `my-geo-study/` and `*.duckdb`, but study data should still be treated as
+user-owned execution data rather than source code.
 
 Use mock mode for a no-cost pipeline smoke test:
 
@@ -235,16 +294,92 @@ geo-monitor run-job .runs/{job_id} --mock
 geo-monitor analyze-job .runs/{job_id} --include-mock
 ```
 
+## Persona Fan-out
+
+Example `seed_prompts.yaml`:
+
+```yaml
+seeds:
+  - seed_id: sample_beginner
+    category: sample_category
+    intent: product_recommendation
+    seed_query: "推荐一款适合新手的示例产品"
+    personas:
+      - budget_sensitive
+      - quality_oriented
+      - comparison_shopper
+      - beginner
+      - convenience_first
+```
+
+Build a frozen external manifest:
+
+```bash
+geo-monitor fanout \
+  --input ./my-geo-study/seed_prompts.yaml \
+  --output ./my-geo-study/manifests/query_manifest.v1.csv
+```
+
+Fan-out output is deterministic and uses fixed columns: `query_id`, `variant_id`,
+`seed_id`, `seed_query`, `category`, `intent`, `persona`, `template_id`, `query`,
+`language`, `generation_method`, `fanout_version`, `manifest_version`, `locked_at`.
+
+## DuckDB And Dashboard
+
+Build the external analysis cache:
+
+```bash
+geo-monitor db build --runs ./my-geo-study/runs --output ./my-geo-study/geo.duckdb
+geo-monitor db inspect --db ./my-geo-study/geo.duckdb
+geo-monitor db query --db ./my-geo-study/geo.duckdb \
+  "select seed_id, persona, count(*) from queries group by 1,2"
+```
+
+Build a static dashboard:
+
+```bash
+geo-monitor dashboard build \
+  --db ./my-geo-study/geo.duckdb \
+  --out ./my-geo-study/dashboard
+```
+
+DuckDB is a rebuildable analysis cache. It does not replace raw JSONL. It reads query
+dimensions from raw attempt `query_meta` and does not require `work/query_manifest.csv`.
+
+## Plugin / Skill API
+
+```python
+from geo_monitor.tool import run_geo_monitor
+
+result = run_geo_monitor(
+    config_path="job_config.local.json",
+    study_dir="./my-geo-study",
+    query_manifest_path="./my-geo-study/manifests/query_manifest.v1.csv",
+    mock=True,
+    build_db=True,
+    build_dashboard=False,
+)
+
+print(result.summary_markdown)
+print(result.metrics)
+```
+
+High-level API calls require either `study_dir` or `runs_dir`. `query_manifest_path` is
+explicit and is never guessed from a study directory.
+
 ## Public CLI Surface
 
 ```text
 doctor
 validate-job-config
+fanout
 build-job
 run-job
 analyze-job
 cleanup-job
 export-csv
+db build / db inspect / db query
+dashboard build
 ```
 
 Cost-producing live calls require explicit `--confirm-cost`.
