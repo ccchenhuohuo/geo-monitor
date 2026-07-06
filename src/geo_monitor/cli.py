@@ -91,10 +91,19 @@ def build_job_command(
 def fanout_command(
     input_path: Annotated[Path, typer.Option("--input", help="seed_prompts.yaml 输入路径")],
     output_path: Annotated[Path, typer.Option("--output", help="外部 frozen query_manifest.csv 输出路径")],
+    persona_template_registry: Annotated[
+        Path | None,
+        typer.Option("--persona-template-registry", help="显式 external persona template registry YAML"),
+    ] = None,
     force: bool = typer.Option(False, "--force", help="允许覆盖已存在 manifest"),
 ) -> None:
     try:
-        result = build_query_manifest(input_path, output_path, force=force)
+        result = build_query_manifest(
+            input_path,
+            output_path,
+            force=force,
+            persona_template_registry_path=persona_template_registry,
+        )
     except FanoutError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]fanout 完成：{result['output']}（{result['row_count']} 行）[/green]")

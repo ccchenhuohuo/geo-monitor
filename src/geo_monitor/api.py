@@ -70,6 +70,7 @@ def run_geo_monitor(
     study_dir: str | Path | None = None,
     runs_dir: str | Path | None = None,
     seed_prompts_path: str | Path | None = None,
+    persona_template_registry_path: str | Path | None = None,
     query_manifest_path: str | Path | None = None,
     db_path: str | Path | None = None,
     dashboard_out: str | Path | None = None,
@@ -103,7 +104,12 @@ def run_geo_monitor(
         manifest_path = Path(paths.query_manifest_path)
         existed = manifest_path.exists()
         if fanout_force or not existed:
-            built = build_query_manifest(seed_prompts_path, manifest_path, force=fanout_force)
+            built = build_query_manifest(
+                seed_prompts_path,
+                manifest_path,
+                force=fanout_force,
+                persona_template_registry_path=persona_template_registry_path,
+            )
             fanout_result = {**built, "action": "overwritten" if existed else "generated"}
         else:
             fanout_result = {"output": str(manifest_path), "action": "reused"}

@@ -110,7 +110,8 @@ attempt 都包含实际发送给模型的 query text，以及 `query_meta` snaps
 保存在 `query_metadata_json` 中的自定义 manifest metadata。
 
 真实长期 study 建议放在仓库外部目录。仓库 `.gitignore` 也会忽略常见本地 study 输出，
-例如 `my-geo-study/`、`study/`、`*.duckdb`。
+例如 `my-geo-study/`、`study/`、`*.duckdb`。仓库根目录刻意不再保留 `outputs/`
+占位目录；如果本地出现该目录，应视为临时数据，并把真实 study 移到 external workspace。
 
 ## 数据边界
 
@@ -248,7 +249,8 @@ geo-monitor fanout \
   --output ./study/manifests/query_manifest.v1.csv
 ```
 
-相同输入和版本下，fan-out 输出 byte-stable。固定 CSV 字段如下：
+相同输入和版本下，fan-out 输出 byte-stable。未传 external registry 时，fan-out 使用内置
+persona 模板，固定 CSV 字段如下：
 
 ```text
 query_id, variant_id, seed_id, seed_query, category, intent, persona,
@@ -256,7 +258,39 @@ template_id, query, language, generation_method, fanout_version,
 manifest_version, locked_at
 ```
 
-## 输出产物
+高级 study 可以显式使用 external persona template registry，把行业、语言或市场相关的 query
+改写规则放在源码外控制：
+
+```yaml
+schema_version: persona-template-registry-v1
+registry_id: default_zh_cn
+registry_version: v1
+personas:
+  beginner:
+    template_id: beginner_help
+    template: "我是新手，{seed_query}"
+fallback:
+  template_id: default
+  template: "{seed_query}"
+```
+
+```bash
+geo-monitor fanout \
+  --input ./study/seed_prompts.yaml \
+  --output ./study/manifests/query_manifest.v1.csv \
+  --persona-template-registry ./study/persona_templates.yaml
+```
+
+Registry 模式是显式且严格的：每个 persona 必须存在于 registry，或由显式 `fallback` 覆盖。
+Registry 输出会追加审计列：`template_source`、`template_registry_id`、
+`template_registry_version`、`template_registry_schema_version`、
+`template_registry_sha256`、`template_hash`。template 文本变化会进入 query id digest，
+因此历史 study 应继续使用当时冻结的 manifest，而不是重新生成旧输入。
+
+Registry template 会直接变成模型请求文本。除非是有意实验设计，否则不要把 target brand、
+竞品列表或敏感业务上下文写进 template。
+
+## Job workspace 产物
 
 每个 job workspace 结构如下：
 

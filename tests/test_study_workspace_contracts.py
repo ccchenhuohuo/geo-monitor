@@ -343,6 +343,62 @@ seeds:
     assert "changed query" in manifest.read_text(encoding="utf-8")
 
 
+def test_tool_api_uses_persona_template_registry_for_generated_manifest(tmp_path):
+    pytest.importorskip("duckdb")
+    study = tmp_path / "study"
+    runs = study / "runs"
+    manifest = study / "manifests" / "query_manifest.v1.csv"
+    config = tmp_path / "job_config.json"
+    seed = study / "seed_prompts.yaml"
+    registry = study / "persona_templates.yaml"
+    _write_config(config)
+    _write_seed(seed)
+    registry.write_text(
+        """
+schema_version: persona-template-registry-v1
+registry_id: api_registry
+registry_version: v1
+personas:
+  beginner:
+    template_id: api_beginner
+    template: "API registry: {seed_query}"
+  budget_sensitive:
+    template_id: api_budget
+    template: "API budget: {seed_query}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = run_geo_monitor(
+        config_path=config,
+        runs_dir=runs,
+        seed_prompts_path=seed,
+        query_manifest_path=manifest,
+        persona_template_registry_path=registry,
+        mock=True,
+        build_db=False,
+    )
+    bundle = Path(result.artifact_paths["bundle_dir"])
+    raw_rows = read_jsonl(bundle / "raw" / "attempts.jsonl")
+
+    assert result.metrics["fanout"]["action"] == "generated"
+    assert result.metrics["fanout"]["template_registry_id"] == "api_registry"
+    assert "API registry: 推荐一款适合新手的示例产品" in manifest.read_text(encoding="utf-8")
+    assert raw_rows
+    for row in raw_rows:
+        metadata = json.loads(row["query_meta"]["query_metadata_json"])
+        assert metadata["template_registry_id"] == "api_registry"
+        assert metadata["template_source"] == "registry"
+        assert len(metadata["template_hash"]) == 64
+
+    db = study / "geo.duckdb"
+    build_duckdb(runs, db)
+    columns, rows = query_duckdb(db, "select query_metadata_json from queries order by query_id")
+    assert columns == ["query_metadata_json"]
+    assert rows
+    assert all(json.loads(row[0])["template_registry_id"] == "api_registry" for row in rows)
+
+
 def test_tool_api_reuses_existing_manifest_without_fanout_force(tmp_path):
     study = tmp_path / "study"
     runs = study / "runs"
@@ -393,4 +449,9 @@ def test_gitignore_protects_common_local_study_outputs():
     ignore = Path(".gitignore").read_text(encoding="utf-8")
 
     assert "my-geo-study/" in ignore
+    assert "geo-study/" in ignore
+    assert "study/" in ignore
     assert "*.duckdb" in ignore
+    assert "outputs/*" not in ignore
+    assert "!outputs/.gitkeep" not in ignore
+    assert not Path("outputs/.gitkeep").exists()

@@ -16,6 +16,10 @@ def test_packaged_examples_are_available():
 
     assert root.joinpath("examples/job_config.example.json").is_file()
     assert root.joinpath("examples/seed_prompts.example.yaml").is_file()
+    packaged_registry = root.joinpath("examples/persona_templates.example.yaml").read_text(encoding="utf-8")
+    top_level_registry = Path("examples/persona_templates.example.yaml").read_text(encoding="utf-8")
+    assert packaged_registry == top_level_registry
+    assert "persona-template-registry-v1" in packaged_registry
 
 
 def test_packaged_docs_are_available():

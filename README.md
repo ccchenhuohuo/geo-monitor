@@ -119,7 +119,9 @@ custom manifest metadata preserved in `query_metadata_json`.
 
 For real studies, prefer a directory outside the repository. The repository also
 ignores common local study outputs such as `my-geo-study/`, `study/`, and
-`*.duckdb`.
+`*.duckdb`. There is intentionally no repository-root `outputs/` placeholder; if
+one appears locally, treat it as scratch data and move real studies into an
+external workspace.
 
 ## Data Boundary
 
@@ -264,8 +266,8 @@ geo-monitor fanout \
   --output ./study/manifests/query_manifest.v1.csv
 ```
 
-Fan-out output is byte-stable for the same input and version. It uses fixed CSV
-columns:
+Fan-out output is byte-stable for the same input and version. Without an external
+registry it uses the built-in persona templates and fixed CSV columns:
 
 ```text
 query_id, variant_id, seed_id, seed_query, category, intent, persona,
@@ -273,7 +275,42 @@ template_id, query, language, generation_method, fanout_version,
 manifest_version, locked_at
 ```
 
-## Outputs
+Advanced studies can opt in to an external persona template registry when
+industry-, language-, or market-specific query wording should be controlled
+outside source code:
+
+```yaml
+schema_version: persona-template-registry-v1
+registry_id: default_zh_cn
+registry_version: v1
+personas:
+  beginner:
+    template_id: beginner_help
+    template: "我是新手，{seed_query}"
+fallback:
+  template_id: default
+  template: "{seed_query}"
+```
+
+```bash
+geo-monitor fanout \
+  --input ./study/seed_prompts.yaml \
+  --output ./study/manifests/query_manifest.v1.csv \
+  --persona-template-registry ./study/persona_templates.yaml
+```
+
+Registry mode is explicit and strict: every persona must exist in the registry or
+be covered by an explicit `fallback`. Registry output appends audit columns
+(`template_source`, `template_registry_id`, `template_registry_version`,
+`template_registry_schema_version`, `template_registry_sha256`, `template_hash`).
+Template text changes are included in the query id digest, so historical studies
+should keep using their frozen manifest instead of regenerating old inputs.
+
+Registry templates become model request text. Do not put target brands,
+competitor lists, or sensitive business context into templates unless that is an
+intentional experiment design.
+
+## Job Workspace Artifacts
 
 Each job workspace contains:
 

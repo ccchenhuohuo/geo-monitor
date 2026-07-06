@@ -80,6 +80,84 @@ def test_validate_job_config_cli_accepts_external_manifest_without_inline_querie
     assert "任务配置有效" in result.output
 
 
+def test_fanout_cli_accepts_persona_template_registry(tmp_path):
+    seed = tmp_path / "seed_prompts.yaml"
+    registry = tmp_path / "persona_templates.yaml"
+    manifest = tmp_path / "query_manifest.csv"
+    seed.write_text(
+        "seeds:\n  - seed_id: sample\n    seed_query: example query\n    personas:\n      - beginner\n",
+        encoding="utf-8",
+    )
+    registry.write_text(
+        """
+schema_version: persona-template-registry-v1
+registry_id: cli_registry
+registry_version: v1
+personas:
+  beginner:
+    template_id: cli_template
+    template: "CLI registry: {seed_query}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fanout",
+            "--input",
+            str(seed),
+            "--output",
+            str(manifest),
+            "--persona-template-registry",
+            str(registry),
+        ],
+    )
+
+    assert result.exit_code == 0
+    text = manifest.read_text(encoding="utf-8")
+    assert "template_registry_id" in text
+    assert "CLI registry: example query" in text
+
+
+def test_fanout_cli_reports_malformed_persona_template_registry(tmp_path):
+    seed = tmp_path / "seed_prompts.yaml"
+    registry = tmp_path / "persona_templates.yaml"
+    manifest = tmp_path / "query_manifest.csv"
+    seed.write_text(
+        "seeds:\n  - seed_id: sample\n    seed_query: example query\n    personas:\n      - beginner\n",
+        encoding="utf-8",
+    )
+    registry.write_text(
+        """
+schema_version: persona-template-registry-v1
+registry_id: bad_registry
+registry_version: v1
+personas:
+  beginner:
+    template_id: cli_template
+    template: "missing placeholder"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fanout",
+            "--input",
+            str(seed),
+            "--output",
+            str(manifest),
+            "--persona-template-registry",
+            str(registry),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "seed_query" in result.output
+
+
 def test_build_and_cleanup_job_cli_smoke(tmp_path):
     config = _write_job_config(tmp_path)
     bundle = tmp_path / "bundle"
