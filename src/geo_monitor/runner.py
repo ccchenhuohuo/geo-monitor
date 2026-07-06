@@ -324,6 +324,23 @@ def _elapsed_ms(start: float) -> int:
 
 def _query_meta(query: QueryRecord) -> dict[str, str]:
     metadata = query.metadata_with_tags()
+    first_class = {
+        "variant_id",
+        "seed_id",
+        "seed_query",
+        "category",
+        "intent",
+        "persona",
+        "template_id",
+        "locale",
+        "market",
+        "tags",
+        "language",
+        "generation_method",
+        "fanout_version",
+        "manifest_version",
+        "locked_at",
+    }
 
     def text(key: str, default: str = "") -> str:
         value = metadata.get(key, default)
@@ -331,6 +348,19 @@ def _query_meta(query: QueryRecord) -> dict[str, str]:
             return default
         return str(value)
 
+    def tags_text() -> str:
+        value = metadata.get("tags", query.tags)
+        if value in (None, ""):
+            return ""
+        if isinstance(value, list):
+            return ",".join(str(item).strip() for item in value if str(item).strip())
+        return str(value).strip()
+
+    custom_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key not in first_class and value not in (None, "")
+    }
     return {
         "schema_version": "query-meta-v1",
         "variant_id": text("variant_id"),
@@ -340,8 +370,13 @@ def _query_meta(query: QueryRecord) -> dict[str, str]:
         "intent": text("intent"),
         "persona": text("persona"),
         "template_id": text("template_id"),
+        "locale": text("locale", str(query.locale or "")),
+        "market": text("market", str(query.market or "")),
+        "tags": tags_text(),
         "language": text("language", str(query.locale or "")),
         "generation_method": text("generation_method", "config"),
         "fanout_version": text("fanout_version"),
         "manifest_version": text("manifest_version"),
+        "locked_at": text("locked_at"),
+        "query_metadata_json": json.dumps(custom_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
     }

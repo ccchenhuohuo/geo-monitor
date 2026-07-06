@@ -15,8 +15,17 @@ def test_retryable_status_classification():
     assert is_retryable_api_error(ValueError("bad input")) is False
 
 
+def test_client_rejects_placeholder_endpoint():
+    try:
+        LLMResponsesClient(Settings(llm_api_key="test"))
+    except RuntimeError as exc:
+        assert "LLM_BASE_URL" in str(exc)
+    else:
+        raise AssertionError("expected placeholder endpoint rejection")
+
+
 def test_client_retries_retryable_status_then_succeeds():
-    settings = Settings(llm_api_key="test", retry_max_attempts=3)
+    settings = Settings(llm_api_key="test", llm_base_url="https://provider.example/v1", retry_max_attempts=3)
     client = LLMResponsesClient(settings)
     calls = {"count": 0}
 
@@ -33,7 +42,7 @@ def test_client_retries_retryable_status_then_succeeds():
 
 
 def test_client_does_not_retry_non_retryable_status():
-    settings = Settings(llm_api_key="test", retry_max_attempts=3)
+    settings = Settings(llm_api_key="test", llm_base_url="https://provider.example/v1", retry_max_attempts=3)
     client = LLMResponsesClient(settings)
     calls = {"count": 0}
 

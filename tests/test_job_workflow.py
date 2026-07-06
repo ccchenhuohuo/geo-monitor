@@ -2,11 +2,17 @@ import csv
 import json
 from pathlib import Path
 
+from geo_monitor.analysis.cache import extraction_cache_key, response_text_hash
 from geo_monitor.config import Settings
 from geo_monitor.exporters import read_jsonl
 from geo_monitor.job import BUNDLE_LOCK, JobError, build_job_bundle, cleanup_job_bundle, estimate_job_run, run_job_bundle, validate_job_config, _job_lock
 from geo_monitor.job_analysis import CSV_FIELD_SCHEMAS, analyze_job_bundle
+from geo_monitor.analysis.pipeline import EXTRACTION_SCHEMA_VERSION
 from geo_monitor.runner import compute_request_hash
+
+
+def _live_test_settings() -> Settings:
+    return Settings(llm_api_key="test-key", llm_base_url="https://provider.example/v1")
 
 
 def _write_job_config(path: Path) -> None:
@@ -223,6 +229,24 @@ def test_validate_job_config_rejects_unknown_root_fields(tmp_path):
     except JobError as exc:
         assert "未知字段" in str(exc)
         assert "repeat" in str(exc)
+    else:
+        raise AssertionError("expected JobError")
+
+
+def test_schema_documents_external_manifest_runtime_mode_and_runtime_rejects_bare_no_query_config(tmp_path):
+    schema = json.loads(Path("data/job_config.schema.json").read_text(encoding="utf-8"))
+    assert "external manifest mode" in schema["description"]
+    assert schema["properties"]["repeats"]["oneOf"]
+    config_path = tmp_path / "job_config.json"
+    config_path.write_text(
+        json.dumps({"target_brand": "TestAEntity", "industry": "TestIndustry", "repeats": "1"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    try:
+        validate_job_config(config_path, settings=Settings(llm_api_key=None))
+    except JobError as exc:
+        assert "queries" in str(exc)
     else:
         raise AssertionError("expected JobError")
 
@@ -680,6 +704,373 @@ def test_analyze_job_bundle_live_extraction_requires_confirm_cost(tmp_path):
     assert manifest["status"] == "analysis_failed"
 
 
+def test_analyze_job_reuses_live_extraction_and_canonicalization_cache(tmp_path, monkeypatch):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "CacheBrand is mentioned.",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+    calls = {"extract": 0, "canonicalize": 0}
+
+    class FakeLLMBrandExtractor:
+        def __init__(self, settings, *, model=None):
+            self.model = model or "test-model"
+
+        def extract_record(self, record):
+            calls["extract"] += 1
+            return [
+                {
+                    "query_id": record["query_id"],
+                    "repeat_index": record["repeat_index"],
+                    "input_query": record["input_query"],
+                    "brand_name_raw": "CacheBrand",
+                    "brand_type": "公司",
+                    "evidence": "CacheBrand",
+                    "role": "mentioned",
+                    "confidence": 0.9,
+                    "sov_eligible": True,
+                }
+            ], None
+
+        def canonicalize(self, names):
+            calls["canonicalize"] += 1
+            return {name: name for name in names}, None
+
+    monkeypatch.setattr("geo_monitor.analysis.pipeline.LLMBrandExtractor", FakeLLMBrandExtractor)
+
+    first = analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
+    second = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None))
+    monkeypatch.undo()
+    third = analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
+
+    assert calls == {"extract": 1, "canonicalize": 1}
+    assert first["cache"]["extraction_cache_writes"] == 1
+    assert second["cache"]["extraction_cache_hits"] == 1
+    assert second["cache"]["canonicalization_cache_hits"] == 1
+    assert third["cache"]["extraction_cache_hits"] == 1
+    assert third["cache"]["canonicalization_cache_hits"] == 1
+    assert third["cache"]["analysis_llm_requests_remaining"] == 0
+
+
+def test_analyze_job_cache_invalidates_when_response_text_changes(tmp_path, monkeypatch):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "CacheBrand is mentioned.",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    raw_path = bundle / "raw" / "attempts.jsonl"
+    raw_path.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    class FakeLLMBrandExtractor:
+        def __init__(self, settings, *, model=None):
+            self.model = model or "test-model"
+
+        def extract_record(self, record):
+            return [
+                {
+                    "query_id": record["query_id"],
+                    "repeat_index": record["repeat_index"],
+                    "input_query": record["input_query"],
+                    "brand_name_raw": "CacheBrand",
+                    "brand_type": "公司",
+                    "evidence": "CacheBrand",
+                    "role": "mentioned",
+                    "confidence": 0.9,
+                    "sov_eligible": True,
+                }
+            ], None
+
+        def canonicalize(self, names):
+            return {name: name for name in names}, None
+
+    monkeypatch.setattr("geo_monitor.analysis.pipeline.LLMBrandExtractor", FakeLLMBrandExtractor)
+    analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
+    row["response_text"] = "ChangedBrand is mentioned."
+    _make_contract_valid(row)
+    raw_path.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        analyze_job_bundle(bundle, settings=Settings(llm_api_key=None))
+    except ValueError as exc:
+        assert "confirm_cost" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_extraction_cache_rebinds_record_context_for_identical_response_text(tmp_path, monkeypatch):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    rows = [
+        {
+            "run_id": "r",
+            "query_id": "q001",
+            "repeat_index": 1,
+            "repeat_total": 1,
+            "model": "test-model",
+            "input_query": "best local providers",
+            "status": "success",
+            "response_text": "SharedBrand is mentioned.",
+            "sources": [],
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "completed_at": "2026-01-01T00:00:01+00:00",
+        },
+        {
+            "run_id": "r",
+            "query_id": "q002",
+            "repeat_index": 1,
+            "repeat_total": 1,
+            "model": "test-model",
+            "input_query": "top premium studios",
+            "status": "success",
+            "response_text": "SharedBrand is mentioned.",
+            "sources": [],
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "completed_at": "2026-01-01T00:00:02+00:00",
+        },
+    ]
+    _make_contract_valid(rows)
+    (bundle / "raw" / "attempts.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    calls = {"extract": 0, "canonicalize": 0}
+
+    class FakeLLMBrandExtractor:
+        def __init__(self, settings, *, model=None):
+            self.model = model or "test-model"
+
+        def extract_record(self, record):
+            calls["extract"] += 1
+            return [
+                {
+                    "query_id": record["query_id"],
+                    "repeat_index": record["repeat_index"],
+                    "input_query": record["input_query"],
+                    "brand_name_raw": "SharedBrand",
+                    "brand_type": "公司",
+                    "evidence": "SharedBrand",
+                    "role": "mentioned",
+                    "confidence": 0.9,
+                    "sov_eligible": True,
+                }
+            ], None
+
+        def canonicalize(self, names):
+            calls["canonicalize"] += 1
+            return {name: name for name in names}, None
+
+    monkeypatch.setattr("geo_monitor.analysis.pipeline.LLMBrandExtractor", FakeLLMBrandExtractor)
+
+    result = analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
+
+    assert calls["extract"] == 1
+    assert result["cache"]["extraction_cache_hits"] == 1
+    assert result["cache"]["extraction_cache_misses"] == 1
+    assert {row["query_id"] for row in result["brand_by_query"]} == {"q001", "q002"}
+    extracted = list(csv.DictReader((bundle / "result" / "brand_mentions_extracted.csv").open(encoding="utf-8-sig")))
+    assert [row["query_id"] for row in extracted] == ["q001", "q002"]
+
+
+def test_extraction_cache_hit_revalidates_traceability_and_schema_version(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "TraceableBrand is mentioned.",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+    cache_path = bundle / "logs" / "extraction_cache.jsonl"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    current_key = extraction_cache_key(
+        response_text_hash_value=response_text_hash(row),
+        schema_version=EXTRACTION_SCHEMA_VERSION,
+        extractor_model="test-model",
+    )
+    old_key = extraction_cache_key(
+        response_text_hash_value=response_text_hash(row),
+        schema_version="brand-extraction-v2",
+        extractor_model="test-model",
+    )
+    cache_rows = [
+        {
+            "cache_key": current_key,
+            "rows": [
+                {
+                    "query_id": "old",
+                    "repeat_index": 1,
+                    "input_query": "old",
+                    "brand_name_raw": "HallucinatedBrand",
+                    "brand_type": "公司",
+                    "evidence": "TraceableBrand is mentioned",
+                }
+            ],
+            "error": None,
+        },
+        {
+            "cache_key": old_key,
+            "rows": [
+                {
+                    "query_id": "old",
+                    "repeat_index": 1,
+                    "input_query": "old",
+                    "brand_name_raw": "TraceableBrand",
+                    "brand_type": "公司",
+                    "evidence": "TraceableBrand",
+                }
+            ],
+            "error": None,
+        },
+    ]
+    cache_path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in cache_rows), encoding="utf-8")
+
+    try:
+        analyze_job_bundle(bundle, settings=Settings(llm_api_key=None))
+    except ValueError as exc:
+        assert "confirm_cost" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_analyze_job_logs_traceability_quarantine_rows(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "TraceableBrand is mentioned.",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    def extractor(record):
+        return [
+            {
+                "query_id": "q001",
+                "repeat_index": 1,
+                "input_query": record["input_query"],
+                "brand_name_raw": "TraceableBrand",
+                "brand_type": "公司",
+                "evidence": "TraceableBrand",
+                "role": "mentioned",
+                "confidence": 0.9,
+                "sov_eligible": True,
+            }
+        ], {
+            "type": "TraceabilityQuarantine",
+            "message": "3 items quarantined",
+            "query_id": "q001",
+            "repeat_index": 1,
+            "quarantined_rows": [
+                {
+                    "query_id": "q001",
+                    "repeat_index": 1,
+                    "input_query": record["input_query"],
+                    "brand_name_raw": "HallucinatedBrandA",
+                    "evidence": "not in response",
+                    "reason": "untraceable_extraction_item",
+                },
+                {
+                    "query_id": "q001",
+                    "repeat_index": 1,
+                    "input_query": record["input_query"],
+                    "brand_name_raw": "HallucinatedBrandB",
+                    "evidence": "not in response",
+                    "reason": "untraceable_extraction_item",
+                },
+                {
+                    "query_id": "q001",
+                    "repeat_index": 1,
+                    "input_query": record["input_query"],
+                    "brand_name_raw": "HallucinatedBrandC",
+                    "evidence": "not in response",
+                    "reason": "untraceable_extraction_item",
+                },
+            ],
+        }
+
+    result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+    errors = read_jsonl(bundle / "logs" / "extraction_errors.jsonl")
+
+    assert result["extracted_mention_count"] == 1
+    assert result["data_quality"]["conclusion_strength"] == "observational"
+    assert result["data_quality"]["traceability_quarantine_count"] == 3
+    assert result["data_quality"]["extraction_error_record_count"] == 1
+    assert result["data_quality"]["extraction_error_row_count"] == 3
+    assert result["data_quality"]["extraction_error_rate"] == "100.0%"
+    assert result["extraction_error_count"] == 1
+    assert result["extraction_error_row_count"] == 3
+    assert len(errors) == 3
+    assert errors[0]["brand_name_raw"] == "HallucinatedBrandA"
+    assert errors[0]["reason"] == "untraceable_extraction_item"
+
+
 def test_analyze_job_computes_sov_and_upserts_cross_job_aggregates(tmp_path):
     config_path = tmp_path / "job_config.json"
     runs_root = tmp_path / ".runs"
@@ -798,6 +1189,26 @@ def test_cross_job_brand_trends_has_stable_header_when_no_brands(tmp_path):
     assert "job_id" in header
     assert "sov_event_share" in header
     assert header != "empty"
+
+
+def test_analyze_job_can_disable_cross_job_aggregates(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    runs_root = tmp_path / ".runs"
+    bundle = runs_root / "job_no_aggregate"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {"run_id": "r", "query_id": "q001", "repeat_index": 1, "repeat_total": 1, "model": "test-model", "input_query": "best local providers", "status": "success", "response_text": "No brands", "sources": [], "started_at": "2026-01-01T00:00:00+00:00", "completed_at": "2026-01-01T00:00:01+00:00"}
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=lambda record: ([], None), write_aggregates=False)
+
+    assert not (runs_root / "index.jsonl").exists()
+    assert not (runs_root / "aggregate").exists()
 
 
 def test_analyze_job_uses_target_aliases_and_filters_source_entities(tmp_path):

@@ -24,7 +24,7 @@ Early engine. The core workflow is usable locally:
 - static local dashboard;
 - embeddable Python API for Plugin / Skill / Agent workflows.
 
-License has not been specified yet.
+Licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## What It Does
 
@@ -54,7 +54,7 @@ Responses API under a controlled query manifest.
   `query_meta`.
 - **Brand extraction**: discover brands/entities from answers without a bundled
   competitor list.
-- **Metrics and reports**: CSV, Markdown, HTML, and optional PDF outputs.
+- **Metrics and reports**: CSV, Markdown, HTML, and best-effort optional PDF outputs.
 - **DuckDB analysis layer**: rebuildable local cache for cross-run analysis.
 - **Static dashboard**: local HTML dashboard without a backend service.
 - **Python API**: structured result object for external agents and workflows.
@@ -114,7 +114,8 @@ study workspace
 `work/query_manifest.csv` may be deleted after execution. Long-term analysis is
 reconstructed from `raw/attempts.jsonl`, where each new attempt includes the
 actual query text and a `query_meta` snapshot containing dimensions such as
-`seed_id`, `persona`, `intent`, `template_id`, and `variant_id`.
+`seed_id`, `persona`, `intent`, `template_id`, `variant_id`, `locked_at`, and
+custom manifest metadata preserved in `query_metadata_json`.
 
 For real studies, prefer a directory outside the repository. The repository also
 ignores common local study outputs such as `my-geo-study/`, `study/`, and
@@ -149,6 +150,13 @@ Example live request shape:
 
 The request does not include `target_brand`, `industry`, `market`, or competitor
 names.
+
+`raw/attempts.jsonl` is sensitive local audit data. It may contain raw model
+outputs, citation snippets, source URLs, provider metadata, business query text,
+and brand/project context embedded in prompts or responses. Keep study
+workspaces in user-controlled paths with appropriate filesystem permissions;
+shared job bundles may need redaction. The project stays audit-first and keeps
+raw attempts by default.
 
 ## Quick Start: Local Mock Run
 
@@ -195,11 +203,13 @@ Open:
 
 ## Live API Configuration
 
-Copy `.env.example` to `.env` and configure an OpenAI-compatible Responses API
-provider.
+Configure an OpenAI-compatible Responses API provider through environment
+variables, or opt in to an explicit env file. The CLI no longer trusts a `.env`
+file from the current working directory by default.
 
 ```bash
-cp .env.example .env
+cp .env.example /tmp/geo-monitor.env
+export GEO_MONITOR_ENV_FILE=/tmp/geo-monitor.env
 ```
 
 ```bash
@@ -212,6 +222,11 @@ REQUEST_TIMEOUT_SECONDS=90
 RETRY_MAX_ATTEMPTS=3
 CONCURRENCY=1
 ```
+
+`https://api.example.com/v1` is a placeholder endpoint. Live commands refuse to
+run until `LLM_BASE_URL` points at a real `http(s)` endpoint and `LLM_API_KEY` is
+configured. Run `geo-monitor doctor` to inspect the active endpoint, API key
+status, and env-file source.
 
 Live sampling and live LLM extraction may incur provider costs. Commands that
 can produce live costs require explicit `--confirm-cost`.
@@ -292,10 +307,25 @@ runs/{job_id}/
     source_by_query.csv
     report.md
     report.html
+    report.pdf              # optional, best-effort
 ```
 
 `work/` is temporary. `raw/`, `logs/`, `result/`, and `job_manifest.json` are
-retained for audit.
+retained for audit. `analyze-job` removes `work/` by default after analysis;
+use `--keep-work` when debugging intermediate extraction files.
+
+When analysis writes study-level aggregates, the runs directory also contains:
+
+```text
+runs/index.jsonl
+runs/aggregate/brand_trends.csv
+runs/aggregate/target_brand_trends.csv
+```
+
+These files are compact cross-run study summaries. They are useful long-term
+study state, but they can be rebuilt from retained job bundles. Embedded or
+single-bundle workflows can use `analyze-job --no-aggregate` or
+`run_geo_monitor(..., write_aggregates=False)`.
 
 ## Metrics
 
@@ -310,6 +340,9 @@ flowchart LR
     Sources --> SourceMetrics["source_domains.csv<br/>source_urls.csv<br/>source_by_query.csv"]
     RawAnswer --> Quality["data_quality.json"]
 ```
+
+See [docs/metrics.md](docs/metrics.md) for metric denominators, grain, mock/live
+rules, partial-sample caveats, and currently overlapping SOV fields.
 
 Current metrics include:
 
@@ -336,6 +369,12 @@ geo-monitor db query --db ./study/geo.duckdb \
   "select seed_id, persona, count(*) from queries group by 1,2"
 ```
 
+`db query` is a restricted local read-only analysis helper. It rejects multi-
+statement SQL, write/admin statements, and DuckDB external file-reading
+functions. Advanced admin SQL should be run with DuckDB's own tools by trusted
+operators. Agent-facing or embedded workflows should prefer typed Python API
+results instead of raw SQL.
+
 Build a static dashboard:
 
 ```bash
@@ -350,7 +389,7 @@ React/Vue app, or hosted database.
 ## Python API
 
 ```python
-from geo_monitor.tool import run_geo_monitor
+from geo_monitor import run_geo_monitor
 
 result = run_geo_monitor(
     config_path="examples/job_config.example.json",
@@ -368,6 +407,14 @@ print(result.artifact_paths)
 
 High-level API calls require either `study_dir` or `runs_dir`. Explicit paths
 win. `query_manifest_path` is never guessed from a study directory.
+`geo_monitor.api` is the canonical implementation module; `geo_monitor` re-
+exports it for convenience. `geo_monitor.tool` remains available only as a
+backward-compatible import shim.
+
+Installed wheels include packaged copies of the job config schema, examples,
+metrics reference, and Simplified Chinese README under `geo_monitor/data`,
+`geo_monitor/examples`, and `geo_monitor/docs`. Source checkouts can keep using
+the top-level `data/`, `examples/`, and `docs/` paths shown above.
 
 ## CLI Reference
 
@@ -394,14 +441,16 @@ src/geo_monitor/
   fanout.py              # seed prompt -> persona query manifest
   job.py                 # build/run/cleanup job lifecycle
   runner.py              # repeated sampling, resume, concurrency
-  job_analysis.py        # extraction, metrics, reports, aggregates
+  analysis/              # extraction pipeline, metrics, reports, aggregates
+  job_analysis.py        # compatibility facade for analysis imports
   brand_extraction.py    # LLM extraction schema and canonicalization
   response_parser.py     # response text/source parsing
   exporters.py           # JSONL/CSV utilities
   reporting.py           # Markdown/HTML/PDF helpers
   db.py                  # DuckDB analysis cache
   dashboard.py           # static HTML dashboard
-  tool.py                # embeddable Python API
+  api.py                 # stable public Python API implementation
+  tool.py                # backward-compatible API import shim
 
 data/
   job_config.schema.json
@@ -434,3 +483,7 @@ python -m pytest
 
 The repository intentionally excludes `.env`, `.runs/`, `.venv/`, local study
 workspaces, DuckDB files, cache directories, and generated task data.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

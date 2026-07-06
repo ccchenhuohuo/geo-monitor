@@ -56,12 +56,21 @@ def extract_usage(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 def extract_sources(raw: dict[str, Any]) -> list[SourceRecord]:
     candidates: list[dict[str, Any]] = []
-    for item in _walk(raw):
-        if not isinstance(item, Mapping):
-            continue
-        item_dict = dict(item)
-        if _looks_like_source(item_dict):
-            candidates.append(item_dict)
+
+    def visit(node: Any, *, hinted: bool = False) -> None:
+        if isinstance(node, Mapping):
+            item_dict = dict(node)
+            source_type = str(item_dict.get("type", "")).lower()
+            current_hinted = hinted or "citation" in source_type or "search" in source_type
+            if _looks_like_source(item_dict, hinted=current_hinted):
+                candidates.append(item_dict)
+            for key, child in node.items():
+                visit(child, hinted=current_hinted or key in SOURCE_HINT_KEYS)
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for child in node:
+                visit(child, hinted=hinted)
+
+    visit(raw)
 
     seen: set[tuple[str | None, str | None]] = set()
     sources: list[SourceRecord] = []
@@ -96,12 +105,12 @@ def _walk(value: Any) -> list[Any]:
     return out
 
 
-def _looks_like_source(item: dict[str, Any]) -> bool:
+def _looks_like_source(item: dict[str, Any], *, hinted: bool = False) -> bool:
     keys = set(item.keys())
     has_url = any(k in keys and isinstance(item.get(k), str) and str(item.get(k)).startswith(("http://", "https://")) for k in URL_KEYS)
     source_type = str(item.get("type", "")).lower()
     has_source_hint = bool(keys & SOURCE_HINT_KEYS) or "citation" in source_type or "search" in source_type
-    return has_url and (has_source_hint or bool(keys & TITLE_KEYS))
+    return has_url and (hinted or has_source_hint)
 
 
 def _first_str(item: Mapping[str, Any], keys: set[str]) -> str | None:

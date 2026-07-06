@@ -1,4 +1,4 @@
-from geo_monitor.brand_extraction import normalize_extraction_items, parse_canonical_map, parse_json_payload
+from geo_monitor.brand_extraction import LLMBrandExtractor, normalize_extraction_items, normalize_extraction_items_with_quarantine, parse_canonical_map, parse_json_payload
 
 
 def test_parse_json_payload_accepts_code_fence():
@@ -69,3 +69,82 @@ def test_parse_canonical_map_keeps_unknown_names_as_themselves():
     assert mapping["TDG"] == "TestDesignGroup / TDG"
     assert mapping["TestDesignGroup"] == "TestDesignGroup / TDG"
     assert mapping["TestPeerEntity"] == "TestPeerEntity"
+
+
+def test_normalize_extraction_items_quarantines_only_untraceable_rows():
+    rows, quarantined = normalize_extraction_items_with_quarantine(
+        [
+            {"brand_name_raw": "TraceableBrand", "brand_type": "公司", "evidence": "TraceableBrand", "confidence": 0.9},
+            {"brand_name_raw": "HallucinatedBrand", "brand_type": "公司", "evidence": "not in answer", "confidence": 0.9},
+        ],
+        {
+            "query_id": "q001",
+            "repeat_index": 1,
+            "input_query": "best studios",
+            "response_text": "TraceableBrand is mentioned.",
+        },
+    )
+
+    assert [row["brand_name_raw"] for row in rows] == ["TraceableBrand"]
+    assert quarantined == [
+        {
+            "query_id": "q001",
+            "repeat_index": 1,
+            "input_query": "best studios",
+            "brand_name_raw": "HallucinatedBrand",
+            "evidence": "not in answer",
+            "reason": "untraceable_extraction_item",
+        }
+    ]
+
+
+def test_normalize_extraction_items_requires_raw_name_traceability_not_only_evidence():
+    rows, quarantined = normalize_extraction_items_with_quarantine(
+        [
+            {
+                "brand_name_raw": "HallucinatedBrand",
+                "brand_type": "公司",
+                "evidence": "TraceableBrand is mentioned",
+                "confidence": 0.9,
+            }
+        ],
+        {
+            "query_id": "q001",
+            "repeat_index": 1,
+            "input_query": "best studios",
+            "response_text": "TraceableBrand is mentioned.",
+        },
+    )
+
+    assert rows == []
+    assert quarantined[0]["brand_name_raw"] == "HallucinatedBrand"
+
+
+def test_llm_extractor_returns_quarantine_error_without_losing_valid_rows():
+    class FakeClient:
+        def create_response(self, payload):
+            return {
+                "output_text": (
+                    '{"brands":['
+                    '{"brand_name_raw":"TraceableBrand","brand_type":"公司","evidence":"TraceableBrand"},'
+                    '{"brand_name_raw":"HallucinatedBrand","brand_type":"公司","evidence":"not in answer"}'
+                    "]}"
+                )
+            }
+
+    extractor = LLMBrandExtractor.__new__(LLMBrandExtractor)
+    extractor.model = "test-model"
+    extractor.client = FakeClient()
+
+    rows, error = extractor.extract_record(
+        {
+            "query_id": "q001",
+            "repeat_index": 1,
+            "input_query": "best studios",
+            "response_text": "TraceableBrand is mentioned.",
+        }
+    )
+
+    assert [row["brand_name_raw"] for row in rows] == ["TraceableBrand"]
+    assert error["type"] == "TraceabilityQuarantine"
+    assert error["quarantined_rows"][0]["brand_name_raw"] == "HallucinatedBrand"

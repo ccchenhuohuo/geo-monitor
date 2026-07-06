@@ -1,0 +1,13 @@
+include README.md
+include README.zh-CN.md
+include LICENSE
+recursive-include data *.json
+recursive-include examples *.json *.yaml *.yml *.md
+recursive-include docs *.md
+recursive-include src/geo_monitor/data *.json
+recursive-include src/geo_monitor/examples *.json *.yaml *.yml *.md
+recursive-include src/geo_monitor/docs *.md
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod] .DS_Store
+prune build
+prune dist

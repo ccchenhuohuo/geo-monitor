@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .llm_client import build_responses_payload
-from .config import Settings, get_settings, workspace_root
+from .config import LiveSettingsError, Settings, get_settings, validate_live_settings, workspace_root
 from .dataset import load_queries, select_queries
 from .exporters import latest_records, read_jsonl, successful_result_hashes
 from .runner import MonitorRunner, compute_request_hash
@@ -240,6 +240,11 @@ def run_job_bundle(
         live_remaining = 0 if dry_run or mock else max(0, len(selected_units) - resume_matched_before)
         if live_remaining and not confirm_cost:
             raise JobError("真实 live 调用会产生 API 成本；请确认预算后显式传入 confirm_cost=True")
+        if live_remaining:
+            try:
+                validate_live_settings(settings)
+            except LiveSettingsError as exc:
+                raise JobError(str(exc)) from exc
         runner = MonitorRunner(settings)
         update_job_manifest(root, status="running")
         try:

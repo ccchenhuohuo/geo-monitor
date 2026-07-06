@@ -1,3 +1,13 @@
-"""GEO 监测 MVP：通过 OpenAI-compatible Responses API 采集联网回答。"""
+"""GEO Brand Monitor public package interface."""
 
 __version__ = "0.1.0"
+
+from .api import GeoMonitorResult, StudyPaths, resolve_study_paths, run_geo_monitor
+
+__all__ = [
+    "__version__",
+    "GeoMonitorResult",
+    "StudyPaths",
+    "resolve_study_paths",
+    "run_geo_monitor",
+]
