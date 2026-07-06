@@ -74,7 +74,15 @@ class LLMBrandExtractor:
             response = self.client.create_response(payload)
             output_text, _, _, raw = parse_response(response)
             data = parse_json_payload(output_text or "")
-            mentions = normalize_extraction_items(data.get("brands", []), record)
+            mentions, quarantined = normalize_extraction_items_with_quarantine(data.get("brands", []), record)
+            if quarantined:
+                return mentions, {
+                    "type": "TraceabilityQuarantine",
+                    "message": f"{len(quarantined)} 个抽取项无法在 response_text 中追溯，已按行隔离",
+                    "query_id": record.get("query_id"),
+                    "repeat_index": record.get("repeat_index") or 1,
+                    "quarantined_rows": quarantined,
+                }
             return mentions, None
         except Exception as exc:  # noqa: BLE001
             return [], {
@@ -121,11 +129,20 @@ def parse_json_payload(text: str) -> dict[str, Any]:
 
 
 def normalize_extraction_items(items: Any, record: dict) -> list[dict[str, Any]]:
+    rows, _ = normalize_extraction_items_with_quarantine(items, record)
+    return rows
+
+
+def normalize_extraction_items_with_quarantine(items: Any, record: dict) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not isinstance(items, list):
         raise ValueError("brands 必须是数组")
     rows: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
     seen: set[str] = set()
     response_text = str(record.get("response_text") or "")
+    query_id = str(record.get("query_id"))
+    repeat_index = int(record.get("repeat_index") or 1)
+    input_query = record.get("input_query", "")
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -133,8 +150,18 @@ def normalize_extraction_items(items: Any, record: dict) -> list[dict[str, Any]]
         if not raw_name:
             continue
         evidence = str(item.get("evidence") or "")[:500]
-        if response_text and not (_traceable(response_text, raw_name) or (evidence and _traceable(response_text, evidence))):
-            raise ValueError(f"抽取结果无法在 response_text 中追溯：{raw_name}")
+        if response_text and not _traceable(response_text, raw_name):
+            quarantined.append(
+                {
+                    "query_id": query_id,
+                    "repeat_index": repeat_index,
+                    "input_query": input_query,
+                    "brand_name_raw": raw_name,
+                    "evidence": evidence,
+                    "reason": "untraceable_extraction_item",
+                }
+            )
+            continue
         dedupe_key = normalize_brand_name(raw_name)
         if dedupe_key in seen:
             continue
@@ -147,9 +174,9 @@ def normalize_extraction_items(items: Any, record: dict) -> list[dict[str, Any]]
             confidence = ""
         role = str(item.get("role") or "").strip().lower()
         rows.append({
-            "query_id": str(record.get("query_id")),
-            "repeat_index": int(record.get("repeat_index") or 1),
-            "input_query": record.get("input_query", ""),
+            "query_id": query_id,
+            "repeat_index": repeat_index,
+            "input_query": input_query,
             "brand_name_raw": raw_name,
             "brand_type": brand_type,
             "evidence": evidence,
@@ -162,7 +189,7 @@ def normalize_extraction_items(items: Any, record: dict) -> list[dict[str, Any]]
             "sov_eligible": _bool_value(item.get("sov_eligible"), default=False) if brand_type else False,
             "canonical_hint": str(item.get("canonical_hint") or item.get("canonical_name") or "")[:200],
         })
-    return rows
+    return rows, quarantined
 
 
 def parse_canonical_map(data: dict[str, Any], raw_names: list[str]) -> dict[str, str]:

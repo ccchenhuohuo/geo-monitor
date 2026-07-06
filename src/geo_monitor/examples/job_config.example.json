@@ -1,0 +1,12 @@
+{
+  "target_brand": "ExampleBrand",
+  "target_aliases": ["Example Brand"],
+  "industry": "ExampleIndustry",
+  "market": "ExampleMarket",
+  "queries": ["example fallback query"],
+  "repeats": 1,
+  "model": "test-model",
+  "web_search_limit": 5,
+  "concurrency": 1,
+  "start_interval_seconds": 0
+}

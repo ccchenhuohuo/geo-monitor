@@ -102,14 +102,19 @@ class MonitorResult(BaseModel):
             "intent",
             "persona",
             "template_id",
+            "locale",
+            "market",
+            "tags",
             "language",
             "generation_method",
             "fanout_version",
             "manifest_version",
+            "locked_at",
         ]:
             meta.setdefault(key, "")
         if not meta["generation_method"]:
             meta["generation_method"] = "config"
+        meta.setdefault("query_metadata_json", "{}")
         self.query_meta = meta
         return self
 

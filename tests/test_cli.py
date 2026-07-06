@@ -1,8 +1,16 @@
 import json
+import re
 
 from typer.testing import CliRunner
 
 from geo_monitor.cli import app
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(output: str) -> str:
+    return ANSI_RE.sub("", output)
 
 
 def _write_job_config(tmp_path):
@@ -32,6 +40,13 @@ def test_validate_job_config_cli_smoke(tmp_path):
 
     assert result.exit_code == 0
     assert "任务配置有效" in result.output
+
+
+def test_doctor_live_is_not_reported_as_successful_smoke():
+    result = CliRunner().invoke(app, ["doctor", "--live"])
+
+    assert result.exit_code != 0
+    assert "不执行真实 API smoke test" in result.output
 
 
 def test_validate_job_config_cli_accepts_external_manifest_without_inline_queries(tmp_path):
@@ -90,7 +105,7 @@ def test_export_csv_cli_skips_bad_jsonl_lines(tmp_path):
     result = CliRunner().invoke(app, ["export-csv", str(raw), "--out", str(out)])
 
     assert result.exit_code == 0
-    assert "已跳过 1 行" in result.output
+    assert "已跳过 1 行" in _plain(result.output)
     assert out.exists()
 
 
@@ -154,7 +169,7 @@ def test_run_job_cli_requires_cost_confirmation_for_live_requests(tmp_path, monk
     result = CliRunner().invoke(app, ["run-job", str(tmp_path / "bundle")])
 
     assert result.exit_code != 0
-    assert "--confirm-cost" in result.output
+    assert "--confirm-cost" in _plain(result.output)
 
 
 def test_run_job_cli_returns_nonzero_when_live_records_errors(tmp_path, monkeypatch):
@@ -207,11 +222,11 @@ def test_run_job_cli_no_resume_requires_cost_confirmation_even_when_complete(tmp
     result = CliRunner().invoke(app, ["run-job", str(tmp_path / "bundle"), "--no-resume"])
 
     assert result.exit_code != 0
-    assert "--confirm-cost" in result.output
+    assert "--confirm-cost" in _plain(result.output)
 
 
 def test_analyze_job_cli_requires_cost_confirmation_for_live_extraction(tmp_path, monkeypatch):
-    def fake_estimate_job_analysis(bundle_dir, *, include_mock=False):
+    def fake_estimate_job_analysis(bundle_dir, *, include_mock=False, refresh_extraction_cache=False):
         return {"analysis_record_count": 3, "sample_mode": "live", "analysis_llm_requests_estimate": 4}
 
     monkeypatch.setattr("geo_monitor.cli.estimate_job_analysis", fake_estimate_job_analysis)
@@ -219,4 +234,4 @@ def test_analyze_job_cli_requires_cost_confirmation_for_live_extraction(tmp_path
     result = CliRunner().invoke(app, ["analyze-job", str(tmp_path / "bundle")])
 
     assert result.exit_code != 0
-    assert "--confirm-cost" in result.output
+    assert "--confirm-cost" in _plain(result.output)

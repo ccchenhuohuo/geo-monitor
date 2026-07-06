@@ -5,7 +5,7 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-from .config import Settings
+from .config import LiveSettingsError, Settings, validate_live_settings
 from .schemas import QueryRecord
 
 
@@ -51,8 +51,10 @@ def build_responses_payload(
 
 class LLMResponsesClient:
     def __init__(self, settings: Settings):
-        if not settings.has_api_key:
-            raise LLMClientError("缺少 LLM_API_KEY，请在 .env 或环境变量中配置")
+        try:
+            validate_live_settings(settings)
+        except LiveSettingsError as exc:
+            raise LLMClientError(str(exc)) from exc
         self.settings = settings
         self.client = OpenAI(
             base_url=settings.llm_base_url,

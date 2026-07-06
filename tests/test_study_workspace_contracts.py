@@ -104,6 +104,8 @@ def test_raw_attempts_have_query_meta_and_analyze_does_not_need_work(tmp_path):
         assert row["query_meta"]["seed_id"] == "sample_beginner"
         assert row["query_meta"]["persona"] in {"beginner", "budget_sensitive"}
     assert analysis["report_files"]["markdown"] == "result/report.md"
+    assert (bundle.parent / "aggregate" / "brand_trends.csv").exists()
+    assert not (bundle.parent / ".runs").exists()
 
 
 def test_run_job_replacement_manifest_is_used_before_preflight(tmp_path):
@@ -194,6 +196,40 @@ def test_duckdb_build_uses_raw_query_meta_without_work_or_external_manifest(tmp_
     assert {row[0] for row in rows} == {"sample_beginner"}
 
 
+def test_raw_only_rebuild_preserves_query_dimensions_and_custom_manifest_metadata(tmp_path):
+    pytest.importorskip("duckdb")
+    study = tmp_path / "study"
+    runs = study / "runs"
+    manifest = study / "manifests" / "query_manifest.v1.csv"
+    config = tmp_path / "job_config.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "query_id,query,locale,market,category,tags,locked_at,channel\n"
+        "q001,example query,zh-CN,CN,test,\"alpha,beta\",2026-07-06T00:00:00Z,vip\n",
+        encoding="utf-8",
+    )
+    _write_config(config)
+    result = build_job_bundle(config, query_manifest_path=manifest, runs_dir=runs, settings=Settings(llm_api_key=None))
+    bundle = Path(result["bundle_dir"])
+
+    run_job_bundle(bundle, mock=True, settings=Settings(llm_api_key=None))
+    raw_row = read_jsonl(bundle / "raw" / "attempts.jsonl")[0]
+    assert raw_row["query_meta"]["locale"] == "zh-CN"
+    assert raw_row["query_meta"]["market"] == "CN"
+    assert raw_row["query_meta"]["tags"] == "alpha,beta"
+    shutil.rmtree(bundle / "work")
+    manifest.rename(str(manifest) + ".bak")
+    analysis = analyze_job_bundle(bundle, include_mock=True, settings=Settings(llm_api_key=None))
+
+    db = study / "geo.duckdb"
+    build_duckdb(runs, db)
+    columns, rows = query_duckdb(db, "select locale, market, tags, locked_at, query_metadata_json from queries")
+
+    assert analysis["expected_queries"] == 1
+    assert columns == ["locale", "market", "tags", "locked_at", "query_metadata_json"]
+    assert rows == [("zh-CN", "CN", "alpha,beta", "2026-07-06T00:00:00Z", '{"channel":"vip"}')]
+
+
 def test_duckdb_merges_later_query_meta_and_keeps_duplicate_attempts(tmp_path):
     pytest.importorskip("duckdb")
     study, runs, manifest, _, result = _build_external_job(tmp_path)
@@ -269,6 +305,88 @@ def test_tool_api_build_dashboard_true_and_seed_requires_manifest(tmp_path):
         assert "query_manifest_path" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_tool_api_fanout_force_overwrites_existing_manifest(tmp_path):
+    study = tmp_path / "study"
+    runs = study / "runs"
+    manifest = study / "manifests" / "query_manifest.v1.csv"
+    config = tmp_path / "job_config.json"
+    seed = study / "seed_prompts.yaml"
+    _write_config(config)
+    _write_seed(seed)
+    build_query_manifest(seed, manifest)
+    seed.write_text(
+        """
+seeds:
+  - seed_id: changed
+    category: sample_category
+    intent: product_recommendation
+    seed_query: "changed query"
+    personas:
+      - beginner
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = run_geo_monitor(
+        config_path=config,
+        runs_dir=runs,
+        seed_prompts_path=seed,
+        query_manifest_path=manifest,
+        fanout_force=True,
+        mock=True,
+        build_db=False,
+    )
+
+    assert result.metrics["fanout"]["action"] == "overwritten"
+    assert "changed query" in manifest.read_text(encoding="utf-8")
+
+
+def test_tool_api_reuses_existing_manifest_without_fanout_force(tmp_path):
+    study = tmp_path / "study"
+    runs = study / "runs"
+    manifest = study / "manifests" / "query_manifest.v1.csv"
+    config = tmp_path / "job_config.json"
+    seed = study / "seed_prompts.yaml"
+    _write_config(config)
+    _write_seed(seed)
+    build_query_manifest(seed, manifest)
+    before = manifest.read_text(encoding="utf-8")
+    seed.write_text(
+        """
+seeds:
+  - seed_id: changed
+    seed_query: "changed query"
+    personas:
+      - beginner
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = run_geo_monitor(
+        config_path=config,
+        runs_dir=runs,
+        seed_prompts_path=seed,
+        query_manifest_path=manifest,
+        fanout_force=False,
+        mock=True,
+        build_db=False,
+    )
+
+    assert result.metrics["fanout"]["action"] == "reused"
+    assert manifest.read_text(encoding="utf-8") == before
+
+
+def test_tool_api_status_matches_partial_cleaned_manifest(tmp_path):
+    study, _, manifest, config, _ = _build_external_job(tmp_path)
+
+    result = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, limit=1, build_db=False)
+    final_manifest = json.loads((Path(result.artifact_paths["bundle_dir"]) / "job_manifest.json").read_text(encoding="utf-8"))
+
+    assert result.status == final_manifest["status"]
+    assert result.status == "analyzed_partial_cleaned"
+    assert any(flag["type"] == "partial_sample" for flag in result.quality_flags)
 
 
 def test_gitignore_protects_common_local_study_outputs():

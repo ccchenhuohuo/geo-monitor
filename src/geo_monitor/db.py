@@ -3,13 +3,20 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from .job import JOB_MANIFEST, RAW_ATTEMPTS, load_job_manifest
 
 
-DUCKDB_SCHEMA_VERSION = "duckdb-schema-v1"
+DUCKDB_SCHEMA_VERSION = "duckdb-schema-v3"
+SAFE_QUERY_START_RE = re.compile(r"^\s*(select|with|show|describe|explain)\b", re.IGNORECASE | re.DOTALL)
+FORBIDDEN_SQL_RE = re.compile(
+    r"\b(attach|copy|create|delete|detach|drop|export|import|insert|install|load|merge|pragma|set|update|alter|call)\b"
+    r"|\b(read_csv|read_csv_auto|read_json|read_ndjson|read_parquet|read_text|read_blob|parquet_scan|glob)\s*\(",
+    re.IGNORECASE,
+)
 
 
 class DuckDBError(ValueError):
@@ -47,13 +54,15 @@ def build_duckdb(runs_dir: str | Path, output_path: str | Path, *, query_manifes
 
 
 def inspect_duckdb(db_path: str | Path) -> dict[str, Any]:
-    duckdb = _duckdb()
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = _connect_readonly(db_path)
     try:
         rows = con.execute("select table_name from information_schema.tables where table_schema='main' order by table_name").fetchall()
         tables = []
         for (name,) in rows:
-            count = con.execute(f"select count(*) from {name}").fetchone()[0]
+            try:
+                count = con.execute(f"select count(*) from {_quote_identifier(str(name))}").fetchone()[0]
+            except Exception as exc:
+                raise DuckDBError(f"无法 inspect DuckDB 表 {name!r}: {exc}") from exc
             tables.append({"table": name, "row_count": count})
         return {"db_path": str(db_path), "tables": tables}
     finally:
@@ -61,12 +70,14 @@ def inspect_duckdb(db_path: str | Path) -> dict[str, Any]:
 
 
 def query_duckdb(db_path: str | Path, sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
-    duckdb = _duckdb()
-    con = duckdb.connect(str(db_path), read_only=True)
+    _validate_safe_query_sql(sql)
+    con = _connect_readonly(db_path)
     try:
         result = con.execute(sql)
         columns = [item[0] for item in result.description or []]
         return columns, result.fetchall()
+    except Exception as exc:
+        raise DuckDBError(str(exc)) from exc
     finally:
         con.close()
 
@@ -104,10 +115,15 @@ def _create_schema(con: Any) -> None:
             persona varchar,
             template_id varchar,
             query varchar,
+            locale varchar,
+            market varchar,
+            tags varchar,
             language varchar,
             generation_method varchar,
             fanout_version varchar,
-            manifest_version varchar
+            manifest_version varchar,
+            locked_at varchar,
+            query_metadata_json varchar
         )
         """
     )
@@ -240,8 +256,28 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
         counts["attempts"] += 1
     for row in query_rows.values():
         con.execute(
-            "insert into queries values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [job_id, row["query_id"], row["variant_id"], row["seed_id"], row["seed_query"], row["category"], row["intent"], row["persona"], row["template_id"], row["query"], row["language"], row["generation_method"], row["fanout_version"], row["manifest_version"]],
+            "insert into queries values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                job_id,
+                row["query_id"],
+                row["variant_id"],
+                row["seed_id"],
+                row["seed_query"],
+                row["category"],
+                row["intent"],
+                row["persona"],
+                row["template_id"],
+                row["query"],
+                row["locale"],
+                row["market"],
+                row["tags"],
+                row["language"],
+                row["generation_method"],
+                row["fanout_version"],
+                row["manifest_version"],
+                row["locked_at"],
+                row["query_metadata_json"],
+            ],
         )
         counts["queries"] += 1
     counts["quality_flags"] += _ingest_csv_outputs(con, run_dir, job_id)
@@ -268,6 +304,9 @@ def _read_attempts(raw_path: Path, job_id: str, fallback_rows: dict[str, dict[st
             qid = str(record.get("query_id") or "")
             query = str(record.get("query") or record.get("input_query") or "")
             meta = record.get("query_meta") if isinstance(record.get("query_meta"), dict) else {}
+            record_metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            if record_metadata:
+                meta = _merge_record_metadata(meta, record_metadata)
             fallback = fallback_rows.get(qid)
             if not meta and fallback:
                 meta = fallback
@@ -323,10 +362,15 @@ def _merge_query_row(
             "persona": "",
             "template_id": "",
             "query": "",
+            "locale": "",
+            "market": "",
+            "tags": "",
             "language": "",
             "generation_method": "",
             "fanout_version": "",
             "manifest_version": "",
+            "locked_at": "",
+            "query_metadata_json": "{}",
         },
     )
     field_priorities = priorities.setdefault(qid, {})
@@ -339,10 +383,15 @@ def _merge_query_row(
         "intent": str(meta.get("intent") or ""),
         "persona": str(meta.get("persona") or ""),
         "template_id": str(meta.get("template_id") or ""),
+        "locale": str(meta.get("locale") or ""),
+        "market": str(meta.get("market") or ""),
+        "tags": _tags_value(meta.get("tags")),
         "language": str(meta.get("language") or ""),
         "generation_method": str(meta.get("generation_method") or ""),
         "fanout_version": str(meta.get("fanout_version") or ""),
         "manifest_version": str(meta.get("manifest_version") or ""),
+        "locked_at": str(meta.get("locked_at") or ""),
+        "query_metadata_json": _query_metadata_json(meta),
     }
     for key, value in values.items():
         if not value:
@@ -351,6 +400,48 @@ def _merge_query_row(
         if not row.get(key) or priority >= current_priority:
             row[key] = value
             field_priorities[key] = priority
+
+
+def _merge_record_metadata(meta: dict[str, Any], record_metadata: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(record_metadata)
+    merged.update({key: value for key, value in meta.items() if value not in (None, "")})
+    return merged
+
+
+def _tags_value(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, list):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def _query_metadata_json(meta: dict[str, Any]) -> str:
+    existing = meta.get("query_metadata_json")
+    if isinstance(existing, str) and existing.strip() and existing.strip() != "{}":
+        return existing
+    known = {
+        "schema_version",
+        "variant_id",
+        "seed_id",
+        "seed_query",
+        "category",
+        "intent",
+        "persona",
+        "template_id",
+        "language",
+        "generation_method",
+        "fanout_version",
+        "manifest_version",
+        "locked_at",
+        "query_id",
+        "query",
+        "locale",
+        "market",
+        "tags",
+    }
+    custom = {key: value for key, value in meta.items() if key not in known and value not in (None, "")}
+    return json.dumps(custom, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _ingest_csv_outputs(con: Any, run_dir: Path, job_id: str) -> int:
@@ -437,6 +528,37 @@ def _to_int(value: Any) -> int | None:
         return int(float(value))
     except Exception:
         return None
+
+
+def _connect_readonly(db_path: str | Path) -> Any:
+    duckdb = _duckdb()
+    try:
+        return duckdb.connect(str(db_path), read_only=True, config={"enable_external_access": "false"})
+    except TypeError:
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            con.execute("set enable_external_access=false")
+        except Exception:
+            con.close()
+            raise
+        return con
+
+
+def _validate_safe_query_sql(sql: str) -> None:
+    text = str(sql or "").strip()
+    if not text:
+        raise DuckDBError("SQL 查询不能为空")
+    without_trailing = text[:-1].strip() if text.endswith(";") else text
+    if ";" in without_trailing:
+        raise DuckDBError("只允许单条只读 SQL 查询")
+    if not SAFE_QUERY_START_RE.search(text):
+        raise DuckDBError("只允许 SELECT/WITH/SHOW/DESCRIBE/EXPLAIN 只读查询")
+    if FORBIDDEN_SQL_RE.search(text):
+        raise DuckDBError("SQL 包含不允许的 DuckDB 语句或外部文件读取函数")
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
 
 
 def _duckdb() -> Any:
