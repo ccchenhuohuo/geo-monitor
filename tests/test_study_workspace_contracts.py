@@ -9,7 +9,7 @@ from geo_monitor.config import Settings
 from geo_monitor.db import build_duckdb, query_duckdb
 from geo_monitor.exporters import read_jsonl
 from geo_monitor.fanout import build_query_manifest
-from geo_monitor.job import build_job_bundle, estimate_job_run, run_job_bundle, validate_job_config
+from geo_monitor.job import JobError, build_job_bundle, estimate_job_run, run_job_bundle, validate_job_config, _resolve_query_manifest_source, _trusted_query_manifest_roots
 from geo_monitor.job_analysis import analyze_job_bundle
 from geo_monitor.tool import run_geo_monitor
 
@@ -66,7 +66,10 @@ def test_external_manifest_job_manifest_does_not_store_query_rows(tmp_path):
     bundle = Path(result["bundle_dir"])
     manifest = json.loads((bundle / "job_manifest.json").read_text(encoding="utf-8"))
 
-    assert manifest["schema_version"] == "geo-job-v2"
+    assert manifest["schema_version"] == "geo-job-v3"
+    assert manifest["sampling_profile"]["adapter"] == "openai_responses_web_search"
+    assert manifest["analysis_profile"]["adapter"] == "openai_responses_text"
+    assert manifest["comparability_profile"]["query_manifest_sha256"]
     assert "queries" not in manifest
     assert manifest["target_brand"] == "ExampleBrand"
     assert manifest["query_manifest"]["source_type"] == "external_file"
@@ -149,6 +152,48 @@ def test_raw_only_partial_analysis_marks_manifest_unavailable(tmp_path):
     assert analysis["expected_queries"] == 2
     assert analysis["data_quality"]["query_manifest_unavailable"] is True
     assert analysis["data_quality"]["missing_unknown_units_count"] == 1
+
+
+def test_analyze_job_external_manifest_tamper_fails_closed(tmp_path):
+    _, _, manifest, _, result = _build_external_job(tmp_path)
+    bundle = Path(result["bundle_dir"])
+    run_job_bundle(bundle, mock=True, settings=Settings(llm_api_key=None))
+    shutil.rmtree(bundle / "work")
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(text.replace("推荐一款适合新手的示例产品", "tampered query"), encoding="utf-8")
+
+    with pytest.raises(JobError, match="sha256"):
+        analyze_job_bundle(bundle, include_mock=True, settings=Settings(llm_api_key=None))
+
+    final_manifest = json.loads((bundle / "job_manifest.json").read_text(encoding="utf-8"))
+    assert final_manifest["status"] == "analysis_failed"
+
+
+def test_job_manifest_source_uri_outside_study_is_rejected_without_replacement(tmp_path):
+    _, _, manifest, _, result = _build_external_job(tmp_path)
+    bundle = Path(result["bundle_dir"])
+    outside = Path("/tmp") / f"geo-monitor-outside-{bundle.name}.csv"
+    outside.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+    job_manifest_path = bundle / "job_manifest.json"
+    data = json.loads(job_manifest_path.read_text(encoding="utf-8"))
+    data["query_manifest"]["source_uri"] = str(outside)
+    data["query_manifest"]["source_uri_base"] = str(outside.parent)
+    job_manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    shutil.rmtree(bundle / "work")
+
+    with pytest.raises(JobError, match="--query-manifest"):
+        estimate_job_run(bundle, mock=True, settings=Settings(llm_api_key=None))
+
+    run = run_job_bundle(bundle, mock=True, settings=Settings(llm_api_key=None), query_manifest_path=outside)
+    assert run["executed"] == 2
+
+
+def test_query_manifest_trusted_roots_do_not_degrade_to_filesystem_root():
+    bundle = Path("/tmp/geo-monitor-shallow-bundle")
+
+    assert Path("/") not in _trusted_query_manifest_roots(bundle)
+    with pytest.raises(JobError, match="--query-manifest"):
+        _resolve_query_manifest_source({"query_manifest": {"source_type": "external_file", "source_uri": "/etc/passwd"}}, bundle_dir=bundle)
 
 
 def test_legacy_config_queries_still_write_query_meta(tmp_path):
@@ -305,6 +350,30 @@ def test_tool_api_build_dashboard_true_and_seed_requires_manifest(tmp_path):
         assert "query_manifest_path" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_tool_api_builds_dashboard_from_existing_db_without_rebuilding_db(tmp_path):
+    pytest.importorskip("duckdb")
+    study, _, manifest, config, _ = _build_external_job(tmp_path)
+
+    first = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_db=True)
+    assert first.db_path
+    second = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_db=False, build_dashboard=True)
+
+    assert second.db_path == first.db_path
+    assert second.dashboard_path
+    assert Path(second.dashboard_path).exists()
+
+
+def test_tool_api_build_dashboard_without_db_fails_fast(tmp_path):
+    study, _, manifest, config, _ = _build_external_job(tmp_path)
+    db = study / "geo.duckdb"
+    assert not db.exists()
+
+    with pytest.raises(ValueError, match="build_db"):
+        run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_db=False, build_dashboard=True)
+
+    assert not db.exists()
 
 
 def test_tool_api_fanout_force_overwrites_existing_manifest(tmp_path):

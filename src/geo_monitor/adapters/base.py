@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
+from typing import Any, Protocol
+
+from openai import OpenAI
+
+from ..config import LiveSettingsError, Settings, validate_live_settings
+from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, request_fingerprint
+from ..response_parser import parse_response, response_to_dict
+from ..schemas import QueryRecord, SourceRecord
+
+WEB_SEARCH_EVIDENCE_PROVIDER_TRACE = "provider_trace"
+WEB_SEARCH_EVIDENCE_TOOL_USAGE_COUNT = "tool_usage_count"
+WEB_SEARCH_EVIDENCE_REQUEST_ONLY = "request_only"
+WEB_SEARCH_EVIDENCE_TOKEN_INFERENCE = "token_inference"
+WEB_SEARCH_EVIDENCE_NOT_AVAILABLE = "not_available"
+
+WEB_SEARCH_STATUS_SATISFIED = "satisfied"
+WEB_SEARCH_STATUS_NOT_SATISFIED = "not_satisfied"
+WEB_SEARCH_STATUS_NOT_VERIFIABLE = "not_verifiable"
+WEB_SEARCH_STATUS_NOT_SUPPORTED = "not_supported"
+WEB_SEARCH_STATUS_NOT_APPLICABLE = "not_applicable"
+
+SOURCE_STATUS_PARSED = "parsed"
+SOURCE_STATUS_PROVIDER_RETURNED_EMPTY = "provider_returned_empty"
+SOURCE_STATUS_UNSUPPORTED_BY_PROTOCOL = "unsupported_by_protocol"
+SOURCE_STATUS_PARSE_ERROR = "parse_error"
+SOURCE_STATUS_NOT_APPLICABLE = "not_applicable"
+
+
+@dataclass(frozen=True)
+class AdapterCapabilities:
+    api_family: str
+    supported_model_patterns: tuple[str, ...] = ("*",)
+    supports_forced_search: bool = False
+    supports_sources: bool | str = "partial"
+    supports_search_trace: bool | str = "partial"
+    source_grain: str = "url"
+
+    def supports_model(self, model: str) -> bool:
+        text = str(model or "").strip()
+        return any(fnmatchcase(text, pattern) for pattern in self.supported_model_patterns)
+
+
+@dataclass(frozen=True)
+class ProviderRequest:
+    sampling_profile: dict[str, Any]
+    payload: dict[str, Any]
+    request_fingerprint_basis: dict[str, Any]
+
+    @property
+    def request_hash(self) -> str:
+        return request_fingerprint(self.request_fingerprint_basis)
+
+    @property
+    def request_fingerprint_version(self) -> str:
+        return REQUEST_FINGERPRINT_VERSION
+
+    @property
+    def model(self) -> str:
+        return str(self.sampling_profile.get("model") or self.payload.get("model") or "")
+
+
+@dataclass(frozen=True)
+class NormalizedProviderResponse:
+    text: str | None
+    sources: list[SourceRecord]
+    usage: dict[str, Any] | None
+    raw: dict[str, Any]
+    provider_meta: dict[str, Any] = field(default_factory=dict)
+    web_search_performed: bool | None = None
+    web_search_evidence: str = WEB_SEARCH_EVIDENCE_NOT_AVAILABLE
+    web_search_requirement_status: str = WEB_SEARCH_STATUS_NOT_APPLICABLE
+    source_parse_status: str = SOURCE_STATUS_NOT_APPLICABLE
+
+
+class ProviderAdapter(Protocol):
+    name: str
+    provider: str
+    adapter_version: str
+    capabilities: AdapterCapabilities
+    allowed_options: set[str]
+
+    def validate_options(self, options: dict[str, Any]) -> None: ...
+
+    def build_request(
+        self,
+        query_record: QueryRecord,
+        sampling_profile: dict[str, Any],
+        settings: Settings,
+        adapter_options: dict[str, Any],
+    ) -> ProviderRequest: ...
+
+    def send(self, client: Any, request: ProviderRequest) -> Any: ...
+
+    def normalize_response(self, response: Any, request: ProviderRequest) -> NormalizedProviderResponse: ...
+
+
+class OpenAICompatibleClientFactory:
+    def __init__(self, settings: Settings):
+        try:
+            validate_live_settings(settings)
+        except LiveSettingsError as exc:
+            raise ValueError(str(exc)) from exc
+        self.settings = settings
+
+    def create(self) -> OpenAI:
+        return OpenAI(
+            base_url=self.settings.llm_base_url,
+            api_key=self.settings.llm_api_key.get_secret_value(),  # type: ignore[union-attr]
+            timeout=self.settings.request_timeout_seconds,
+        )
+
+
+class BaseAdapter:
+    name = ""
+    provider = ""
+    adapter_version = "1"
+    capabilities = AdapterCapabilities(api_family="responses")
+    allowed_options: set[str] = set()
+
+    def validate_options(self, options: dict[str, Any]) -> None:
+        unknown = sorted(set(options) - self.allowed_options)
+        if unknown:
+            raise ValueError(f"{self.name} adapter_options 包含未知字段：{', '.join(unknown)}")
+
+    def _fingerprint_basis(self, query_record: QueryRecord, sampling_profile: dict[str, Any], payload_basis: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": sampling_profile.get("provider"),
+            "adapter": sampling_profile.get("adapter"),
+            "adapter_version": sampling_profile.get("adapter_version"),
+            "api_family": sampling_profile.get("api_family"),
+            "base_url_fingerprint": sampling_profile.get("base_url_fingerprint"),
+            "model": sampling_profile.get("model"),
+            "query_id": query_record.query_id,
+            "input": query_record.query,
+            "web_search_required": sampling_profile.get("web_search_required"),
+            "source_grain": sampling_profile.get("source_grain"),
+            "payload": payload_basis,
+        }
+
+    def normalize_response(self, response: Any, request: ProviderRequest) -> NormalizedProviderResponse:
+        raw = response_to_dict(response)
+        try:
+            text, sources, usage, parsed_raw = parse_response(raw)
+            source_status = _source_parse_status(sources, self.capabilities)
+        except Exception:
+            text, sources, usage, parsed_raw = None, [], None, raw
+            source_status = SOURCE_STATUS_PARSE_ERROR
+        performed, evidence, requirement_status = infer_web_search_status(parsed_raw, request.payload, request.sampling_profile)
+        return NormalizedProviderResponse(
+            text=text,
+            sources=sources,
+            usage=usage,
+            raw=parsed_raw,
+            provider_meta={},
+            web_search_performed=performed,
+            web_search_evidence=evidence,
+            web_search_requirement_status=requirement_status,
+            source_parse_status=source_status,
+        )
+
+
+def infer_web_search_status(raw: dict[str, Any], payload: dict[str, Any], sampling_profile: dict[str, Any]) -> tuple[bool | None, str, str]:
+    required = bool(sampling_profile.get("web_search_required", True))
+    if not required:
+        return None, WEB_SEARCH_EVIDENCE_NOT_AVAILABLE, WEB_SEARCH_STATUS_NOT_APPLICABLE
+    if _has_web_search_call(raw):
+        return True, WEB_SEARCH_EVIDENCE_PROVIDER_TRACE, WEB_SEARCH_STATUS_SATISFIED
+    if _web_search_tool_count(raw) > 0:
+        return True, WEB_SEARCH_EVIDENCE_TOOL_USAGE_COUNT, WEB_SEARCH_STATUS_SATISFIED
+    if request_has_web_search(payload):
+        return None, WEB_SEARCH_EVIDENCE_REQUEST_ONLY, WEB_SEARCH_STATUS_NOT_VERIFIABLE
+    return False, WEB_SEARCH_EVIDENCE_NOT_AVAILABLE, WEB_SEARCH_STATUS_NOT_SATISFIED
+
+
+def request_has_web_search(payload: dict[str, Any]) -> bool:
+    for tool in payload.get("tools", []) or []:
+        if isinstance(tool, dict) and str(tool.get("type") or "") == "web_search":
+            return True
+    extra_body = payload.get("extra_body") if isinstance(payload.get("extra_body"), dict) else {}
+    return bool(extra_body.get("enable_search"))
+
+
+def _source_parse_status(sources: list[SourceRecord], capabilities: AdapterCapabilities) -> str:
+    if capabilities.source_grain == "none":
+        return SOURCE_STATUS_NOT_APPLICABLE
+    if sources:
+        return SOURCE_STATUS_PARSED
+    if capabilities.supports_sources is False:
+        return SOURCE_STATUS_UNSUPPORTED_BY_PROTOCOL
+    return SOURCE_STATUS_PROVIDER_RETURNED_EMPTY
+
+
+def _has_web_search_call(raw: Any) -> bool:
+    if isinstance(raw, dict):
+        if raw.get("type") == "web_search_call":
+            return True
+        return any(_has_web_search_call(value) for value in raw.values())
+    if isinstance(raw, list):
+        return any(_has_web_search_call(item) for item in raw)
+    return False
+
+
+def _web_search_tool_count(raw: dict[str, Any]) -> int:
+    total = 0
+    for path in [
+        ("x_tools", "web_search", "count"),
+        ("usage", "plugins", "web_search", "count"),
+        ("plugins", "web_search", "count"),
+    ]:
+        value: Any = raw
+        for key in path:
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(key)
+        try:
+            total += int(value or 0)
+        except Exception:
+            continue
+    return total
+

@@ -4,7 +4,8 @@ import pytest
 from typer.testing import CliRunner
 
 from geo_monitor.cli import app
-from geo_monitor.db import DuckDBError, inspect_duckdb, query_duckdb
+from geo_monitor.dashboard import DashboardError, build_dashboard
+from geo_monitor.db import DUCKDB_SCHEMA_VERSION, DuckDBError, inspect_duckdb, query_duckdb
 
 
 pytest.importorskip("duckdb")
@@ -77,3 +78,36 @@ def test_db_query_cli_reports_rejected_sql_without_traceback(tmp_path):
     assert result.exit_code != 0
     assert "外部文件" in result.output
     assert "Traceback" not in result.output
+
+
+def test_dashboard_rejects_wrong_schema_version(tmp_path):
+    import duckdb
+
+    db = tmp_path / "wrong-schema.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("create table schema_info(schema_version varchar)")
+    con.execute("insert into schema_info values ('duckdb-schema-v0')")
+    con.close()
+
+    with pytest.raises(DashboardError, match="schema_version"):
+        build_dashboard(db, tmp_path / "dashboard")
+
+
+def test_dashboard_uses_safe_readonly_connection_for_malicious_view(tmp_path):
+    import duckdb
+
+    db = tmp_path / "malicious-view.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("create table schema_info(schema_version varchar)")
+    con.execute("insert into schema_info values (?)", [DUCKDB_SCHEMA_VERSION])
+    con.execute("create table queries(query_id varchar, persona varchar, seed_id varchar)")
+    con.execute("create table attempts(attempt_id varchar)")
+    con.execute("create table runs(job_id varchar, status varchar, sample_count integer, target_brand varchar, model varchar, provider varchar, adapter varchar, api_family varchar, job_conclusion_strength varchar, created_at varchar)")
+    con.execute("create table quality_flags(type varchar)")
+    con.execute("create table comparison_cohorts(query_manifest_sha256 varchar, repeats integer, execution_window_bucket varchar, job_count integer, comparison_group_count integer, analysis_fingerprint_count integer, comparison_conclusion_strength varchar, source_metrics_comparable boolean)")
+    con.execute("create view brand_summary as select 'evil'::varchar brand_name_canonical, count(*)::double sov from read_csv_auto('/etc/passwd')")
+    con.close()
+
+    with pytest.raises(DashboardError):
+        build_dashboard(db, tmp_path / "dashboard")
+    assert not (tmp_path / "dashboard" / "index.html").exists()

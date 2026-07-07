@@ -80,6 +80,22 @@ def test_validate_job_config_cli_accepts_external_manifest_without_inline_querie
     assert "任务配置有效" in result.output
 
 
+def test_build_and_validate_job_cli_report_bad_query_manifest_without_traceback(tmp_path):
+    config = _write_job_config(tmp_path)
+    bad_manifest = tmp_path / "bad.csv"
+    bad_manifest.write_text("query_id\nq001\n", encoding="utf-8")
+
+    build = CliRunner().invoke(app, ["build-job", str(config), "--query-manifest", str(bad_manifest), "--out-dir", str(tmp_path / "bundle")])
+    validate = CliRunner().invoke(app, ["validate-job-config", str(config), "--query-manifest", str(bad_manifest)])
+
+    assert build.exit_code != 0
+    assert validate.exit_code != 0
+    assert "CSV 缺少必填字段" in _plain(build.output)
+    assert "CSV 缺少必填字段" in _plain(validate.output)
+    assert "Traceback" not in build.output
+    assert "Traceback" not in validate.output
+
+
 def test_fanout_cli_accepts_persona_template_registry(tmp_path):
     seed = tmp_path / "seed_prompts.yaml"
     registry = tmp_path / "persona_templates.yaml"

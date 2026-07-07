@@ -23,9 +23,11 @@ from .cache import (
 )
 from ..brand_extraction import BrandCanonicalizer, BrandMentionExtractor, LLMBrandExtractor, fallback_canonicalize, normalize_brand_name
 from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings, workspace_root
-from ..exporters import latest_records, read_jsonl, read_jsonl_with_errors, safe_result_key, sanitize_csv_cell, write_jsonl
-from ..job import BUNDLE_LOCK, RUNS_DIR, load_job_manifest, load_job_queries, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir, _cleanup_job_bundle_unlocked, _job_lock
-from ..reporting import build_html, table_cell, try_generate_pdf
+from ..exporters import canonical_request_hash, latest_records, read_jsonl, read_jsonl_with_errors, safe_result_key, sanitize_csv_row, write_jsonl
+from ..job import BUNDLE_LOCK, RUNS_DIR, QueryManifestIntegrityError, QueryManifestSourceError, load_job_manifest, load_job_queries, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir, _cleanup_job_bundle_unlocked, _job_lock
+from ..query_meta import query_metadata_json, tags_text
+from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, legacy_payload_hash, request_fingerprint
+from ..reporting import build_html, markdown_text, table_cell, try_generate_pdf
 
 
 EXTRACTION_SCHEMA_VERSION = "brand-extraction-v3"
@@ -187,6 +189,7 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
         raise ValueError(f"缺少 raw attempts：{raw_path}")
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
     manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
+    analysis_profile = _analysis_profile(manifest)
     live_records = latest_records(raw_records, statuses={"success"})
     mock_records = latest_records(raw_records, statuses={"mock"}) if include_mock else []
     if live_records:
@@ -195,7 +198,7 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
         cache_estimate = _estimate_live_cache_requests(
             logs_dir(root),
             live_records,
-            extractor_model=str(manifest.get("model") or ""),
+            extractor_model=str(analysis_profile.get("model") or manifest.get("model") or ""),
             refresh_extraction_cache=refresh_extraction_cache,
         )
         extraction_requests = cache_estimate["extraction_cache_misses"]
@@ -222,6 +225,7 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
         "extraction_requests_estimate": extraction_requests,
         "canonicalization_requests_estimate": canonicalization_requests,
         "model": manifest.get("model"),
+        "analysis_profile": analysis_profile,
         "cache": cache_estimate,
     }
 
@@ -288,6 +292,8 @@ def _analyze_job_bundle_unlocked(
 
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
     manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
+    analysis_profile = _analysis_profile(manifest)
+    analysis_model = str(analysis_profile.get("model") or manifest["model"])
     live_records = latest_records(raw_records, statuses={"success"})
     mock_records = latest_records(raw_records, statuses={"mock"}) if include_mock else []
     if live_records:
@@ -318,7 +324,7 @@ def _analyze_job_bundle_unlocked(
         preflight_cache_stats = _estimate_live_cache_requests(
             logs,
             success_records_for_stats,
-            extractor_model=str(manifest["model"]),
+            extractor_model=analysis_model,
             refresh_extraction_cache=refresh_extraction_cache,
         )
         if preflight_cache_stats["analysis_llm_requests_remaining"] > 0 and not confirm_cost:
@@ -329,7 +335,7 @@ def _analyze_job_bundle_unlocked(
             except LiveSettingsError as exc:
                 raise ValueError(str(exc)) from exc
     if extractor is None and success_records_for_stats and sample_mode == "live" and preflight_cache_stats["analysis_llm_requests_remaining"] > 0:
-        extractor_obj = LLMBrandExtractor(settings, model=str(manifest["model"]))
+        extractor_obj = LLMBrandExtractor(settings, model=analysis_model)
     active_extractor = extractor or (extractor_obj.extract_record if extractor_obj else None)
     if active_extractor is None and sample_mode == "mock":
         active_extractor = lambda record: demo_extract_record(record, manifest)
@@ -343,7 +349,7 @@ def _analyze_job_bundle_unlocked(
             settings=settings,
             logs=logs,
             cache_enabled=sample_mode == "live" and extractor is None,
-            extractor_model=str(manifest["model"]),
+            extractor_model=analysis_model,
             refresh_extraction_cache=refresh_extraction_cache,
         )
         _merge_cache_stats(cache_stats, extraction_cache_stats)
@@ -362,7 +368,7 @@ def _analyze_job_bundle_unlocked(
     elif sample_mode == "live" and extractor is None and raw_names:
         canonical_map, canonical_error, canonical_cache_stats = _canonicalize_from_cache_only(
             raw_names=raw_names,
-            canonicalizer_model=str(manifest["model"]),
+            canonicalizer_model=analysis_model,
             logs=logs,
             refresh_extraction_cache=refresh_extraction_cache,
         )
@@ -407,6 +413,10 @@ def _analyze_job_bundle_unlocked(
         "expected_units": manifest["query_count"] * manifest["repeats"],
         "model": manifest["model"],
         "web_search_limit": manifest["web_search_limit"],
+        "sampling_profile": manifest.get("sampling_profile", {}),
+        "analysis_profile": analysis_profile,
+        "comparability_profile": manifest.get("comparability_profile", {}),
+        "job_conclusion_strength": data_quality.get("conclusion_strength", "observational"),
         "query_set_hash": query_set_hash(manifest),
         "raw_record_count": len(raw_records),
         "success_record_count": len(success_records_for_stats),
@@ -453,6 +463,8 @@ def _manifest_with_queries_for_analysis(root: Path, manifest: dict[str, Any], ra
         return manifest
     try:
         records = load_job_queries(root, manifest, materialize=False)
+    except (QueryManifestIntegrityError, QueryManifestSourceError):
+        raise
     except Exception:
         records = []
     if records:
@@ -482,13 +494,13 @@ def _manifest_with_queries_for_analysis(root: Path, manifest: dict[str, Any], ra
             "template_id": str(meta.get("template_id") or ""),
             "locale": str(meta.get("locale") or record_metadata.get("locale") or ""),
             "market": str(meta.get("market") or record_metadata.get("market") or ""),
-            "tags": _tags_text(meta.get("tags") or record_metadata.get("tags")),
+            "tags": tags_text(meta.get("tags") or record_metadata.get("tags")),
             "language": str(meta.get("language") or record_metadata.get("locale") or ""),
             "generation_method": str(meta.get("generation_method") or ""),
             "fanout_version": str(meta.get("fanout_version") or ""),
             "manifest_version": str(meta.get("manifest_version") or ""),
             "locked_at": str(meta.get("locked_at") or record_metadata.get("locked_at") or ""),
-            "query_metadata_json": _raw_query_metadata_json(meta, record_metadata),
+            "query_metadata_json": query_metadata_json(meta, record_metadata),
         }
         queries_by_id[qid] = {key: value for key, value in row.items() if value != ""}
     if not queries_by_id:
@@ -504,40 +516,20 @@ def _manifest_with_queries_for_analysis(root: Path, manifest: dict[str, Any], ra
     return hydrated
 
 
-def _tags_text(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    if isinstance(value, list):
-        return ",".join(str(item).strip() for item in value if str(item).strip())
-    return str(value).strip()
-
-
-def _raw_query_metadata_json(meta: dict[str, Any], record_metadata: dict[str, Any]) -> str:
-    existing = meta.get("query_metadata_json")
-    if isinstance(existing, str) and existing.strip() and existing.strip() != "{}":
-        return existing
-    known = {
-        "schema_version",
-        "variant_id",
-        "seed_id",
-        "seed_query",
-        "category",
-        "intent",
-        "persona",
-        "template_id",
-        "locale",
-        "market",
-        "tags",
-        "language",
-        "generation_method",
-        "fanout_version",
-        "manifest_version",
-        "locked_at",
-        "query_id",
-        "query",
+def _analysis_profile(manifest: dict[str, Any]) -> dict[str, Any]:
+    profile = manifest.get("analysis_profile") if isinstance(manifest.get("analysis_profile"), dict) else {}
+    if profile:
+        return profile
+    return {
+        "provider": "openai_compatible",
+        "adapter": "openai_responses_text",
+        "adapter_version": "1",
+        "api_family": "responses",
+        "model": str(manifest.get("model") or ""),
+        "base_url_fingerprint": "",
+        "analysis_fingerprint": "",
     }
-    custom = {key: value for key, value in record_metadata.items() if key not in known and value not in (None, "")}
-    return json.dumps(custom, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
 
 
 def _query_rows_from_records(records: list[Any]) -> list[dict[str, Any]]:
@@ -821,7 +813,7 @@ def generate_job_report(summary: dict[str, Any], report_dir: Path) -> dict[str, 
 
 
 def build_job_markdown(summary: dict[str, Any]) -> str:
-    lines = [f"# {summary['title']}", "", "## 1. Executive Summary", ""]
+    lines = [f"# {markdown_text(summary['title'])}", "", "## 1. Executive Summary", ""]
     data_quality = summary.get("data_quality") or {}
     if summary.get("sample_mode") == "mock":
         lines.append("- 当前报告基于 mock 样本，只用于验收交付链路，不构成业务结论。")
@@ -834,14 +826,14 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
     else:
         top = summary["brand_summary"][0]
         diagnosis = summary.get("target_diagnosis") or {}
-        lines.append(f"- 当前品牌命中事件份额最高的是 {top['brand_name_canonical']}，份额为 {top['sov_event_share']}，覆盖 {top['query_coverage_rate']} 的 query。")
+        lines.append(f"- 当前品牌命中事件份额最高的是 {markdown_text(top['brand_name_canonical'])}，份额为 {top['sov_event_share']}，覆盖 {top['query_coverage_rate']} 的 query。")
         if diagnosis.get("target_detected"):
             lines.append(
-                f"- 目标品牌 {summary['target_brand']} 的品牌命中事件份额为 {diagnosis.get('target_sov_event_share', diagnosis.get('target_sov_response_share'))}，"
+                f"- 目标品牌 {markdown_text(summary['target_brand'])} 的品牌命中事件份额为 {diagnosis.get('target_sov_event_share', diagnosis.get('target_sov_response_share'))}，"
                 f"样本内份额排序第 {diagnosis.get('target_rank_by_sov')}，与第一名差距 {diagnosis.get('target_sov_gap_to_leader')}。"
             )
         else:
-            lines.append(f"- 目标品牌 {summary['target_brand']} 在当前抽取口径下未命中，需结合别名和 raw response 复核。")
+            lines.append(f"- 目标品牌 {markdown_text(summary['target_brand'])} 在当前抽取口径下未命中，需结合别名和 raw response 复核。")
         unstable = [row for row in summary.get("query_stability", []) if row.get("brand_set_jaccard_avg") not in {"", 1, 1.0}]
         if unstable:
             lines.append(f"- 有 {len(unstable)} 个 query 的品牌集合在重复采样中存在波动，建议优先人工复核这些 query 的 raw response。")
@@ -923,7 +915,7 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
     if missing and int(summary.get("success_record_count") or 0) > 0:
         lines.extend(["", "目标品牌缺失的 query：", ""])
         for item in missing[:10]:
-            lines.append(f"- `{item['query_id']}` {table_cell(item['query'])}")
+            lines.append(f"- `{markdown_text(item['query_id'])}` {table_cell(item['query'])}")
 
     lines.extend(["", "## 6. Source & Citation Opportunities", ""])
     if summary.get("source_domains"):
@@ -1028,7 +1020,10 @@ def evaluate_data_quality(
     manifest_queries = {str(query["query_id"]): str(query["query"]) for query in manifest["queries"]}
     raw_units: list[tuple[str, int, str]] = []
     invalid_records: list[dict[str, Any]] = []
+    analysis_signatures = {_record_attempt_signature(record) for record in analysis_records if safe_result_key(record) is not None}
+    raw_records_by_signature: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
     contract_mismatches: list[dict[str, Any]] = []
+    superseded_contract_mismatches: list[dict[str, Any]] = []
     for index, record in enumerate(raw_records, start=1):
         key = safe_result_key(record)
         status = str(record.get("status") or "")
@@ -1037,14 +1032,26 @@ def evaluate_data_quality(
             continue
         qid, repeat = key
         raw_units.append((qid, repeat, status))
-        if status in analysis_statuses:
-            contract_mismatches.extend(_record_contract_mismatches(record, manifest, manifest_queries, qid, repeat, index))
+        signature = _record_attempt_signature(record)
+        raw_records_by_signature[signature] = (index, record)
+        if status in analysis_statuses and signature not in analysis_signatures:
+            superseded_contract_mismatches.extend(_record_contract_mismatches(record, manifest, manifest_queries, qid, repeat, index))
+    for record in analysis_records:
+        key = safe_result_key(record)
+        if key is None:
+            continue
+        qid, repeat = key
+        signature = _record_attempt_signature(record)
+        record_index, contract_record = raw_records_by_signature.get(signature, (0, record))
+        contract_mismatches.extend(_record_contract_mismatches(contract_record, manifest, manifest_queries, qid, repeat, record_index))
     duplicate_counts = Counter((qid, repeat) for qid, repeat, status in raw_units if status in analysis_statuses)
     duplicate_units = [{"query_id": qid, "repeat_index": repeat, "count": count} for (qid, repeat), count in duplicate_counts.items() if count > 1]
     missing_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(expected_units - actual_units)]
     extra_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(actual_units - expected_units)]
     extra_query_ids = sorted({qid for qid, _, _ in raw_units if qid not in manifest_ids and qid != "None"})
-    partial = bool(missing_units or missing_unknown_units_count or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches)
+    web_search_quality_flags = _web_search_quality_flags(analysis_records)
+    source_quality_flags = _source_quality_flags(analysis_records)
+    partial = bool(missing_units or missing_unknown_units_count or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches or web_search_quality_flags or source_quality_flags)
     conclusion_strength = "observational" if partial else "strong"
     result = {
         "planned_units": len(expected_units) + missing_unknown_units_count,
@@ -1058,6 +1065,9 @@ def evaluate_data_quality(
         "duplicate_units": duplicate_units,
         "invalid_records": invalid_records,
         "contract_mismatches": contract_mismatches,
+        "superseded_contract_mismatches": superseded_contract_mismatches,
+        "web_search_quality_flags": web_search_quality_flags,
+        "source_quality_flags": source_quality_flags,
         "raw_read_errors": raw_read_errors,
     }
     if missing_unknown_units_count:
@@ -1066,6 +1076,50 @@ def evaluate_data_quality(
         result["expected_query_count"] = int(manifest.get("query_count") or len(manifest["queries"]))
         result["missing_unknown_units_count"] = missing_unknown_units_count
     return result
+
+
+def _record_attempt_signature(record: dict[str, Any]) -> tuple[Any, ...]:
+    key = safe_result_key(record)
+    return (
+        key,
+        str(record.get("completed_at") or ""),
+        str(record.get("attempt_id") or ""),
+        str(canonical_request_hash(record) or ""),
+        str(record.get("response_text") or ""),
+    )
+
+
+def _web_search_quality_flags(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+    for record in records:
+        status = record.get("web_search_requirement_status")
+        if status in (None, ""):
+            continue
+        if status in {"satisfied", "not_applicable"}:
+            continue
+        flags.append({
+            "query_id": record.get("query_id", ""),
+            "repeat_index": record.get("repeat_index", 1),
+            "status": status,
+            "evidence": record.get("web_search_evidence", ""),
+        })
+    return flags
+
+
+def _source_quality_flags(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+    for record in records:
+        status = record.get("source_parse_status")
+        if status in (None, ""):
+            continue
+        if status in {"parsed", "provider_returned_empty", "unsupported_by_protocol", "not_applicable"}:
+            continue
+        flags.append({
+            "query_id": record.get("query_id", ""),
+            "repeat_index": record.get("repeat_index", 1),
+            "status": status,
+        })
+    return flags
 
 
 STAT_EXCLUDING_CONTRACT_FIELDS = {
@@ -1111,6 +1165,8 @@ def _record_contract_mismatches(
     mismatches: list[dict[str, Any]] = []
     expected_query = manifest_queries.get(qid)
     raw_request = record.get("raw_request") if isinstance(record.get("raw_request"), dict) else {}
+    sampling_profile = manifest.get("sampling_profile") if isinstance(manifest.get("sampling_profile"), dict) else {}
+    adapter_name = str(sampling_profile.get("adapter") or manifest.get("adapter") or "openai_responses_web_search")
     raw_response = record.get("raw_response")
     if not isinstance(raw_response, dict) or not raw_response:
         mismatches.append(_contract_mismatch(record_index, qid, repeat, "raw_response", type(raw_response).__name__, "non-empty object"))
@@ -1119,12 +1175,13 @@ def _record_contract_mismatches(
         ("model", record.get("model"), manifest.get("model")),
         ("repeat_total", record.get("repeat_total"), manifest.get("repeats")),
         ("raw_request.model", raw_request.get("model"), manifest.get("model")),
-        ("raw_request.input", raw_request.get("input"), expected_query),
-        ("raw_request.web_search_limit", _raw_request_web_search_limit(raw_request), manifest.get("web_search_limit")),
+        ("raw_request.input", _raw_request_input(raw_request), expected_query),
     ]
+    if adapter_name == "openai_responses_web_search":
+        checks.append(("raw_request.web_search_limit", _raw_request_web_search_limit(raw_request), manifest.get("web_search_limit")))
     if raw_request:
         stored_hash = str(record.get("request_hash") or "")
-        computed_hash = _hash_raw_request(raw_request)
+        computed_hash = _record_request_hash(record, raw_request)
         if computed_hash and not stored_hash:
             mismatches.append(_contract_mismatch(record_index, qid, repeat, "request_hash", "", computed_hash))
         elif stored_hash and computed_hash and stored_hash != computed_hash:
@@ -1137,11 +1194,23 @@ def _record_contract_mismatches(
     return mismatches
 
 
-def _hash_raw_request(raw_request: dict[str, Any]) -> str | None:
+def _record_request_hash(record: dict[str, Any], raw_request: dict[str, Any]) -> str | None:
+    if isinstance(record.get("request_fingerprint_basis"), dict) and record.get("request_fingerprint_version") == REQUEST_FINGERPRINT_VERSION:
+        return request_fingerprint(record["request_fingerprint_basis"])
     if not raw_request:
         return None
-    stable = json.dumps(raw_request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    return legacy_payload_hash(raw_request)
+
+
+def _raw_request_input(raw_request: dict[str, Any]) -> Any:
+    if "input" in raw_request:
+        return raw_request.get("input")
+    messages = raw_request.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "user":
+                return message.get("content")
+    return None
 
 
 def _raw_request_web_search_limit(raw_request: dict[str, Any]) -> Any:
@@ -1527,11 +1596,12 @@ def compute_source_stats(records: list[dict[str, Any]], manifest: dict[str, Any]
                 continue
             seen_sources.add(source_key)
             title = str(source.get("title") or "")
-            rank = _as_positive_int(source.get("rank")) or 999
+            rank = _as_positive_int(source.get("rank"))
             domain_occ[domain] += 1
             domain_responses[domain].add(response_key)
             domain_queries[domain].add(qid)
-            domain_ranks[domain].append(rank)
+            if rank is not None:
+                domain_ranks[domain].append(rank)
             if url:
                 domain_urls[domain][url] += 1
                 url_occ[url] += 1
@@ -1539,7 +1609,8 @@ def compute_source_stats(records: list[dict[str, Any]], manifest: dict[str, Any]
             cell = by_query_domain[(qid, domain)]
             cell["repeats"].add(rep)
             cell["occ"] += 1
-            cell["ranks"].append(rank)
+            if rank is not None:
+                cell["ranks"].append(rank)
             if url:
                 cell["urls"][url] += 1
 
@@ -1679,7 +1750,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], *, schema: str | None = N
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for row in rows:
-                writer.writerow({key: sanitize_csv_cell(value) for key, value in row.items()})
+                writer.writerow(sanitize_csv_row(row))
         os.replace(tmp_path, path)
     finally:
         try:

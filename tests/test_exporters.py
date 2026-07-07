@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from geo_monitor.exporters import canonical_request_hash, export_csv, latest_success_records, read_jsonl, sanitize_csv_cell, successful_result_hashes, successful_result_keys
+from geo_monitor.exporters import canonical_request_hash, export_csv, latest_success_records, read_jsonl, sanitize_csv_cell, sanitize_csv_row, successful_result_hashes, successful_result_keys
 from geo_monitor.runner import MonitorRunner
 from geo_monitor.config import Settings
 from geo_monitor.dataset import load_queries
@@ -90,4 +90,41 @@ def test_csv_formula_injection_is_sanitized():
     assert sanitize_csv_cell("+cmd") == "'+cmd"
     assert sanitize_csv_cell("-sum") == "'-sum"
     assert sanitize_csv_cell("@test") == "'@test"
+    assert sanitize_csv_cell(" =1+1") == "' =1+1"
+    assert sanitize_csv_cell("\n=1+1") == "'\n=1+1"
     assert sanitize_csv_cell("normal") == "normal"
+
+
+def test_sanitize_csv_row_covers_all_fields():
+    row = sanitize_csv_row({"run_id": "=run", "model": "+model", "status": "ok", "count": 1})
+
+    assert row["run_id"] == "'=run"
+    assert row["model"] == "'+model"
+    assert row["status"] == "ok"
+    assert row["count"] == 1
+
+
+def test_export_csv_sanitizes_formula_values_at_writer_boundary(tmp_path):
+    out = tmp_path / "attempts.csv"
+    export_csv(
+        [
+            {
+                "run_id": "=run",
+                "query_id": "+qid",
+                "model": "@model",
+                "status": "success",
+                "input_query": "normal",
+                "response_text": "=response",
+                "error": {"type": "-type", "message": " =message"},
+            }
+        ],
+        out,
+    )
+
+    text = out.read_text(encoding="utf-8-sig")
+    assert "'=run" in text
+    assert "'+qid" in text
+    assert "'@model" in text
+    assert "'=response" in text
+    assert "'-type" in text
+    assert "' =message" in text

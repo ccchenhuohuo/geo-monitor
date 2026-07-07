@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .query_meta import ensure_query_meta_defaults
+
 
 Status = Literal["success", "error", "dry_run", "mock"]
 
@@ -68,6 +70,8 @@ class MonitorResult(BaseModel):
     repeat_index: int = 1
     repeat_total: int = 1
     request_hash: str | None = None
+    request_fingerprint_version: str | None = None
+    request_fingerprint_basis: dict[str, Any] = Field(default_factory=dict)
     model: str
     query: str | None = None
     input_query: str
@@ -79,6 +83,12 @@ class MonitorResult(BaseModel):
     error: ErrorRecord | None = None
     raw_request: dict[str, Any] = Field(default_factory=dict)
     raw_response: dict[str, Any] | None = None
+    sampling_profile: dict[str, Any] = Field(default_factory=dict)
+    provider_meta: dict[str, Any] = Field(default_factory=dict)
+    web_search_performed: bool | None = None
+    web_search_evidence: str | None = None
+    web_search_requirement_status: str | None = None
+    source_parse_status: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     query_meta: dict[str, Any] = Field(default_factory=dict)
     started_at: str
@@ -92,30 +102,7 @@ class MonitorResult(BaseModel):
             self.query = self.input_query.strip()
         if not self.query:
             raise ValueError("attempts-v2 requires top-level query")
-        meta = {key: "" if value is None else str(value) for key, value in dict(self.query_meta or {}).items()}
-        meta.setdefault("schema_version", "query-meta-v1")
-        for key in [
-            "variant_id",
-            "seed_id",
-            "seed_query",
-            "category",
-            "intent",
-            "persona",
-            "template_id",
-            "locale",
-            "market",
-            "tags",
-            "language",
-            "generation_method",
-            "fanout_version",
-            "manifest_version",
-            "locked_at",
-        ]:
-            meta.setdefault(key, "")
-        if not meta["generation_method"]:
-            meta["generation_method"] = "config"
-        meta.setdefault("query_metadata_json", "{}")
-        self.query_meta = meta
+        self.query_meta = ensure_query_meta_defaults(self.query_meta)
         return self
 
     @property

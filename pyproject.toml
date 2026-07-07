@@ -4,16 +4,19 @@ version = "0.1.0"
 description = "OpenAI-compatible Responses API GEO monitoring MVP"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "ccchenhuohuo" },
 ]
 classifiers = [
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Information Analysis",
 ]
+
 dependencies = [
   "openai>=1.60.0",
   "pydantic>=2.7.0",
@@ -26,6 +29,11 @@ dependencies = [
   "duckdb>=1.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/ccchenhuohuo/geo-monitor"
+Repository = "https://github.com/ccchenhuohuo/geo-monitor"
+Issues = "https://github.com/ccchenhuohuo/geo-monitor/issues"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2.0",
@@ -37,7 +45,7 @@ dev = [
 geo-monitor = "geo_monitor.cli:app"
 
 [build-system]
-requires = ["setuptools>=68.0.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

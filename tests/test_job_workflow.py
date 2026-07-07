@@ -72,6 +72,32 @@ def test_build_job_creates_query_manifest_without_business_context(tmp_path):
     assert "TestIndustry" not in query_manifest
 
 
+def test_query_manifest_preserves_formula_like_query_text(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    config_path.write_text(
+        json.dumps(
+            {
+                "target_brand": "TestAEntity",
+                "industry": "TestIndustry",
+                "queries": ["=formula-like user query"],
+                "repeats": 1,
+                "model": "test-model",
+                "web_search_limit": 5,
+                "concurrency": 1,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+
+    text = (bundle / "work" / "query_manifest.csv").read_text(encoding="utf-8-sig")
+    assert "=formula-like user query" in text
+    assert "'=formula-like user query" not in text
+
+
 def test_validate_job_config_reports_planned_units(tmp_path):
     config_path = tmp_path / "job_config.json"
     _write_job_config(config_path)
@@ -661,6 +687,72 @@ def test_analyze_job_with_injected_extractor_does_not_need_alias(tmp_path):
     assert result["brand_summary"][0]["brand_name_canonical"] == "TestStudio"
     assert (bundle / "result" / "sov_summary.csv").exists()
     assert "Brand Visibility / SOV" in (bundle / "result" / "report.md").read_text(encoding="utf-8")
+
+
+def test_analyze_job_ignores_superseded_contract_mismatch_for_latest_stats(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+
+    old = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "request_hash": "old-bad-hash",
+        "model": "test-model",
+        "input_query": "wrong query",
+        "status": "success",
+        "response_text": "OldBrand should be superseded.",
+        "sources": [],
+        "raw_request": {"model": "test-model", "input": "wrong query", "tools": [{"type": "web_search", "limit": 5}]},
+        "raw_response": {"status": "completed", "output_text": "OldBrand should be superseded."},
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    latest = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "LatestBrand is the valid answer.",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:02+00:00",
+        "completed_at": "2026-01-01T00:00:03+00:00",
+    }
+    _make_contract_valid(latest)
+    (bundle / "raw" / "attempts.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in [old, latest]), encoding="utf-8")
+
+    def extractor(record):
+        return [
+            {
+                "query_id": record["query_id"],
+                "repeat_index": record["repeat_index"],
+                "input_query": record["input_query"],
+                "brand_name_raw": "LatestBrand",
+                "brand_type": "公司",
+                "evidence": "LatestBrand",
+                "role": "mentioned",
+                "confidence": 0.9,
+            }
+        ], None
+
+    result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    assert result["data_quality"]["duplicate_units"] == [{"query_id": "q001", "repeat_index": 1, "count": 2}]
+    assert result["data_quality"]["contract_mismatches"] == []
+    assert result["data_quality"]["superseded_contract_mismatches"]
+    assert result["data_quality"]["stats_record_count"] == 1
+    assert result["data_quality"]["excluded_from_stats_count"] == 0
+    assert result["brand_summary"][0]["brand_name_canonical"] == "LatestBrand"
 
 
 def test_analyze_job_failure_marks_analysis_failed(tmp_path):
@@ -1606,6 +1698,81 @@ def test_source_stats_normalizes_domain_from_domain_or_url(tmp_path):
     assert len(domains) == 1
     assert domains[0]["domain"] == "example.com"
     assert domains[0]["parsed_source_occurrences"] == "2"
+
+
+def test_source_stats_ignores_missing_rank_in_source_order_average(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "TestStudio",
+        "sources": [
+            {"domain": "example.com", "url": "https://example.com/a", "title": "A", "rank": 2},
+            {"domain": "example.com", "url": "https://example.com/b", "title": "B"},
+        ],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    def extractor(record):
+        return [{"query_id": "q001", "repeat_index": 1, "input_query": record["input_query"], "brand_name_raw": "TestStudio", "brand_type": "品牌", "evidence": "TestStudio", "role": "mentioned", "confidence": 0.9}], None
+
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    domains = list(csv.DictReader((bundle / "result" / "source_domains.csv").open(encoding="utf-8-sig")))
+    assert domains[0]["parsed_source_occurrences"] == "2"
+    assert domains[0]["avg_source_order"] == "2"
+    assert domains[0]["best_source_order"] == "2"
+
+
+def test_source_stats_leaves_source_order_blank_when_all_ranks_missing(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "TestStudio",
+        "sources": [{"domain": "example.com", "url": "https://example.com/a", "title": "A"}],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    def extractor(record):
+        return [{"query_id": "q001", "repeat_index": 1, "input_query": record["input_query"], "brand_name_raw": "TestStudio", "brand_type": "品牌", "evidence": "TestStudio", "role": "mentioned", "confidence": 0.9}], None
+
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    domains = list(csv.DictReader((bundle / "result" / "source_domains.csv").open(encoding="utf-8-sig")))
+    assert domains[0]["parsed_source_occurrences"] == "1"
+    assert domains[0]["avg_source_order"] == ""
+    assert domains[0]["best_source_order"] == ""
 
 
 def test_source_stats_dedupes_same_url_within_response(tmp_path):

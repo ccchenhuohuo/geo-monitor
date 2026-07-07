@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from .job import JOB_MANIFEST, RAW_ATTEMPTS, load_job_manifest
+from .query_meta import query_metadata_json, tags_text
 
 
-DUCKDB_SCHEMA_VERSION = "duckdb-schema-v3"
+DUCKDB_SCHEMA_VERSION = "duckdb-schema-v4"
 SAFE_QUERY_START_RE = re.compile(r"^\s*(select|with|show|describe|explain)\b", re.IGNORECASE | re.DOTALL)
 FORBIDDEN_SQL_RE = re.compile(
     r"\b(attach|copy|create|delete|detach|drop|export|import|insert|install|load|merge|pragma|set|update|alter|call)\b"
@@ -94,6 +95,16 @@ def _create_schema(con: Any) -> None:
             completed_at varchar,
             target_brand varchar,
             model varchar,
+            provider varchar,
+            adapter varchar,
+            adapter_version varchar,
+            api_family varchar,
+            repeats integer,
+            source_grain varchar,
+            analysis_model varchar,
+            analysis_adapter varchar,
+            analysis_fingerprint varchar,
+            job_conclusion_strength varchar,
             sample_count integer,
             query_manifest_sha256 varchar,
             query_manifest_source_type varchar,
@@ -137,6 +148,15 @@ def _create_schema(con: Any) -> None:
             latency_ms integer,
             error varchar,
             model varchar,
+            provider varchar,
+            adapter varchar,
+            adapter_version varchar,
+            api_family varchar,
+            request_fingerprint_version varchar,
+            web_search_performed boolean,
+            web_search_evidence varchar,
+            web_search_requirement_status varchar,
+            source_parse_status varchar,
             created_at varchar,
             completed_at varchar,
             response_preview varchar,
@@ -172,6 +192,47 @@ def _create_views(con: Any) -> None:
         """
     )
     con.execute("create view metrics_by_run as select job_id, count(*) as attempt_count from attempts group by job_id")
+    con.execute(
+        """
+        create view comparison_cohorts as
+        select
+            coalesce(nullif(query_manifest_sha256, ''), 'unknown') as query_manifest_sha256,
+            repeats,
+            substr(coalesce(nullif(completed_at, ''), created_at), 1, 10) as execution_window_bucket,
+            count(*) as job_count,
+            count(distinct provider || ':' || adapter || ':' || api_family) as comparison_group_count,
+            count(distinct analysis_fingerprint) as analysis_fingerprint_count,
+            case
+                when count(*) > 1
+                 and count(distinct analysis_fingerprint) = 1
+                 and min(case when job_conclusion_strength = 'strong' then 1 else 0 end) = 1
+                 and min(case when coalesce(web_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
+                 and min(case when coalesce(source_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
+                then 'strong'
+                else 'observational'
+            end as comparison_conclusion_strength,
+            case
+                when min(case when source_grain = 'url' then 1 else 0 end) = 1
+                 and min(case when coalesce(source_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
+                then true
+                else false
+            end as source_metrics_comparable
+        from runs
+        left join (
+            select job_id, count(*) as bad_count
+            from attempts
+            where source_parse_status not in ('', 'parsed', 'provider_returned_empty')
+            group by job_id
+        ) source_status_bad using (job_id)
+        left join (
+            select job_id, count(*) as bad_count
+            from attempts
+            where web_search_requirement_status not in ('', 'satisfied', 'not_applicable')
+            group by job_id
+        ) web_status_bad using (job_id)
+        group by query_manifest_sha256, repeats, execution_window_bucket
+        """
+    )
 
 
 def _iter_run_dirs(runs_root: Path) -> list[Path]:
@@ -209,10 +270,14 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
         _quality(con, job_id, "missing_raw_attempts", "raw/attempts.jsonl missing", str(raw_path))
         counts["quality_flags"] += 1
     info = manifest.get("query_manifest") if isinstance(manifest.get("query_manifest"), dict) else {}
+    sampling_profile = manifest.get("sampling_profile") if isinstance(manifest.get("sampling_profile"), dict) else {}
+    analysis_profile = manifest.get("analysis_profile") if isinstance(manifest.get("analysis_profile"), dict) else {}
+    comparability_profile = manifest.get("comparability_profile") if isinstance(manifest.get("comparability_profile"), dict) else {}
+    analysis_summary = _read_analysis_summary(run_dir)
     report_path = run_dir / "result" / "report.html"
     completed_at = _completed_at(run_dir, attempts)
     con.execute(
-        "insert into runs values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into runs values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             job_id,
             manifest.get("status"),
@@ -220,8 +285,18 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
             completed_at,
             manifest.get("target_brand"),
             manifest.get("model"),
+            sampling_profile.get("provider", ""),
+            sampling_profile.get("adapter", manifest.get("adapter", "")),
+            sampling_profile.get("adapter_version", ""),
+            sampling_profile.get("api_family", ""),
+            _to_int(manifest.get("repeats")),
+            sampling_profile.get("source_grain", ""),
+            analysis_profile.get("model", ""),
+            analysis_profile.get("adapter", ""),
+            analysis_profile.get("analysis_fingerprint", ""),
+            analysis_summary.get("job_conclusion_strength") or (analysis_summary.get("data_quality") or {}).get("conclusion_strength", ""),
             len(attempts),
-            info.get("sha256", ""),
+            comparability_profile.get("query_manifest_sha256") or info.get("sha256", ""),
             info.get("source_type", ""),
             info.get("source_uri", ""),
             str(report_path) if report_path.exists() else "",
@@ -236,7 +311,7 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
         else:
             seen_attempts.add(attempt["attempt_id"])
         con.execute(
-            "insert into attempts values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into attempts values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 job_id,
                 attempt["attempt_id"],
@@ -245,6 +320,15 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
                 attempt["latency_ms"],
                 attempt["error"],
                 attempt["model"],
+                attempt["provider"],
+                attempt["adapter"],
+                attempt["adapter_version"],
+                attempt["api_family"],
+                attempt["request_fingerprint_version"],
+                attempt["web_search_performed"],
+                attempt["web_search_evidence"],
+                attempt["web_search_requirement_status"],
+                attempt["source_parse_status"],
                 attempt["created_at"],
                 attempt["completed_at"],
                 attempt["response_preview"],
@@ -318,6 +402,7 @@ def _read_attempts(raw_path: Path, job_id: str, fallback_rows: dict[str, dict[st
                 if conflicts:
                     flags.append({"type": "query_meta_conflict", "message": ",".join(conflicts), "path": str(raw_path), "raw_line_number": line_no, "query_id": qid})
             error = record.get("error") if isinstance(record.get("error"), dict) else {}
+            sampling_profile = record.get("sampling_profile") if isinstance(record.get("sampling_profile"), dict) else {}
             response_text = str(record.get("response_text") or "")
             attempt_id = str(record.get("attempt_id") or f"{job_id}__{qid}__r{record.get('repeat_index', 1)}__{record.get('request_hash', '')}")
             attempts.append(
@@ -328,6 +413,15 @@ def _read_attempts(raw_path: Path, job_id: str, fallback_rows: dict[str, dict[st
                     "latency_ms": _to_int(record.get("latency_ms")),
                     "error": str(error.get("message") or error.get("type") or ""),
                     "model": str(record.get("model") or ""),
+                    "provider": str(sampling_profile.get("provider") or ""),
+                    "adapter": str(sampling_profile.get("adapter") or ""),
+                    "adapter_version": str(sampling_profile.get("adapter_version") or ""),
+                    "api_family": str(sampling_profile.get("api_family") or ""),
+                    "request_fingerprint_version": str(record.get("request_fingerprint_version") or ""),
+                    "web_search_performed": _to_bool(record.get("web_search_performed")),
+                    "web_search_evidence": str(record.get("web_search_evidence") or ""),
+                    "web_search_requirement_status": str(record.get("web_search_requirement_status") or ""),
+                    "source_parse_status": str(record.get("source_parse_status") or ""),
                     "created_at": str(record.get("started_at") or ""),
                     "completed_at": str(record.get("completed_at") or ""),
                     "response_preview": response_text[:500],
@@ -385,13 +479,13 @@ def _merge_query_row(
         "template_id": str(meta.get("template_id") or ""),
         "locale": str(meta.get("locale") or ""),
         "market": str(meta.get("market") or ""),
-        "tags": _tags_value(meta.get("tags")),
+        "tags": tags_text(meta.get("tags")),
         "language": str(meta.get("language") or ""),
         "generation_method": str(meta.get("generation_method") or ""),
         "fanout_version": str(meta.get("fanout_version") or ""),
         "manifest_version": str(meta.get("manifest_version") or ""),
         "locked_at": str(meta.get("locked_at") or ""),
-        "query_metadata_json": _query_metadata_json(meta),
+        "query_metadata_json": query_metadata_json(meta),
     }
     for key, value in values.items():
         if not value:
@@ -406,42 +500,6 @@ def _merge_record_metadata(meta: dict[str, Any], record_metadata: dict[str, Any]
     merged = dict(record_metadata)
     merged.update({key: value for key, value in meta.items() if value not in (None, "")})
     return merged
-
-
-def _tags_value(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    if isinstance(value, list):
-        return ",".join(str(item).strip() for item in value if str(item).strip())
-    return str(value).strip()
-
-
-def _query_metadata_json(meta: dict[str, Any]) -> str:
-    existing = meta.get("query_metadata_json")
-    if isinstance(existing, str) and existing.strip() and existing.strip() != "{}":
-        return existing
-    known = {
-        "schema_version",
-        "variant_id",
-        "seed_id",
-        "seed_query",
-        "category",
-        "intent",
-        "persona",
-        "template_id",
-        "language",
-        "generation_method",
-        "fanout_version",
-        "manifest_version",
-        "locked_at",
-        "query_id",
-        "query",
-        "locale",
-        "market",
-        "tags",
-    }
-    custom = {key: value for key, value in meta.items() if key not in known and value not in (None, "")}
-    return json.dumps(custom, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _ingest_csv_outputs(con: Any, run_dir: Path, job_id: str) -> int:
@@ -505,6 +563,17 @@ def _completed_at(run_dir: Path, attempts: list[dict[str, Any]]) -> str:
     return max(values) if values else ""
 
 
+def _read_analysis_summary(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "logs" / "analysis_summary.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _pct(value: Any) -> float | None:
     text = str(value or "").strip()
     if not text:
@@ -528,6 +597,34 @@ def _to_int(value: Any) -> int | None:
         return int(float(value))
     except Exception:
         return None
+
+
+def _to_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def connect_readonly(db_path: str | Path) -> Any:
+    return _connect_readonly(db_path)
+
+
+def validate_schema(con: Any) -> None:
+    try:
+        row = con.execute("select schema_version from schema_info limit 1").fetchone()
+    except Exception as exc:
+        raise DuckDBError(f"DuckDB schema_info 缺失或不可读：{exc}") from exc
+    if not row or str(row[0]) != DUCKDB_SCHEMA_VERSION:
+        raise DuckDBError(f"DuckDB schema_version 不支持：{row[0] if row else 'unknown'}；请重建 DuckDB")
 
 
 def _connect_readonly(db_path: str | Path) -> Any:

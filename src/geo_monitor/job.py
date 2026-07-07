@@ -11,10 +11,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .llm_client import build_responses_payload
+from .adapters.registry import build_sampling_profile, get_adapter
 from .config import LiveSettingsError, Settings, get_settings, validate_live_settings, workspace_root
 from .dataset import load_queries, select_queries
 from .exporters import latest_records, read_jsonl, successful_result_hashes
+from .request_fingerprint import REQUEST_FINGERPRINT_VERSION, analysis_fingerprint, base_url_fingerprint
 from .runner import MonitorRunner, compute_request_hash
 from .schemas import QueryRecord, utc_now_iso
 
@@ -29,6 +30,7 @@ QUERY_MANIFEST = f"{WORK_DIR}/query_manifest.csv"
 RAW_ATTEMPTS = "raw/attempts.jsonl"
 GEO_JOB_V1 = "geo-job-v1"
 GEO_JOB_V2 = "geo-job-v2"
+GEO_JOB_V3 = "geo-job-v3"
 QUERY_MANIFEST_V1 = "query-manifest-v1"
 SLUG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 RUN_SUMMARY = "logs/run_summary.json"
@@ -43,6 +45,10 @@ JOB_CONFIG_KEYS = {
     "repeats",
     "model",
     "web_search_limit",
+    "adapter",
+    "adapter_options",
+    "analysis_model",
+    "analysis_adapter",
     "concurrency",
     "start_interval_seconds",
 }
@@ -63,6 +69,14 @@ ALLOWED_STATUSES = {
 
 
 class JobError(ValueError):
+    pass
+
+
+class QueryManifestIntegrityError(JobError):
+    pass
+
+
+class QueryManifestSourceError(JobError):
     pass
 
 
@@ -87,7 +101,6 @@ def build_job_bundle(
     if external_query_manifest is not None:
         queries = _query_rows_from_records(load_queries(external_query_manifest))
         query_manifest_info = _query_manifest_info(external_query_manifest)
-        schema_version = GEO_JOB_V2
     else:
         queries = _normalize_queries(config.get("queries"))
         query_manifest_info = {
@@ -98,7 +111,7 @@ def build_job_bundle(
             "sha256": "",
             "row_count": len(queries),
         }
-        schema_version = GEO_JOB_V1
+    schema_version = GEO_JOB_V3
     repeats = _positive_int(config.get("repeats", 20), "repeats")
     web_search_limit = _bounded_int(config.get("web_search_limit", settings.web_search_limit), "web_search_limit", minimum=1, maximum=20)
     concurrency = _positive_int(config.get("concurrency", settings.concurrency), "concurrency")
@@ -108,6 +121,28 @@ def build_job_bundle(
     model = str(config.get("model") or settings.llm_model).strip()
     if not model:
         raise JobError("model 不能为空")
+    adapter_name = str(config.get("adapter") or "openai_responses_web_search").strip()
+    adapter_options = _object_dict(config.get("adapter_options"), "adapter_options")
+    try:
+        adapter = get_adapter(adapter_name)
+        adapter.validate_options(adapter_options)
+        sampling_profile = build_sampling_profile(
+            adapter_name=adapter_name,
+            model=model,
+            settings=settings,
+            web_search_limit=web_search_limit,
+            web_search_required=True,
+        )
+    except ValueError as exc:
+        raise JobError(str(exc)) from exc
+    analysis_model = str(config.get("analysis_model") or model).strip()
+    if not analysis_model:
+        raise JobError("analysis_model 不能为空")
+    analysis_adapter = str(config.get("analysis_adapter") or "openai_responses_text").strip()
+    try:
+        analysis_profile = _build_analysis_profile(analysis_adapter, analysis_model, settings)
+    except ValueError as exc:
+        raise JobError(str(exc)) from exc
     target_brand = _required_str(config, "target_brand")
     industry = _required_str(config, "industry")
     market = _optional_str(config, "market", default="未指定市场")
@@ -124,12 +159,17 @@ def build_job_bundle(
         "repeats": repeats,
         "model": model,
         "web_search_limit": web_search_limit,
+        "adapter": adapter.name,
+        "adapter_options": adapter_options,
+        "sampling_profile": sampling_profile,
+        "analysis_profile": analysis_profile,
         "concurrency": concurrency,
         "start_interval_seconds": start_interval_seconds,
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "query_count": len(queries),
         "query_manifest": query_manifest_info,
+        "comparability_profile": _build_comparability_profile(query_manifest_info, queries, repeats, sampling_profile, analysis_profile),
         "paths": _manifest_paths(),
     }
     if external_query_manifest is None:
@@ -152,7 +192,7 @@ def _materialize_job_bundle(bundle_dir: Path, manifest: dict[str, Any], queries:
         (bundle_dir / name).mkdir(parents=True, exist_ok=True)
     _write_json(bundle_dir / JOB_MANIFEST, manifest)
     query_manifest = bundle_dir / QUERY_MANIFEST
-    source_path = _resolve_query_manifest_source(manifest)
+    source_path = _resolve_query_manifest_source(manifest, bundle_dir=bundle_dir)
     if source_path is not None and source_path.exists():
         shutil.copyfile(source_path, query_manifest)
     else:
@@ -191,6 +231,23 @@ def validate_job_config(
     model = str(config.get("model") or settings.llm_model).strip()
     if not model:
         raise JobError("model 不能为空")
+    adapter_name = str(config.get("adapter") or "openai_responses_web_search").strip()
+    adapter_options = _object_dict(config.get("adapter_options"), "adapter_options")
+    try:
+        adapter = get_adapter(adapter_name)
+        adapter.validate_options(adapter_options)
+        sampling_profile = build_sampling_profile(
+            adapter_name=adapter_name,
+            model=model,
+            settings=settings,
+            web_search_limit=web_search_limit,
+            web_search_required=True,
+        )
+        analysis_model = str(config.get("analysis_model") or model).strip()
+        analysis_adapter = str(config.get("analysis_adapter") or "openai_responses_text").strip()
+        analysis_profile = _build_analysis_profile(analysis_adapter, analysis_model, settings)
+    except ValueError as exc:
+        raise JobError(str(exc)) from exc
     result = {
         "target_brand": _required_str(config, "target_brand"),
         "target_aliases": _string_list(config.get("target_aliases"), "target_aliases"),
@@ -201,6 +258,16 @@ def validate_job_config(
         "planned_units": len(queries) * repeats,
         "model": model,
         "web_search_limit": web_search_limit,
+        "adapter": adapter.name,
+        "sampling_profile": sampling_profile,
+        "analysis_profile": analysis_profile,
+        "comparability_profile": _build_comparability_profile(
+            query_manifest_info or {"sha256": "", "row_count": len(queries)},
+            queries,
+            repeats,
+            sampling_profile,
+            analysis_profile,
+        ),
         "concurrency": concurrency,
         "start_interval_seconds": start_interval_seconds,
     }
@@ -258,6 +325,8 @@ def run_job_bundle(
                 resume=resume,
                 model=str(manifest["model"]),
                 web_search_limit=int(manifest["web_search_limit"]),
+                sampling_profile=dict(manifest["sampling_profile"]),
+                adapter_options=dict(manifest.get("adapter_options") or {}),
                 repeats=int(manifest["repeats"]),
                 repeat_order="round-robin",
                 sleep_seconds=sleep_seconds,
@@ -354,6 +423,9 @@ def estimate_job_run(
         "start_interval_seconds": manifest.get("start_interval_seconds", 0.0),
         "web_search_limit": manifest["web_search_limit"],
         "model": manifest["model"],
+        "adapter": manifest.get("adapter"),
+        "sampling_profile": manifest.get("sampling_profile"),
+        "analysis_profile": manifest.get("analysis_profile"),
     }
 
 
@@ -362,8 +434,9 @@ def load_job_manifest(bundle_dir: str | Path) -> dict[str, Any]:
     if not path.exists():
         raise JobError(f"缺少 job_manifest.json：{path}")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("schema_version") not in {GEO_JOB_V1, GEO_JOB_V2}:
-        raise JobError("job_manifest schema_version 必须是 geo-job-v1 或 geo-job-v2")
+    if data.get("schema_version") not in {GEO_JOB_V1, GEO_JOB_V2, GEO_JOB_V3}:
+        raise JobError("job_manifest schema_version 必须是 geo-job-v1、geo-job-v2 或 geo-job-v3")
+    data = _normalize_job_manifest_profiles(data)
     _validate_job_manifest(data)
     return data
 
@@ -382,7 +455,7 @@ def load_job_queries(bundle_dir: str | Path, manifest: dict[str, Any] | None = N
     query_manifest = resolve_query_manifest(root, manifest, materialize=materialize)
     if query_manifest.exists():
         return load_queries(query_manifest)
-    source = _resolve_query_manifest_source(manifest)
+    source = _resolve_query_manifest_source(manifest, bundle_dir=root)
     if source is not None and source.exists():
         _ensure_manifest_file_fingerprint(source, manifest)
         return load_queries(source)
@@ -399,7 +472,7 @@ def resolve_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | No
     queries = manifest.get("queries")
     if not isinstance(queries, list) or not queries:
         if materialize:
-            source = _resolve_query_manifest_source(manifest)
+            source = _resolve_query_manifest_source(manifest, bundle_dir=root)
             if source is not None and source.exists():
                 _ensure_manifest_file_fingerprint(source, manifest)
                 current.parent.mkdir(parents=True, exist_ok=True)
@@ -596,7 +669,7 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _resolve_query_manifest_source(manifest: dict[str, Any]) -> Path | None:
+def _resolve_query_manifest_source(manifest: dict[str, Any], *, bundle_dir: str | Path | None = None) -> Path | None:
     info = manifest.get("query_manifest")
     if not isinstance(info, dict):
         return None
@@ -606,10 +679,51 @@ def _resolve_query_manifest_source(manifest: dict[str, Any]) -> Path | None:
     if not source_uri:
         return None
     path = Path(str(source_uri))
-    if path.is_absolute():
-        return path
-    base = info.get("source_uri_base")
-    return (Path(str(base)) / path) if base else path
+    if not path.is_absolute():
+        base = info.get("source_uri_base")
+        path = (Path(str(base)) / path) if base else path
+    if bundle_dir is not None:
+        _ensure_trusted_query_manifest_source(path, Path(bundle_dir))
+    return path
+
+
+def _ensure_trusted_query_manifest_source(path: Path, bundle_dir: Path) -> None:
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception as exc:
+        raise QueryManifestSourceError(f"query_manifest.source_uri 无法解析：{path}") from exc
+    trusted_roots = _trusted_query_manifest_roots(bundle_dir)
+    if any(_is_relative_to(resolved, root) for root in trusted_roots):
+        return
+    roots = ", ".join(str(root) for root in trusted_roots)
+    raise QueryManifestSourceError(
+        f"query_manifest.source_uri 不在可信目录内：{path}；可信目录：{roots}。如需使用该文件，请显式传入 --query-manifest。"
+    )
+
+
+def _trusted_query_manifest_roots(bundle_dir: Path) -> list[Path]:
+    candidates = [bundle_dir, bundle_dir.parent]
+    if bundle_dir.parent.name in {"runs", RUNS_DIR}:
+        candidates.append(bundle_dir.parent.parent)
+    roots: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except Exception:
+            continue
+        if resolved == resolved.parent:
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _ensure_manifest_file_fingerprint(path: Path, manifest: dict[str, Any]) -> None:
@@ -621,10 +735,10 @@ def _ensure_manifest_file_fingerprint(path: Path, manifest: dict[str, Any]) -> N
     expected_sha = str(info.get("sha256") or "")
     expected_count = int(info.get("row_count") or 0)
     if expected_sha and _file_sha256(path) != expected_sha:
-        raise JobError(f"query manifest sha256 不匹配：{path}")
+        raise QueryManifestIntegrityError(f"query manifest sha256 不匹配：{path}")
     records = load_queries(path)
     if expected_count and len(records) != expected_count:
-        raise JobError(f"query manifest row_count 不匹配：{path}")
+        raise QueryManifestIntegrityError(f"query manifest row_count 不匹配：{path}")
     _query_rows_from_records(records)
 
 
@@ -658,8 +772,68 @@ def _manifest_paths() -> dict[str, str]:
     }
 
 
+def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(data)
+    settings = get_settings()
+    model = str(normalized.get("model") or settings.llm_model)
+    web_search_limit = int(normalized.get("web_search_limit") or settings.web_search_limit)
+    adapter_name = str(normalized.get("adapter") or "openai_responses_web_search")
+    if not isinstance(normalized.get("adapter_options"), dict):
+        normalized["adapter_options"] = {}
+    if not isinstance(normalized.get("sampling_profile"), dict):
+        try:
+            normalized["sampling_profile"] = build_sampling_profile(
+                adapter_name=adapter_name,
+                model=model,
+                settings=settings,
+                web_search_limit=web_search_limit,
+                web_search_required=True,
+            )
+        except ValueError:
+            normalized["sampling_profile"] = {
+                "provider": "openai_compatible",
+                "adapter": "openai_responses_web_search",
+                "adapter_version": "1",
+                "api_family": "responses",
+                "model": model,
+                "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
+                "request_fingerprint_version": REQUEST_FINGERPRINT_VERSION,
+                "web_search_required": True,
+                "source_grain": "url",
+                "web_search_limit": web_search_limit,
+            }
+    if not normalized.get("adapter"):
+        normalized["adapter"] = str(normalized["sampling_profile"].get("adapter") or adapter_name)
+    if not isinstance(normalized.get("analysis_profile"), dict):
+        analysis_model = str(normalized.get("analysis_model") or model)
+        try:
+            normalized["analysis_profile"] = _build_analysis_profile("openai_responses_text", analysis_model, settings)
+        except ValueError:
+            normalized["analysis_profile"] = {
+                "provider": "openai_compatible",
+                "adapter": "openai_responses_text",
+                "adapter_version": "1",
+                "api_family": "responses",
+                "model": analysis_model,
+                "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
+                "analysis_fingerprint": "",
+            }
+            normalized["analysis_profile"]["analysis_fingerprint"] = analysis_fingerprint(normalized["analysis_profile"])
+    if not isinstance(normalized.get("comparability_profile"), dict):
+        info = normalized.get("query_manifest") if isinstance(normalized.get("query_manifest"), dict) else {}
+        queries = normalized.get("queries") if isinstance(normalized.get("queries"), list) else []
+        normalized["comparability_profile"] = _build_comparability_profile(
+            info,
+            queries,
+            int(normalized.get("repeats") or 1),
+            normalized["sampling_profile"],
+            normalized["analysis_profile"],
+        )
+    return normalized
+
+
 def _validate_job_manifest(data: dict[str, Any]) -> None:
-    required = ["schema_version", "job_id", "status", "target_brand", "industry", "market", "repeats", "model", "web_search_limit", "concurrency", "query_count"]
+    required = ["schema_version", "job_id", "status", "target_brand", "industry", "market", "repeats", "model", "web_search_limit", "adapter", "concurrency", "query_count"]
     missing = [key for key in required if key not in data]
     if missing:
         raise JobError(f"job_manifest 缺少字段：{', '.join(missing)}")
@@ -673,7 +847,7 @@ def _validate_job_manifest(data: dict[str, Any]) -> None:
             raise JobError("job_manifest query_count 与 queries 数量不一致")
     else:
         if not isinstance(data.get("query_manifest"), dict):
-            raise JobError("geo-job-v2 必须包含 query_manifest")
+            raise JobError(f"{schema_version} 必须包含 query_manifest")
         info = data["query_manifest"]
         for key in ["source_type", "schema_version", "sha256", "row_count"]:
             if key not in info:
@@ -688,12 +862,23 @@ def _validate_job_manifest(data: dict[str, Any]) -> None:
     _non_negative_float(data.get("start_interval_seconds", 0.0), "start_interval_seconds")
     if not str(data.get("model") or "").strip():
         raise JobError("model 不能为空")
+    _validate_profile_object(data.get("sampling_profile"), "sampling_profile", ["provider", "adapter", "adapter_version", "api_family", "model", "base_url_fingerprint", "request_fingerprint_version", "web_search_required", "source_grain"])
+    _validate_profile_object(data.get("analysis_profile"), "analysis_profile", ["provider", "adapter", "adapter_version", "api_family", "model", "base_url_fingerprint", "analysis_fingerprint"])
+    _validate_profile_object(data.get("comparability_profile"), "comparability_profile", ["query_manifest_sha256", "repeats", "analysis_fingerprint", "source_grain"])
     _required_str(data, "target_brand")
     _string_list(data.get("target_aliases"), "target_aliases")
     _required_str(data, "industry")
     _optional_str(data, "market", default="未指定市场")
     if schema_version == GEO_JOB_V1:
         _validate_persisted_queries(data.get("queries"))
+
+
+def _validate_profile_object(value: Any, name: str, required: list[str]) -> None:
+    if not isinstance(value, dict):
+        raise JobError(f"{name} 必须是对象")
+    missing = [key for key in required if key not in value]
+    if missing:
+        raise JobError(f"{name} 缺少字段：{', '.join(missing)}")
 
 
 def _make_job_id() -> str:
@@ -722,6 +907,58 @@ def _string_list(value: Any, key: str) -> list[str]:
         raise JobError(f"{key} 必须是字符串数组")
     out = [str(item).strip() for item in value if str(item).strip()]
     return out
+
+
+def _object_dict(value: Any, key: str) -> dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise JobError(f"{key} 必须是对象")
+    return dict(value)
+
+
+def _build_analysis_profile(adapter_name: str, model: str, settings: Settings) -> dict[str, Any]:
+    adapter = get_adapter(adapter_name)
+    if adapter.name != "openai_responses_text":
+        raise ValueError("analysis_adapter 目前只支持 openai_responses_text")
+    model_text = str(model or "").strip()
+    if not model_text:
+        raise ValueError("analysis_model 不能为空")
+    if not adapter.capabilities.supports_model(model_text):
+        patterns = ", ".join(adapter.capabilities.supported_model_patterns)
+        raise ValueError(f"{adapter.name} 不支持 analysis_model {model_text!r}；支持模式：{patterns}")
+    profile = {
+        "provider": adapter.provider,
+        "adapter": adapter.name,
+        "adapter_version": adapter.adapter_version,
+        "api_family": adapter.capabilities.api_family,
+        "model": model_text,
+        "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
+    }
+    profile["analysis_fingerprint"] = analysis_fingerprint(profile)
+    return profile
+
+
+def _build_comparability_profile(
+    query_manifest_info: dict[str, Any],
+    queries: list[dict[str, Any]],
+    repeats: int,
+    sampling_profile: dict[str, Any],
+    analysis_profile: dict[str, Any],
+) -> dict[str, Any]:
+    query_digest = str(query_manifest_info.get("sha256") or "") or _query_rows_digest(queries)
+    return {
+        "query_manifest_sha256": query_digest,
+        "repeats": repeats,
+        "analysis_fingerprint": analysis_profile.get("analysis_fingerprint", ""),
+        "source_grain": sampling_profile.get("source_grain", "unknown"),
+    }
+
+
+def _query_rows_digest(queries: list[dict[str, Any]]) -> str:
+    rows = [{key: row.get(key, "") for key in sorted(row)} for row in queries]
+    stable = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 
 def _bounded_int(value: Any, key: str, *, minimum: int, maximum: int) -> int:
@@ -800,7 +1037,8 @@ def _query_records_from_manifest(manifest: dict[str, Any]) -> list[QueryRecord]:
 
 
 def _ensure_query_manifest_matches(path: Path, manifest: dict[str, Any]) -> None:
-    if str(manifest.get("schema_version")) == GEO_JOB_V2:
+    info = manifest.get("query_manifest") if isinstance(manifest.get("query_manifest"), dict) else {}
+    if str(manifest.get("schema_version")) in {GEO_JOB_V2, GEO_JOB_V3} and info.get("source_type") == "external_file":
         _ensure_manifest_file_fingerprint(path, manifest)
         return
     loaded_queries = load_queries(path)
@@ -850,13 +1088,14 @@ def _resume_matched_unit_count(raw_path: Path, queries: list[QueryRecord], manif
         return 0
     count = 0
     repeats = int(manifest["repeats"])
-    model = str(manifest["model"])
-    web_search_limit = int(manifest["web_search_limit"])
+    sampling_profile = dict(manifest.get("sampling_profile") or {})
+    adapter = get_adapter(str(sampling_profile.get("adapter") or "openai_responses_web_search"))
+    adapter_options = dict(manifest.get("adapter_options") or {})
     for query in queries:
-        payload = build_responses_payload(query, settings, model=model, web_search_limit=web_search_limit)
-        request_hash = compute_request_hash(payload)
+        provider_request = adapter.build_request(query, sampling_profile, settings, adapter_options)
+        request_hashes = {provider_request.request_hash, compute_request_hash(provider_request.payload)}
         for repeat_index in range(1, repeats + 1):
-            if request_hash in done_hashes.get((query.query_id, repeat_index), set()):
+            if request_hashes & done_hashes.get((query.query_id, repeat_index), set()):
                 count += 1
     return count
 

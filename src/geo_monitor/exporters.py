@@ -36,7 +36,7 @@ CSV_FIELDS = [
 ]
 
 
-FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
 def append_jsonl(path: str | Path, result: MonitorResult) -> None:
@@ -221,7 +221,11 @@ def export_csv(records: Iterable[dict], path: str | Path) -> None:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
         for record in records:
-            writer.writerow(_flatten_record(record))
+            writer.writerow(sanitize_csv_row(_flatten_record(record)))
+
+
+def sanitize_csv_row(row: dict[str, object]) -> dict[str, object]:
+    return {key: sanitize_csv_cell(value) for key, value in row.items()}
 
 
 def sanitize_csv_cell(value: object) -> object:
@@ -229,7 +233,8 @@ def sanitize_csv_cell(value: object) -> object:
         return value
     if not isinstance(value, str):
         return value
-    if value.startswith(FORMULA_PREFIXES):
+    stripped = value.lstrip(" \t\r\n")
+    if value.startswith(("\t", "\r", "\n")) or stripped.startswith(("=", "+", "-", "@")):
         return "'" + value
     return value
 
@@ -250,17 +255,17 @@ def _flatten_record(record: dict) -> dict[str, object]:
         "model": record.get("model"),
         "status": record.get("status"),
         "latency_ms": record.get("latency_ms"),
-        "input_query": sanitize_csv_cell(record.get("input_query")),
-        "response_text": sanitize_csv_cell(record.get("response_text")),
+        "input_query": record.get("input_query"),
+        "response_text": record.get("response_text"),
         "source_count": len(sources),
-        "source_domains": sanitize_csv_cell(" ".join(domains)),
-        "source_urls": sanitize_csv_cell(" ".join(urls)),
+        "source_domains": " ".join(domains),
+        "source_urls": " ".join(urls),
         "usage_input_tokens": usage.get("input_tokens") or usage.get("prompt_tokens"),
         "usage_output_tokens": usage.get("output_tokens") or usage.get("completion_tokens"),
         "usage_total_tokens": usage.get("total_tokens"),
         "usage_web_search": tool_usage.get("web_search"),
         "error_type": error.get("type"),
-        "error_message": sanitize_csv_cell(error.get("message")),
+        "error_message": error.get("message"),
         "started_at": record.get("started_at"),
         "completed_at": record.get("completed_at"),
     }

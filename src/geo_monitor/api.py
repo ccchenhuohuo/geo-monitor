@@ -99,6 +99,11 @@ def run_geo_monitor(
         raise ValueError("run_geo_monitor 需要 study_dir 或 runs_dir")
     if seed_prompts_path and not paths.query_manifest_path:
         raise ValueError("使用 seed_prompts_path 时必须显式传入 query_manifest_path")
+    if build_dashboard and not paths.dashboard_out:
+        raise ValueError("build_dashboard=True 需要 study_dir 或 dashboard_out")
+    existing_db_available = bool(paths.db_path and Path(paths.db_path).exists())
+    if build_dashboard and not build_db and not existing_db_available:
+        raise ValueError("build_dashboard=True 且 build_db=False 需要已有 DuckDB；请提供 db_path 或启用 build_db=True")
     fanout_result: dict[str, Any] = {}
     if seed_prompts_path and paths.query_manifest_path:
         manifest_path = Path(paths.query_manifest_path)
@@ -138,9 +143,11 @@ def run_geo_monitor(
     status = str(final_manifest.get("status") or ("dry_run" if dry_run else "ran"))
     db_result = None
     dashboard_result = None
+    db_available = existing_db_available
     if build_db and status.startswith("analyzed") and paths.db_path:
         db_result = build_duckdb(paths.runs_dir, paths.db_path)
-    if build_dashboard and db_result and paths.dashboard_out and paths.db_path:
+        db_available = True
+    if build_dashboard and db_available and paths.dashboard_out and paths.db_path:
         dashboard_result = build_static_dashboard(paths.db_path, paths.dashboard_out)
     report_md = Path(bundle["bundle_dir"]) / "result" / "report.md"
     artifact_paths = {
@@ -163,7 +170,7 @@ def run_geo_monitor(
         metrics={"fanout": fanout_result, "run": run_result, "analysis": analysis_result, "db": db_result or {}},
         artifact_paths=artifact_paths,
         study_paths=asdict(paths),
-        db_path=paths.db_path if db_result else None,
+        db_path=paths.db_path if db_available else None,
         dashboard_path=dashboard_result["dashboard_path"] if dashboard_result else None,
         quality_flags=_quality_flags_from_analysis(analysis_result),
         errors=_errors_from_results(run_result, analysis_result),

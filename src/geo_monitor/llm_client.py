@@ -60,6 +60,7 @@ class LLMResponsesClient:
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key.get_secret_value(),  # type: ignore[union-attr]
             timeout=settings.request_timeout_seconds,
+            max_retries=0,
         )
 
     def create_response(self, payload: dict[str, Any]) -> Any:

@@ -81,9 +81,13 @@ def inline(text: str) -> str:
     return escaped.replace("`", "")
 
 
-def table_cell(value: object) -> str:
+def markdown_text(value: object) -> str:
     text = "" if value is None else str(value)
-    return text.replace("|", "；").replace("\n", " ")
+    return html.escape(text, quote=False)
+
+
+def table_cell(value: object) -> str:
+    return markdown_text(value).replace("|", "；").replace("\n", " ")
 
 
 def re_bold(text: str) -> str:

@@ -24,6 +24,25 @@ def test_client_rejects_placeholder_endpoint():
         raise AssertionError("expected placeholder endpoint rejection")
 
 
+def test_client_disables_openai_sdk_retries(monkeypatch):
+    captured = {}
+
+    class FakeResponses:
+        def create(self, **payload):
+            return {"status": "completed", "output_text": "ok"}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("geo_monitor.llm_client.OpenAI", FakeOpenAI)
+
+    LLMResponsesClient(Settings(llm_api_key="test", llm_base_url="https://provider.example/v1"))
+
+    assert captured["max_retries"] == 0
+
+
 def test_client_retries_retryable_status_then_succeeds():
     settings = Settings(llm_api_key="test", llm_base_url="https://provider.example/v1", retry_max_attempts=3)
     client = LLMResponsesClient(settings)

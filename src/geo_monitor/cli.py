@@ -81,7 +81,7 @@ def build_job_command(
 ) -> None:
     try:
         result = build_job_bundle(job_config, out_dir, force=force, query_manifest_path=query_manifest, runs_dir=runs_dir)
-    except JobError as exc:
+    except (DatasetError, JobError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]任务已生成：{result['bundle_dir']}[/green]")
     console.print(f"query_manifest: {result['query_manifest']}")
@@ -116,7 +116,7 @@ def validate_job_config_command(
 ) -> None:
     try:
         result = validate_job_config(job_config, query_manifest_path=query_manifest)
-    except JobError as exc:
+    except (DatasetError, JobError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(
         f"[green]任务配置有效：{result['query_count']} 条 query × {result['repeats']} repeats = "
@@ -227,7 +227,7 @@ def cleanup_job_command(
 ) -> None:
     try:
         result = cleanup_job_bundle(bundle_dir)
-    except JobError as exc:
+    except (DatasetError, JobError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]清理完成：removed_work_dir={result['removed_work_dir']}[/green]")
 

@@ -12,6 +12,8 @@ __pycache__/
 .coverage
 htmlcov/
 *.egg-info/
+build/
+dist/
 .runs/
 # Local external study workspaces and generated analysis caches.
 my-geo-study/

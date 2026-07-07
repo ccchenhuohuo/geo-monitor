@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .db import DuckDBError, connect_readonly, validate_schema
+
 
 class DashboardError(ValueError):
     pass
@@ -32,18 +34,23 @@ def build_dashboard(db_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
 def _load_dashboard_data(db: Path) -> dict[str, Any]:
     if not db.exists():
         raise DashboardError(f"DuckDB 不存在：{db}")
-    duckdb = _duckdb()
-    con = duckdb.connect(str(db), read_only=True)
+    con = connect_readonly(db)
     try:
+        validate_schema(con)
         return {
             "overview": _one(con, "select count(*) queries from queries"),
             "attempts": _one(con, "select count(*) attempts from attempts"),
             "top_brands": _rows(con, "select brand_name_canonical, avg(sov_event_share) sov from brand_summary group by 1 order by sov desc nulls last limit 10"),
             "persona": _rows(con, "select persona, count(distinct query_id) queries from queries group by 1 order by 1"),
             "seed": _rows(con, "select seed_id, count(distinct query_id) queries from queries group by 1 order by 1"),
-            "runs": _rows(con, "select job_id, status, sample_count, target_brand, model from runs order by created_at desc nulls last"),
+            "runs": _rows(con, "select job_id, status, sample_count, target_brand, model, provider, adapter, api_family, job_conclusion_strength from runs order by created_at desc nulls last"),
+            "comparison": _rows(con, "select query_manifest_sha256, repeats, execution_window_bucket, job_count, comparison_group_count, analysis_fingerprint_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts order by execution_window_bucket desc nulls last"),
             "quality": _rows(con, "select type, count(*) count from quality_flags group by 1 order by count desc"),
         }
+    except DuckDBError as exc:
+        raise DashboardError(str(exc)) from exc
+    except Exception as exc:
+        raise DashboardError(f"DuckDB dashboard 查询失败：{exc}") from exc
     finally:
         con.close()
 
@@ -90,9 +97,10 @@ th {{ background: #eef2f7; }}
 </section>
 <section><h2>Top Brands</h2>{_table(data["top_brands"])}</section>
 <section><h2>Persona</h2>{_table(data["persona"])}</section>
-<section><h2>Seed Query</h2>{_table(data["seed"])}</section>
-<section><h2>Runs</h2>{_table(data["runs"])}</section>
-<section><h2>Quality</h2>{_table(data["quality"])}</section>
+    <section><h2>Seed Query</h2>{_table(data["seed"])}</section>
+    <section><h2>Runs</h2>{_table(data["runs"])}</section>
+    <section><h2>Comparison Cohorts</h2>{_table(data["comparison"])}</section>
+    <section><h2>Quality</h2>{_table(data["quality"])}</section>
 </body>
 </html>
 """
@@ -109,11 +117,3 @@ def _table(rows: list[dict[str, Any]]) -> str:
 
 def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value))
-
-
-def _duckdb() -> Any:
-    try:
-        import duckdb
-    except ModuleNotFoundError as exc:
-        raise DashboardError("缺少 duckdb 依赖，请安装项目依赖：pip install -e .") from exc
-    return duckdb

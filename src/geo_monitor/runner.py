@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 from uuid import uuid4
 
-from .llm_client import LLMResponsesClient, build_responses_payload
+from .adapters import OpenAICompatibleClientFactory, ProviderRequest, build_sampling_profile, get_adapter
 from .config import Settings, redact_secret
 from .exporters import append_jsonl, successful_result_hashes
+from .llm_client import LLMResponsesClient
 from .mock_client import build_mock_response
-from .response_parser import parse_response, response_to_dict
+from .query_meta import query_record_meta
+from .request_fingerprint import legacy_payload_hash
 from .schemas import ErrorRecord, MonitorResult, QueryRecord, utc_now_iso
 
 
@@ -25,8 +25,7 @@ def make_run_id() -> str:
 
 
 def compute_request_hash(payload: dict) -> str:
-    stable = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    return legacy_payload_hash(payload)
 
 
 class MonitorRunner:
@@ -45,6 +44,8 @@ class MonitorRunner:
         resume: bool = False,
         model: str | None = None,
         web_search_limit: int | None = None,
+        sampling_profile: dict[str, Any] | None = None,
+        adapter_options: dict[str, Any] | None = None,
         repeats: int = 1,
         repeat_order: RepeatOrder = "round-robin",
         sleep_seconds: float = 0.0,
@@ -68,16 +69,26 @@ class MonitorRunner:
         query_list = list(queries)
         actual_run_id = run_id or make_run_id()
         actual_job_id = job_id
+        actual_sampling_profile = sampling_profile or build_sampling_profile(
+            adapter_name="openai_responses_web_search",
+            model=model or self.settings.llm_model,
+            settings=self.settings,
+            web_search_limit=web_search_limit,
+        )
+        actual_adapter_options = dict(adapter_options or {})
+        adapter = get_adapter(str(actual_sampling_profile.get("adapter") or "openai_responses_web_search"))
+        adapter.validate_options(actual_adapter_options)
         done_hashes = successful_result_hashes(output_path) if resume else {}
         work_items = []
         results: list[MonitorResult] = []
 
         for query, repeat_index in _iter_units(query_list, repeats, repeat_order):
-            payload = build_responses_payload(query, self.settings, model=model, web_search_limit=web_search_limit)
-            request_hash = compute_request_hash(payload)
+            provider_request = adapter.build_request(query, actual_sampling_profile, self.settings, actual_adapter_options)
+            request_hash = provider_request.request_hash
+            legacy_hash = compute_request_hash(provider_request.payload)
             done_key = (query.query_id, repeat_index)
             existing_hashes = done_hashes.get(done_key, set())
-            if request_hash in existing_hashes:
+            if request_hash in existing_hashes or legacy_hash in existing_hashes:
                 continue
             if existing_hashes:
                 warnings.warn(
@@ -89,7 +100,7 @@ class MonitorRunner:
                 {
                     "query": query,
                     "repeat_index": repeat_index,
-                    "payload": payload,
+                    "provider_request": provider_request,
                     "request_hash": request_hash,
                 }
             )
@@ -97,7 +108,12 @@ class MonitorRunner:
         if not work_items:
             return results
 
-        client = None if dry_run or mock else LLMResponsesClient(self.settings)
+        if dry_run or mock:
+            client = None
+        elif adapter.name == "openai_responses_web_search":
+            client = LLMResponsesClient(self.settings)
+        else:
+            client = OpenAICompatibleClientFactory(self.settings).create()
         if actual_concurrency == 1 or len(work_items) <= 1:
             for item in work_items:
                 result = self._run_one(
@@ -109,9 +125,10 @@ class MonitorRunner:
                     mock=mock,
                     model=model,
                     web_search_limit=web_search_limit,
+                    adapter=adapter,
                     repeat_index=item["repeat_index"],
                     repeat_total=repeats,
-                    payload=item["payload"],
+                    provider_request=item["provider_request"],
                     request_hash=item["request_hash"],
                 )
                 append_jsonl(output_path, result)
@@ -150,9 +167,10 @@ class MonitorRunner:
                         mock=mock,
                         model=model,
                         web_search_limit=web_search_limit,
+                        adapter=adapter,
                         repeat_index=item["repeat_index"],
                         repeat_total=repeats,
-                        payload=item["payload"],
+                        provider_request=item["provider_request"],
                         request_hash=item["request_hash"],
                         sleep_seconds=sleep_seconds,
                     )
@@ -167,14 +185,15 @@ class MonitorRunner:
         *,
         job_id: str | None,
         run_id: str,
-        client: LLMResponsesClient | None,
+        client: Any | None,
         dry_run: bool,
         mock: bool,
         model: str | None,
         web_search_limit: int | None,
+        adapter: Any,
         repeat_index: int,
         repeat_total: int,
-        payload: dict,
+        provider_request: ProviderRequest,
         request_hash: str,
         sleep_seconds: float,
     ) -> MonitorResult:
@@ -187,9 +206,10 @@ class MonitorRunner:
             mock=mock,
             model=model,
             web_search_limit=web_search_limit,
+            adapter=adapter,
             repeat_index=repeat_index,
             repeat_total=repeat_total,
-            payload=payload,
+            provider_request=provider_request,
             request_hash=request_hash,
         )
         if sleep_seconds:
@@ -202,22 +222,32 @@ class MonitorRunner:
         *,
         job_id: str | None,
         run_id: str,
-        client: LLMResponsesClient | None,
+        client: Any | None,
         dry_run: bool,
         mock: bool,
         model: str | None,
         web_search_limit: int | None,
+        adapter: Any,
         repeat_index: int,
         repeat_total: int,
-        payload: dict | None = None,
+        provider_request: ProviderRequest | None = None,
         request_hash: str | None = None,
     ) -> MonitorResult:
         started_at = utc_now_iso()
         start = time.perf_counter()
-        payload = payload or build_responses_payload(query, self.settings, model=model, web_search_limit=web_search_limit)
-        request_hash = request_hash or compute_request_hash(payload)
-        model_name = payload["model"]
-        query_meta = _query_meta(query)
+        if provider_request is None:
+            sampling_profile = build_sampling_profile(
+                adapter_name="openai_responses_web_search",
+                model=model or self.settings.llm_model,
+                settings=self.settings,
+                web_search_limit=web_search_limit,
+            )
+            adapter = get_adapter(str(sampling_profile.get("adapter")))
+            provider_request = adapter.build_request(query, sampling_profile, self.settings, {})
+        payload = provider_request.payload
+        request_hash = request_hash or provider_request.request_hash
+        model_name = provider_request.model
+        query_meta = query_record_meta(query)
         run_scope_id = job_id or run_id
         attempt_id = f"{run_scope_id}__{query.query_id}__r{repeat_index}__{request_hash}"
 
@@ -229,10 +259,13 @@ class MonitorRunner:
             "repeat_index": repeat_index,
             "repeat_total": repeat_total,
             "request_hash": request_hash,
+            "request_fingerprint_version": provider_request.request_fingerprint_version,
+            "request_fingerprint_basis": provider_request.request_fingerprint_basis,
             "model": model_name,
             "query": query.query,
             "input_query": query.query,
             "raw_request": payload,
+            "sampling_profile": provider_request.sampling_profile,
             "metadata": query.metadata_with_tags(),
             "query_meta": query_meta,
             "started_at": started_at,
@@ -244,43 +277,57 @@ class MonitorRunner:
                     **common,
                     status="dry_run",
                     raw_response=None,
+                    web_search_performed=None,
+                    web_search_evidence="not_available",
+                    web_search_requirement_status="not_applicable",
+                    source_parse_status="not_applicable",
                     latency_ms=_elapsed_ms(start),
                     completed_at=utc_now_iso(),
                 )
 
             if mock:
                 raw_response = build_mock_response(query)
-                text, sources, usage, raw = parse_response(raw_response)
+                normalized = adapter.normalize_response(raw_response, provider_request)
                 return MonitorResult(
                     **common,
                     status="mock",
-                    response_text=text,
-                    sources=sources,
-                    usage=usage,
-                    raw_response=raw,
+                    response_text=normalized.text,
+                    sources=normalized.sources,
+                    usage=normalized.usage,
+                    raw_response=normalized.raw,
+                    provider_meta=normalized.provider_meta,
+                    web_search_performed=normalized.web_search_performed,
+                    web_search_evidence=normalized.web_search_evidence,
+                    web_search_requirement_status=normalized.web_search_requirement_status,
+                    source_parse_status=normalized.source_parse_status,
                     latency_ms=_elapsed_ms(start),
                     completed_at=utc_now_iso(),
                 )
 
             if client is None:
-                raise RuntimeError("真实调用需要 LLMResponsesClient")
-            response = client.create_response(payload)
-            text, sources, usage, raw = parse_response(response)
-            _ensure_live_response_valid(raw, text)
+                raise RuntimeError("真实调用需要 OpenAI-compatible client")
+            response = adapter.send(client, provider_request)
+            normalized = adapter.normalize_response(response, provider_request)
+            _ensure_live_response_valid(normalized.raw, normalized.text)
             return MonitorResult(
                 **common,
                 status="success",
-                response_text=text,
-                sources=sources,
-                usage=usage,
-                raw_response=raw,
+                response_text=normalized.text,
+                sources=normalized.sources,
+                usage=normalized.usage,
+                raw_response=normalized.raw,
+                provider_meta=normalized.provider_meta,
+                web_search_performed=normalized.web_search_performed,
+                web_search_evidence=normalized.web_search_evidence,
+                web_search_requirement_status=normalized.web_search_requirement_status,
+                source_parse_status=normalized.source_parse_status,
                 latency_ms=_elapsed_ms(start),
                 completed_at=utc_now_iso(),
             )
         except Exception as exc:  # noqa: BLE001
             raw_response = None
-            if 'raw' in locals():
-                raw_response = raw
+            if "normalized" in locals():
+                raw_response = normalized.raw
             return MonitorResult(
                 **common,
                 status="error",
@@ -320,63 +367,3 @@ def _iter_units(
 
 def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
-
-
-def _query_meta(query: QueryRecord) -> dict[str, str]:
-    metadata = query.metadata_with_tags()
-    first_class = {
-        "variant_id",
-        "seed_id",
-        "seed_query",
-        "category",
-        "intent",
-        "persona",
-        "template_id",
-        "locale",
-        "market",
-        "tags",
-        "language",
-        "generation_method",
-        "fanout_version",
-        "manifest_version",
-        "locked_at",
-    }
-
-    def text(key: str, default: str = "") -> str:
-        value = metadata.get(key, default)
-        if value in (None, ""):
-            return default
-        return str(value)
-
-    def tags_text() -> str:
-        value = metadata.get("tags", query.tags)
-        if value in (None, ""):
-            return ""
-        if isinstance(value, list):
-            return ",".join(str(item).strip() for item in value if str(item).strip())
-        return str(value).strip()
-
-    custom_metadata = {
-        key: value
-        for key, value in metadata.items()
-        if key not in first_class and value not in (None, "")
-    }
-    return {
-        "schema_version": "query-meta-v1",
-        "variant_id": text("variant_id"),
-        "seed_id": text("seed_id"),
-        "seed_query": text("seed_query"),
-        "category": str(query.category or metadata.get("category") or ""),
-        "intent": text("intent"),
-        "persona": text("persona"),
-        "template_id": text("template_id"),
-        "locale": text("locale", str(query.locale or "")),
-        "market": text("market", str(query.market or "")),
-        "tags": tags_text(),
-        "language": text("language", str(query.locale or "")),
-        "generation_method": text("generation_method", "config"),
-        "fanout_version": text("fanout_version"),
-        "manifest_version": text("manifest_version"),
-        "locked_at": text("locked_at"),
-        "query_metadata_json": json.dumps(custom_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    }
