@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from geo_monitor.exporters import canonical_request_hash, export_csv, latest_success_records, read_jsonl, sanitize_csv_cell, sanitize_csv_row, successful_result_hashes, successful_result_keys
+from geo_monitor.request_fingerprint import legacy_payload_hash
 from geo_monitor.runner import MonitorRunner
 from geo_monitor.config import Settings
 from geo_monitor.dataset import load_queries
@@ -82,7 +83,16 @@ def test_latest_success_records_uses_query_and_repeat_as_logical_key():
     ]
     latest = latest_success_records(records)
     assert len(latest) == 1
-    assert latest[0]["request_hash"] == "abc"
+    assert latest[0]["request_hash"] == legacy_payload_hash({"model": "m", "input": "a"})
+
+
+def test_canonical_request_hash_recomputes_before_trusting_stored_hash():
+    record = {
+        "request_hash": "stale",
+        "raw_request": {"model": "m", "input": "fresh"},
+    }
+
+    assert canonical_request_hash(record) == legacy_payload_hash({"model": "m", "input": "fresh"})
 
 
 def test_csv_formula_injection_is_sanitized():

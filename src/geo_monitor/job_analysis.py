@@ -1,7 +1,7 @@
-"""Compatibility facade for the analysis pipeline.
+"""Compatibility facade for the public analysis API."""
 
-The implementation lives under :mod:`geo_monitor.analysis.pipeline`; this module
-keeps older imports such as ``geo_monitor.job_analysis`` working.
-"""
+from .analysis.artifacts import CSV_FIELD_SCHEMAS
+from .analysis.extraction import EXTRACTION_SCHEMA_VERSION
+from .analysis.orchestrator import analyze_job_bundle, estimate_job_analysis
 
-from .analysis.pipeline import *  # noqa: F401,F403
+__all__ = ["CSV_FIELD_SCHEMAS", "EXTRACTION_SCHEMA_VERSION", "analyze_job_bundle", "estimate_job_analysis"]

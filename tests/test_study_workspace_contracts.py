@@ -299,7 +299,7 @@ def test_duckdb_merges_later_query_meta_and_keeps_duplicate_attempts(tmp_path):
     _, attempt_rows = query_duckdb(db, "select count(*) from attempts")
     _, flag_rows = query_duckdb(db, "select type from quality_flags where type='duplicate_attempt_id'")
 
-    assert query_rows == [("sample_beginner", "beginner")]
+    assert sorted(query_rows) == [("sample_beginner", "beginner"), ("sample_beginner", "budget_sensitive")]
     assert attempt_rows == [(2,)]
     assert flag_rows == [("duplicate_attempt_id",)]
 
@@ -343,6 +343,9 @@ def test_tool_api_build_dashboard_true_and_seed_requires_manifest(tmp_path):
 
     assert result.dashboard_path
     assert Path(result.dashboard_path).exists()
+    html = Path(result.dashboard_path).read_text(encoding="utf-8")
+    for text in ["GEO Monitor Dashboard", "Overview", "Runs", "Comparison Cohorts", "Quality", "Top Brands"]:
+        assert text in html
 
     try:
         run_geo_monitor(config_path=config, study_dir=study, seed_prompts_path=study / "seed_prompts.yaml", mock=True)

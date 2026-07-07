@@ -169,7 +169,17 @@ def build_job_bundle(
         "updated_at": utc_now_iso(),
         "query_count": len(queries),
         "query_manifest": query_manifest_info,
-        "comparability_profile": _build_comparability_profile(query_manifest_info, queries, repeats, sampling_profile, analysis_profile),
+        "comparability_profile": _build_comparability_profile(
+            query_manifest_info,
+            queries,
+            repeats,
+            sampling_profile,
+            analysis_profile,
+            target_brand=target_brand,
+            target_aliases=target_aliases,
+            industry=industry,
+            market=market,
+        ),
         "paths": _manifest_paths(),
     }
     if external_query_manifest is None:
@@ -248,11 +258,15 @@ def validate_job_config(
         analysis_profile = _build_analysis_profile(analysis_adapter, analysis_model, settings)
     except ValueError as exc:
         raise JobError(str(exc)) from exc
+    target_brand = _required_str(config, "target_brand")
+    target_aliases = _string_list(config.get("target_aliases"), "target_aliases")
+    industry = _required_str(config, "industry")
+    market = _optional_str(config, "market", default="未指定市场")
     result = {
-        "target_brand": _required_str(config, "target_brand"),
-        "target_aliases": _string_list(config.get("target_aliases"), "target_aliases"),
-        "industry": _required_str(config, "industry"),
-        "market": _optional_str(config, "market", default="未指定市场"),
+        "target_brand": target_brand,
+        "target_aliases": target_aliases,
+        "industry": industry,
+        "market": market,
         "query_count": len(queries),
         "repeats": repeats,
         "planned_units": len(queries) * repeats,
@@ -267,6 +281,10 @@ def validate_job_config(
             repeats,
             sampling_profile,
             analysis_profile,
+            target_brand=target_brand,
+            target_aliases=target_aliases,
+            industry=industry,
+            market=market,
         ),
         "concurrency": concurrency,
         "start_interval_seconds": start_interval_seconds,
@@ -313,29 +331,40 @@ def run_job_bundle(
             except LiveSettingsError as exc:
                 raise JobError(str(exc)) from exc
         runner = MonitorRunner(settings)
-        update_job_manifest(root, status="running")
-        try:
-            results = runner.run(
-                queries,
-                output_path=raw_path,
-                job_id=str(manifest["job_id"]),
-                run_id=str(manifest["job_id"]),
-                dry_run=dry_run,
-                mock=mock,
-                resume=resume,
-                model=str(manifest["model"]),
-                web_search_limit=int(manifest["web_search_limit"]),
-                sampling_profile=dict(manifest["sampling_profile"]),
-                adapter_options=dict(manifest.get("adapter_options") or {}),
-                repeats=int(manifest["repeats"]),
-                repeat_order="round-robin",
-                sleep_seconds=sleep_seconds,
-                start_interval_seconds=float(start_interval_seconds if start_interval_seconds is not None else manifest.get("start_interval_seconds", 0.0)),
-                concurrency=int(manifest["concurrency"]),
+        will_execute = bool(selected_units) and (dry_run or mock or not resume or resume_matched_before < len(selected_units))
+        run_generation = int(manifest.get("run_generation") or 0)
+        if will_execute:
+            run_generation += 1
+            _invalidate_analysis_artifacts(root)
+            manifest = update_job_manifest(
+                root,
+                status="running",
+                extra={"run_generation": run_generation, "last_run_started_at": started_at},
             )
-        except Exception:
-            update_job_manifest(root, status="run_failed")
-            raise
+            try:
+                results = runner.run(
+                    queries,
+                    output_path=raw_path,
+                    job_id=str(manifest["job_id"]),
+                    run_id=str(manifest["job_id"]),
+                    dry_run=dry_run,
+                    mock=mock,
+                    resume=resume,
+                    model=str(manifest["model"]),
+                    web_search_limit=int(manifest["web_search_limit"]),
+                    sampling_profile=dict(manifest["sampling_profile"]),
+                    adapter_options=dict(manifest.get("adapter_options") or {}),
+                    repeats=int(manifest["repeats"]),
+                    repeat_order="round-robin",
+                    sleep_seconds=sleep_seconds,
+                    start_interval_seconds=float(start_interval_seconds if start_interval_seconds is not None else manifest.get("start_interval_seconds", 0.0)),
+                    concurrency=int(manifest["concurrency"]),
+                )
+            except Exception:
+                update_job_manifest(root, status="run_failed")
+                raise
+        else:
+            results = []
         completed_at = utc_now_iso()
         all_units = _expected_units_for_queries(all_queries, int(manifest["repeats"]))
         planned_units = len(selected_units)
@@ -357,10 +386,12 @@ def run_job_bundle(
             "started_at": started_at,
             "completed_at": completed_at,
             "mode": "dry_run" if dry_run else "mock" if mock else "live",
+            "run_generation": run_generation,
         }
         _write_json(root / RUN_SUMMARY, summary)
         status = "ran" if summary["errors"] == 0 and job_completed_units == len(all_units) else "ran_partial"
-        update_job_manifest(root, status=status)
+        if will_execute or not str(manifest.get("status") or "").startswith("analyzed"):
+            update_job_manifest(root, status=status, extra={"run_generation": run_generation, "last_run_completed_at": completed_at})
     return {
         "bundle_dir": str(root),
         "raw_jsonl": str(raw_path),
@@ -514,6 +545,14 @@ def cleanup_job_bundle(bundle_dir: str | Path) -> dict[str, Any]:
         return _cleanup_job_bundle_unlocked(root)
 
 
+def job_bundle_lock(bundle_dir: str | Path) -> "_job_lock":
+    return _job_lock(Path(bundle_dir) / BUNDLE_LOCK)
+
+
+def cleanup_job_work_dir_unlocked(bundle_dir: str | Path) -> dict[str, Any]:
+    return _cleanup_job_bundle_unlocked(bundle_dir)
+
+
 def _cleanup_job_bundle_unlocked(bundle_dir: str | Path) -> dict[str, Any]:
     root = Path(bundle_dir)
     manifest = load_job_manifest(root)
@@ -552,13 +591,34 @@ def update_job_manifest(bundle_dir: str | Path, *, status: str | None = None, ex
     return manifest
 
 
+def _invalidate_analysis_artifacts(bundle_dir: Path) -> None:
+    result = result_dir(bundle_dir)
+    if result.exists():
+        shutil.rmtree(result)
+    result.mkdir(parents=True, exist_ok=True)
+    logs = logs_dir(bundle_dir)
+    for name in [
+        "analysis_summary.json",
+        "analysis_summary.json.cache",
+        "data_quality.json",
+        "extraction_errors.jsonl",
+        "raw_read_errors.jsonl",
+    ]:
+        try:
+            (logs / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
 def query_set_hash(manifest: dict[str, Any]) -> str:
+    comparability = manifest.get("comparability_profile")
+    if isinstance(comparability, dict) and comparability.get("query_manifest_sha256"):
+        return str(comparability["query_manifest_sha256"])[:16]
     info = manifest.get("query_manifest")
     if isinstance(info, dict) and info.get("sha256"):
         return str(info["sha256"])[:16]
-    queries = [{"query_id": str(row.get("query_id", "")), "query": str(row.get("query", ""))} for row in manifest.get("queries", [])]
-    stable = json.dumps(queries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    queries = manifest.get("queries") if isinstance(manifest.get("queries"), list) else []
+    return _query_rows_digest(queries)[:16]
 
 
 def _load_job_config(config_path: str | Path) -> dict[str, Any]:
@@ -775,6 +835,7 @@ def _manifest_paths() -> dict[str, str]:
 def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(data)
     settings = get_settings()
+    legacy_schema = str(normalized.get("schema_version") or "") in {GEO_JOB_V1, GEO_JOB_V2}
     model = str(normalized.get("model") or settings.llm_model)
     web_search_limit = int(normalized.get("web_search_limit") or settings.web_search_limit)
     adapter_name = str(normalized.get("adapter") or "openai_responses_web_search")
@@ -789,6 +850,8 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
                 web_search_limit=web_search_limit,
                 web_search_required=True,
             )
+            if legacy_schema:
+                normalized["sampling_profile"]["inferred_from_legacy"] = True
         except ValueError:
             normalized["sampling_profile"] = {
                 "provider": "openai_compatible",
@@ -801,6 +864,7 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
                 "web_search_required": True,
                 "source_grain": "url",
                 "web_search_limit": web_search_limit,
+                "inferred_from_legacy": True,
             }
     if not normalized.get("adapter"):
         normalized["adapter"] = str(normalized["sampling_profile"].get("adapter") or adapter_name)
@@ -808,6 +872,8 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
         analysis_model = str(normalized.get("analysis_model") or model)
         try:
             normalized["analysis_profile"] = _build_analysis_profile("openai_responses_text", analysis_model, settings)
+            if legacy_schema:
+                normalized["analysis_profile"]["inferred_from_legacy"] = True
         except ValueError:
             normalized["analysis_profile"] = {
                 "provider": "openai_compatible",
@@ -817,6 +883,7 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
                 "model": analysis_model,
                 "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
                 "analysis_fingerprint": "",
+                "inferred_from_legacy": True,
             }
             normalized["analysis_profile"]["analysis_fingerprint"] = analysis_fingerprint(normalized["analysis_profile"])
     if not isinstance(normalized.get("comparability_profile"), dict):
@@ -828,7 +895,17 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
             int(normalized.get("repeats") or 1),
             normalized["sampling_profile"],
             normalized["analysis_profile"],
+            target_brand=str(normalized.get("target_brand") or ""),
+            target_aliases=_string_list(normalized.get("target_aliases"), "target_aliases") if isinstance(normalized.get("target_aliases"), list) else [],
+            industry=str(normalized.get("industry") or ""),
+            market=str(normalized.get("market") or ""),
         )
+        if legacy_schema:
+            normalized["comparability_profile"]["inferred_from_legacy"] = True
+    if legacy_schema:
+        normalized["sampling_profile"].setdefault("inferred_from_legacy", True)
+        normalized["analysis_profile"].setdefault("inferred_from_legacy", True)
+        normalized["comparability_profile"].setdefault("inferred_from_legacy", True)
     return normalized
 
 
@@ -852,6 +929,12 @@ def _validate_job_manifest(data: dict[str, Any]) -> None:
         for key in ["source_type", "schema_version", "sha256", "row_count"]:
             if key not in info:
                 raise JobError(f"query_manifest 缺少字段：{key}")
+        if schema_version == GEO_JOB_V3 and info.get("source_type") == "external_file":
+            sha = str(info.get("sha256") or "")
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+                raise JobError("geo-job-v3 external query_manifest.sha256 必须是 64 位 hex")
+            if not str(info.get("source_uri") or "").strip():
+                raise JobError("geo-job-v3 external query_manifest 必须包含 source_uri")
         if _positive_int(data.get("query_count"), "query_count") != _positive_int(info.get("row_count"), "query_manifest.row_count"):
             raise JobError("job_manifest query_count 与 query_manifest.row_count 不一致")
     _positive_int(data.get("repeats"), "repeats")
@@ -945,19 +1028,50 @@ def _build_comparability_profile(
     repeats: int,
     sampling_profile: dict[str, Any],
     analysis_profile: dict[str, Any],
+    *,
+    target_brand: str = "",
+    target_aliases: list[str] | None = None,
+    industry: str = "",
+    market: str = "",
 ) -> dict[str, Any]:
     query_digest = str(query_manifest_info.get("sha256") or "") or _query_rows_digest(queries)
-    return {
+    profile = {
         "query_manifest_sha256": query_digest,
         "repeats": repeats,
         "analysis_fingerprint": analysis_profile.get("analysis_fingerprint", ""),
         "source_grain": sampling_profile.get("source_grain", "unknown"),
     }
+    study_basis = {
+        "target_brand": target_brand,
+        "target_aliases": sorted(str(alias) for alias in (target_aliases or [])),
+        "industry": industry,
+        "market": market,
+        "query_manifest_sha256": query_digest,
+        "query_count": len(queries) or int(query_manifest_info.get("row_count") or 0),
+        "repeats": repeats,
+    }
+    sampling_basis = {
+        key: sampling_profile.get(key)
+        for key in [
+            "request_fingerprint_version",
+            "web_search_required",
+            "source_grain",
+            "web_search_limit",
+        ]
+    }
+    profile["study_fingerprint"] = _stable_digest(study_basis)
+    profile["sampling_fingerprint"] = _stable_digest(sampling_basis)
+    return profile
 
 
 def _query_rows_digest(queries: list[dict[str, Any]]) -> str:
     rows = [{key: row.get(key, "") for key in sorted(row)} for row in queries]
     stable = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def _stable_digest(value: Any) -> str:
+    stable = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 

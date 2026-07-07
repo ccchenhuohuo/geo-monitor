@@ -40,11 +40,31 @@ def _load_dashboard_data(db: Path) -> dict[str, Any]:
         return {
             "overview": _one(con, "select count(*) queries from queries"),
             "attempts": _one(con, "select count(*) attempts from attempts"),
-            "top_brands": _rows(con, "select brand_name_canonical, avg(sov_event_share) sov from brand_summary group by 1 order by sov desc nulls last limit 10"),
+            "top_brands": _rows(
+                con,
+                "select b.brand_name_canonical, avg(b.sov_event_share) sov "
+                "from brand_summary b join runs r using (job_id) "
+                "where r.sample_mode = 'live' and r.job_conclusion_strength = 'strong' "
+                "group by 1 order by sov desc nulls last limit 10",
+            ),
+            "observational_top_brands": _rows(
+                con,
+                "select b.brand_name_canonical, avg(b.sov_event_share) sov, max(r.job_conclusion_strength) conclusion_strength "
+                "from brand_summary b join runs r using (job_id) "
+                "where r.sample_mode = 'live' and r.job_conclusion_strength != 'strong' "
+                "group by 1 order by sov desc nulls last limit 10",
+            ),
             "persona": _rows(con, "select persona, count(distinct query_id) queries from queries group by 1 order by 1"),
             "seed": _rows(con, "select seed_id, count(distinct query_id) queries from queries group by 1 order by 1"),
-            "runs": _rows(con, "select job_id, status, sample_count, target_brand, model, provider, adapter, api_family, job_conclusion_strength from runs order by created_at desc nulls last"),
-            "comparison": _rows(con, "select query_manifest_sha256, repeats, execution_window_bucket, job_count, comparison_group_count, analysis_fingerprint_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts order by execution_window_bucket desc nulls last"),
+            "runs": _rows(con, "select job_id, status, sample_mode, partial_sample, sample_count, target_brand, model, provider, adapter, api_family, job_conclusion_strength from runs order by created_at desc nulls last"),
+            "comparison": _rows(con, "select query_manifest_sha256, repeats, execution_window_bucket, job_count, comparison_group_count, analysis_fingerprint_count, study_fingerprint_count, sampling_fingerprint_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts order by execution_window_bucket desc nulls last"),
+            "quality_summary": _rows(
+                con,
+                "select job_id, sample_mode, conclusion_strength, partial_sample, planned_units, stats_record_count, "
+                "missing_unit_count, latest_failed_unit_count, web_search_quality_flag_count, source_quality_flag_count, "
+                "extraction_error_record_count, extraction_error_rate "
+                "from quality_summary order by job_id",
+            ),
             "quality": _rows(con, "select type, count(*) count from quality_flags group by 1 order by count desc"),
         }
     except DuckDBError as exc:
@@ -95,12 +115,14 @@ th {{ background: #eef2f7; }}
 <div class="metric"><div>Attempts</div><div class="value">{_e(data["attempts"].get("attempts", 0))}</div></div>
 </div>
 </section>
-<section><h2>Top Brands</h2>{_table(data["top_brands"])}</section>
+<section><h2>Top Brands (Strong Live)</h2>{_table(data["top_brands"])}</section>
+<section><h2>Observed Brands (Observational Live)</h2>{_table(data["observational_top_brands"])}</section>
 <section><h2>Persona</h2>{_table(data["persona"])}</section>
     <section><h2>Seed Query</h2>{_table(data["seed"])}</section>
     <section><h2>Runs</h2>{_table(data["runs"])}</section>
     <section><h2>Comparison Cohorts</h2>{_table(data["comparison"])}</section>
-    <section><h2>Quality</h2>{_table(data["quality"])}</section>
+    <section><h2>Quality Summary</h2>{_table(data["quality_summary"])}</section>
+    <section><h2>Quality Flags</h2>{_table(data["quality"])}</section>
 </body>
 </html>
 """

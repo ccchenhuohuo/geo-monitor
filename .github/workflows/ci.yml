@@ -42,3 +42,16 @@ jobs:
           /tmp/geo-monitor-wheel-smoke/bin/geo-monitor --help
           /tmp/geo-monitor-wheel-smoke/bin/python -m geo_monitor.cli --help
           /tmp/geo-monitor-wheel-smoke/bin/python -c "from geo_monitor import run_geo_monitor; print(run_geo_monitor)"
+          /tmp/geo-monitor-wheel-smoke/bin/python - <<'PY'
+          from importlib import resources
+
+          checks = [
+              ("geo_monitor.data", "job_config.schema.json"),
+              ("geo_monitor.examples", "job_config.example.json"),
+              ("geo_monitor.docs", "metrics.md"),
+              ("geo_monitor.docs", "README.zh-CN.md"),
+          ]
+          for package, name in checks:
+              text = resources.files(package).joinpath(name).read_text(encoding="utf-8")
+              assert text.strip(), f"empty package resource: {package}/{name}"
+          PY

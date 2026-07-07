@@ -35,15 +35,52 @@ def extract_output_text(raw: dict[str, Any]) -> str | None:
         return output_text.strip()
 
     texts: list[str] = []
-    for item in _walk(raw):
-        if not isinstance(item, Mapping):
-            continue
-        if item.get("type") in {"output_text", "text"} and isinstance(item.get("text"), str):
-            texts.append(item["text"])
-        elif isinstance(item.get("content"), str):
-            texts.append(item["content"])
+    choices = raw.get("choices")
+    if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes, bytearray)):
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            message = choice.get("message")
+            if isinstance(message, Mapping):
+                text = _message_content_text(message.get("content"))
+                if text:
+                    texts.append(text)
+        if texts:
+            return "\n".join(t.strip() for t in texts if t.strip())
+
+    output = raw.get("output")
+    if isinstance(output, Sequence) and not isinstance(output, (str, bytes, bytearray)):
+        for item in output:
+            if not isinstance(item, Mapping):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "output_text" and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+            if item_type != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+                continue
+            for part in content:
+                if isinstance(part, Mapping) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
     if texts:
         return "\n".join(t.strip() for t in texts if t.strip())
+    return None
+
+
+def _message_content_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
+        parts = []
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") in {"text", "output_text"} and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        if parts:
+            return "\n".join(text.strip() for text in parts if text.strip()) or None
     return None
 
 

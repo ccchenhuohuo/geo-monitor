@@ -6,8 +6,11 @@ dashboards are rebuildable analysis layers.
 
 ## Shared Terms
 
-- Response grain: one latest successful attempt for one `query_id` and
-  `repeat_index`.
+- Attempt grain: the latest terminal attempt for one `query_id` and
+  `repeat_index`. A later `error` supersedes an older success and is excluded
+  from stats with a data-quality flag.
+- Response grain: a latest terminal attempt whose status is eligible for the
+  current sample mode (`success` for live, `mock` only when explicitly included).
 - Brand response hit: one SOV-eligible canonical brand appearing in one response.
   Multiple raw mentions of the same canonical brand in the same response are
   deduped.
@@ -21,9 +24,27 @@ dashboards are rebuildable analysis layers.
 - Partial samples: data quality sets `conclusion_strength=observational` when
   samples are incomplete, duplicated, malformed, contract-mismatched, or
   extraction has errors/quarantined rows.
+- Provider/search/source evidence: missing web-search evidence, unverifiable
+  required search, legacy-inferred profiles, or non-comparable URL source
+  parsing also downgrade conclusions to observational.
 - Traceability quarantine: non-traceable extracted rows are excluded from brand
   metrics and logged in `logs/extraction_errors.jsonl`; traceable rows from the
   same response are retained.
+
+## Facts Layer
+
+The analysis step also writes denominator facts. These files are the stable
+foundation for later intelligence scoring and DuckDB/dashboard views:
+
+| File | Grain | Purpose |
+|---|---|---|
+| `quality_summary.csv` | Job | Sample mode, conclusion strength, partial flags, record counts, and evidence-quality counts |
+| `attempt_facts.csv` | Latest terminal query/repeat | Planned vs completed attempts, valid/stats-included status, request hash, web/source evidence |
+| `query_facts.csv` | Planned query | Planned attempts, terminal/completed/stats-included counts, usable sample rate, frozen query metadata |
+| `brand_attempt_facts.csv` | Brand/query/repeat | SOV-eligible brand facts traceable back to a stats-included attempt |
+
+Downstream recommendation, competitor, citation, or overview scores should be
+derived from these facts or DuckDB views, not directly from raw summary CSVs.
 
 ## Brand Summary
 
@@ -41,7 +62,7 @@ Exported in `brand_summary.csv`, `sov_summary.csv`, and
 | `query_coverage_rate` | `query_coverage` | Planned query count |
 | `query_macro_mention_rate` | Mean per-query mention rate | For each planned query: mentioned repeats / expected repeats |
 | `sov_response_share` | Brand response hits for this brand | All brand response hits across brands |
-| `sov_event_share` | Currently same as `sov_response_share` | All brand response hits; reserved for future true event grain |
+| `sov_event_share` | Currently compatible with `sov_response_share` | All brand response hits; reserved for a future true event-grain migration |
 | `recommended_count` | Responses where brand is mentioned and recommended | Brand response hits |
 | `recommended_rate` | `recommended_count` | Brand response hits for this brand |
 | `recommended_rate_when_mentioned` | Same as `recommended_rate` | Brand response hits for this brand |

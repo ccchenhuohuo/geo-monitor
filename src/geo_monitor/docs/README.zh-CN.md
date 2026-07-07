@@ -324,6 +324,10 @@ runs/{job_id}/
     source_domains.csv
     source_urls.csv
     source_by_query.csv
+    quality_summary.csv
+    attempt_facts.csv
+    query_facts.csv
+    brand_attempt_facts.csv
     report.md
     report.html
     report.pdf              # optional, best-effort

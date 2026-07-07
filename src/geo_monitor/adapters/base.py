@@ -112,6 +112,7 @@ class OpenAICompatibleClientFactory:
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key.get_secret_value(),  # type: ignore[union-attr]
             timeout=self.settings.request_timeout_seconds,
+            max_retries=0,
         )
 
 
@@ -126,6 +127,34 @@ class BaseAdapter:
         unknown = sorted(set(options) - self.allowed_options)
         if unknown:
             raise ValueError(f"{self.name} adapter_options 包含未知字段：{', '.join(unknown)}")
+
+    def _require_object_option(self, options: dict[str, Any], key: str) -> dict[str, Any]:
+        value = options.get(key)
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是对象")
+        return dict(value)
+
+    def _require_bool_option(self, options: dict[str, Any], key: str) -> bool | None:
+        value = options.get(key)
+        if value in (None, ""):
+            return None
+        if not isinstance(value, bool):
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是布尔值")
+        return value
+
+    def _positive_int_option(self, options: dict[str, Any], key: str, default: int) -> int:
+        value = options.get(key, default)
+        if isinstance(value, bool):
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数")
+        try:
+            parsed = int(value)
+        except Exception as exc:
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数") from exc
+        if parsed < 1:
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数")
+        return parsed
 
     def _fingerprint_basis(self, query_record: QueryRecord, sampling_profile: dict[str, Any], payload_basis: dict[str, Any]) -> dict[str, Any]:
         return {

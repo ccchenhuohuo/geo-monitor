@@ -20,6 +20,20 @@ class DoubaoResponsesWebSearchAdapter(BaseAdapter):
     )
     allowed_options = {"web_search_options", "include", "tool_choice", "max_tool_calls"}
 
+    def validate_options(self, options: dict[str, Any]) -> None:
+        super().validate_options(options)
+        web_search_options = self._require_object_option(options, "web_search_options")
+        reserved = sorted(set(web_search_options) & {"type"})
+        if reserved:
+            raise ValueError(f"{self.name} adapter_options.web_search_options 不能覆盖保留字段：{', '.join(reserved)}")
+        tool_choice = options.get("tool_choice")
+        if isinstance(tool_choice, str) and tool_choice in {"auto", "none"}:
+            raise ValueError("doubao_responses_web_search 要求联网搜索，tool_choice 不能是 auto 或 none")
+        if isinstance(tool_choice, dict) and str(tool_choice.get("type") or "") != "web_search":
+            raise ValueError("doubao_responses_web_search tool_choice 必须指向 web_search")
+        if "max_tool_calls" in options:
+            self._positive_int_option(options, "max_tool_calls", 1)
+
     def build_request(
         self,
         query_record: QueryRecord,
@@ -29,15 +43,17 @@ class DoubaoResponsesWebSearchAdapter(BaseAdapter):
     ) -> ProviderRequest:
         self.validate_options(adapter_options)
         tool: dict[str, Any] = {"type": "web_search"}
-        if isinstance(adapter_options.get("web_search_options"), dict):
-            tool.update(adapter_options["web_search_options"])
+        web_search_options = self._require_object_option(adapter_options, "web_search_options")
+        if web_search_options:
+            tool.update(web_search_options)
         payload: dict[str, Any] = {
             "model": sampling_profile["model"],
             "input": query_record.query,
             "tools": [tool],
-            "max_tool_calls": int(adapter_options.get("max_tool_calls") or settings.max_tool_calls),
+            "tool_choice": adapter_options.get("tool_choice") or ("required" if sampling_profile.get("web_search_required", True) else "auto"),
+            "max_tool_calls": self._positive_int_option(adapter_options, "max_tool_calls", settings.max_tool_calls),
         }
-        for key in ["include", "tool_choice"]:
+        for key in ["include"]:
             if key in adapter_options:
                 payload[key] = adapter_options[key]
         return ProviderRequest(
@@ -48,4 +64,3 @@ class DoubaoResponsesWebSearchAdapter(BaseAdapter):
 
     def send(self, client: Any, request: ProviderRequest) -> Any:
         return client.responses.create(**request.payload)
-

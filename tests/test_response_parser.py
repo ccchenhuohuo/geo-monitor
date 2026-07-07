@@ -81,6 +81,40 @@ def test_extract_output_text_returns_none_when_empty():
     assert extract_output_text(payload) is None
 
 
+def test_extract_output_text_ignores_response_source_snippets():
+    payload = {
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Answer mentions TargetOnly"}],
+            },
+            {
+                "type": "web_search_call",
+                "action": {
+                    "sources": [
+                        {
+                            "title": "Competitor page",
+                            "url": "https://example.com/a",
+                            "snippet": "CompetitorBrand appears only in source snippet",
+                        }
+                    ]
+                },
+            },
+        ],
+    }
+
+    assert extract_output_text(payload) == "Answer mentions TargetOnly"
+
+
+def test_extract_output_text_ignores_chat_tool_content():
+    payload = {
+        "choices": [{"message": {"role": "assistant", "content": "Answer mentions TargetOnly"}}],
+        "tool_results": [{"content": "CompetitorBrand appears only in tool content"}],
+    }
+
+    assert extract_output_text(payload) == "Answer mentions TargetOnly"
+
+
 def test_parse_response_preserves_incomplete_details():
     payload = {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output_text": ""}
     text, sources, usage, raw = parse_response(payload)

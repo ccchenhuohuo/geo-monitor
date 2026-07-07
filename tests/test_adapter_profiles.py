@@ -108,6 +108,24 @@ def test_qwen_chat_required_search_sets_forced_search():
     assert request.payload["extra_body"]["search_options"]["forced_search"] is True
 
 
+def test_qwen_chat_required_search_rejects_forced_search_false():
+    settings = Settings(llm_api_key=None, llm_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    adapter = get_adapter("qwen_chat_enable_search")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="qwen-plus", settings=settings, web_search_required=True)
+
+    with pytest.raises(ValueError, match="forced_search"):
+        adapter.build_request(QueryRecord(query_id="q001", query="best providers"), profile, settings, {"forced_search": False})
+
+
+def test_doubao_responses_rejects_reserved_web_search_option_type():
+    settings = Settings(llm_api_key=None, llm_base_url="https://ark.cn-beijing.volces.com/api/v3")
+    adapter = get_adapter("doubao_responses_web_search")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="doubao-test", settings=settings, web_search_required=True)
+
+    with pytest.raises(ValueError, match="保留字段"):
+        adapter.build_request(QueryRecord(query_id="q001", query="best providers"), profile, settings, {"web_search_options": {"type": "none"}})
+
+
 def test_adapter_options_fail_fast(tmp_path):
     config = tmp_path / "job_config.json"
     config.write_text(
@@ -216,6 +234,27 @@ def test_duckdb_comparison_observational_when_web_or_source_evidence_is_bad(tmp_
     assert source_rows == [("observational", False)]
 
 
+def test_duckdb_comparison_observational_when_sampling_fingerprint_differs(tmp_path):
+    pytest.importorskip("duckdb")
+    runs = tmp_path / "runs"
+    settings = Settings(llm_api_key=None)
+    first = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings, adapter="doubao_responses_web_search", model="doubao-test")
+    second = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings, adapter="qwen_responses_web_search_basic", model="qwen3.7-plus")
+    _write_strong_summary(Path(first["bundle_dir"]))
+    _write_strong_summary(Path(second["bundle_dir"]))
+    _rewrite_attempts(Path(first["bundle_dir"]), web_search_requirement_status="satisfied", web_search_evidence="provider_trace", source_parse_status="parsed")
+    _rewrite_attempts(Path(second["bundle_dir"]), web_search_requirement_status="satisfied", web_search_evidence="provider_trace", source_parse_status="parsed")
+    manifest = json.loads((Path(second["bundle_dir"]) / "job_manifest.json").read_text(encoding="utf-8"))
+    manifest["comparability_profile"]["sampling_fingerprint"] = "different"
+    (Path(second["bundle_dir"]) / "job_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    db = tmp_path / "geo.duckdb"
+    build_duckdb(runs, db)
+    _, rows = query_duckdb(db, "select sampling_fingerprint_count, comparison_conclusion_strength from comparison_cohorts")
+
+    assert rows == [(2, "observational")]
+
+
 def test_duckdb_source_metrics_not_comparable_when_sources_are_empty(tmp_path):
     pytest.importorskip("duckdb")
     runs = tmp_path / "runs"
@@ -288,7 +327,18 @@ def _build_and_run_mock_job(
 
 
 def _write_strong_summary(bundle: Path) -> None:
-    summary = {"job_conclusion_strength": "strong", "data_quality": {"conclusion_strength": "strong"}}
+    manifest = json.loads((bundle / "job_manifest.json").read_text(encoding="utf-8"))
+    manifest["status"] = "analyzed"
+    (bundle / "job_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    summary = {
+        "job_conclusion_strength": "strong",
+        "sample_mode": "live",
+        "partial_sample": False,
+        "success_record_count": 1,
+        "stats_record_count": 1,
+        "run_generation": manifest.get("run_generation", 0),
+        "data_quality": {"conclusion_strength": "strong", "partial_sample": False},
+    }
     (bundle / "logs" / "analysis_summary.json").write_text(json.dumps(summary), encoding="utf-8")
 
 
@@ -298,5 +348,7 @@ def _rewrite_attempts(bundle: Path, **updates) -> None:
     for line in raw.read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
         row.update(updates)
+        if row.get("web_search_requirement_status") == "satisfied" and not row.get("web_search_evidence"):
+            row["web_search_evidence"] = "provider_trace"
         rows.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
     raw.write_text("\n".join(rows) + "\n", encoding="utf-8")
