@@ -145,7 +145,9 @@ Example live request shape:
 {
   "model": "<MODEL_OR_ENDPOINT_ID>",
   "input": "<QUERY_TEXT>",
-  "tools": [{"type": "web_search", "limit": 5}],
+  "tools": [{"type": "web_search"}],
+  "tool_choice": "required",
+  "include": ["web_search_call.action.sources"],
   "max_tool_calls": 2
 }
 ```

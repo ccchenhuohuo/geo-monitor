@@ -1128,7 +1128,6 @@ STAT_EXCLUDING_CONTRACT_FIELDS = {
     "repeat_total",
     "raw_request.model",
     "raw_request.input",
-    "raw_request.web_search_limit",
     "request_hash",
     "raw_response",
 }
@@ -1165,8 +1164,6 @@ def _record_contract_mismatches(
     mismatches: list[dict[str, Any]] = []
     expected_query = manifest_queries.get(qid)
     raw_request = record.get("raw_request") if isinstance(record.get("raw_request"), dict) else {}
-    sampling_profile = manifest.get("sampling_profile") if isinstance(manifest.get("sampling_profile"), dict) else {}
-    adapter_name = str(sampling_profile.get("adapter") or manifest.get("adapter") or "openai_responses_web_search")
     raw_response = record.get("raw_response")
     if not isinstance(raw_response, dict) or not raw_response:
         mismatches.append(_contract_mismatch(record_index, qid, repeat, "raw_response", type(raw_response).__name__, "non-empty object"))
@@ -1177,8 +1174,6 @@ def _record_contract_mismatches(
         ("raw_request.model", raw_request.get("model"), manifest.get("model")),
         ("raw_request.input", _raw_request_input(raw_request), expected_query),
     ]
-    if adapter_name == "openai_responses_web_search":
-        checks.append(("raw_request.web_search_limit", _raw_request_web_search_limit(raw_request), manifest.get("web_search_limit")))
     if raw_request:
         stored_hash = str(record.get("request_hash") or "")
         computed_hash = _record_request_hash(record, raw_request)
@@ -1210,13 +1205,6 @@ def _raw_request_input(raw_request: dict[str, Any]) -> Any:
         for message in messages:
             if isinstance(message, dict) and message.get("role") == "user":
                 return message.get("content")
-    return None
-
-
-def _raw_request_web_search_limit(raw_request: dict[str, Any]) -> Any:
-    for tool in raw_request.get("tools", []) or []:
-        if isinstance(tool, dict) and tool.get("type") == "web_search":
-            return tool.get("limit")
     return None
 
 

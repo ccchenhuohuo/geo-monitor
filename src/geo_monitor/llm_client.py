@@ -38,13 +38,13 @@ def build_responses_payload(
     limit_value = web_search_limit if web_search_limit is not None else settings.web_search_limit
     if limit_value < 1 or limit_value > 20:
         raise ValueError("web_search_limit 必须在 1 到 20 之间")
-    if limit_value:
-        tool["limit"] = limit_value
 
     return {
         "model": model or settings.llm_model,
         "input": query_record.query,
         "tools": [tool],
+        "tool_choice": "required",
+        "include": ["web_search_call.action.sources"],
         "max_tool_calls": settings.max_tool_calls,
     }
 

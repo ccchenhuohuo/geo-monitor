@@ -61,6 +61,20 @@ def test_normalize_extraction_items_accepts_enhanced_schema_and_dedupes():
     assert rows[0]["canonical_hint"] == "TestStudio"
 
 
+def test_normalize_extraction_items_keeps_missing_sov_eligible_unknown():
+    rows = normalize_extraction_items(
+        [
+            {"brand_name_raw": "TestStudio", "brand_type": "公司", "evidence": "TestStudio", "confidence": 0.8},
+            {"brand_name_raw": "NullStudio", "brand_type": "公司", "evidence": "NullStudio", "confidence": 0.8, "sov_eligible": None},
+            {"brand_name_raw": "BlankStudio", "brand_type": "公司", "evidence": "BlankStudio", "confidence": 0.8, "sov_eligible": ""},
+            {"brand_name_raw": "UnknownStudio", "brand_type": "公司", "evidence": "UnknownStudio", "confidence": 0.8, "sov_eligible": "unknown"},
+        ],
+        {"query_id": "q001", "repeat_index": 1, "input_query": "best studios"},
+    )
+
+    assert [row["sov_eligible"] for row in rows] == ["", "", "", ""]
+
+
 def test_parse_canonical_map_keeps_unknown_names_as_themselves():
     mapping = parse_canonical_map(
         {"canonical_brands": [{"canonical_name": "TestDesignGroup / TDG", "raw_names": ["TDG", "TestDesignGroup"]}]},

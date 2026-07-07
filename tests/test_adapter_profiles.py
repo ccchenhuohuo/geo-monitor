@@ -11,6 +11,58 @@ from geo_monitor.request_fingerprint import REQUEST_FINGERPRINT_VERSION, request
 from geo_monitor.schemas import QueryRecord
 
 
+def test_openai_responses_payload_omits_legacy_limit_and_requires_search():
+    settings = Settings(llm_api_key=None, llm_base_url="https://api.openai.com/v1")
+    adapter = get_adapter("openai_responses_web_search")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="gpt-5.5", settings=settings, web_search_limit=5)
+
+    request = adapter.build_request(QueryRecord(query_id="q001", query="best providers"), profile, settings, {})
+
+    assert request.payload["tools"] == [{"type": "web_search"}]
+    assert "limit" not in request.payload["tools"][0]
+    assert request.payload["tool_choice"] == "required"
+    assert request.payload["include"] == ["web_search_call.action.sources"]
+    assert request.legacy_request_hashes
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+def test_openai_responses_rejects_optional_tool_choice_when_search_required(tool_choice):
+    settings = Settings(llm_api_key=None, llm_base_url="https://api.openai.com/v1")
+    adapter = get_adapter("openai_responses_web_search")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="gpt-5.5", settings=settings)
+
+    with pytest.raises(ValueError, match="tool_choice"):
+        adapter.build_request(QueryRecord(query_id="q001", query="best providers"), profile, settings, {"tool_choice": tool_choice})
+
+
+def test_openai_responses_parses_action_sources_include_shape():
+    settings = Settings(llm_api_key=None, llm_base_url="https://api.openai.com/v1")
+    adapter = get_adapter("openai_responses_web_search")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="gpt-5.5", settings=settings)
+    request = adapter.build_request(QueryRecord(query_id="q001", query="best providers"), profile, settings, {})
+
+    normalized = adapter.normalize_response(
+        {
+            "status": "completed",
+            "output_text": "answer",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {
+                        "sources": [
+                            {"title": "Example", "url": "https://www.example.com/a"},
+                        ]
+                    },
+                }
+            ],
+        },
+        request,
+    )
+
+    assert normalized.sources[0].domain == "example.com"
+    assert normalized.source_parse_status == "parsed"
+
+
 def test_qwen_responses_web_search_call_is_provider_trace():
     settings = Settings(llm_api_key=None, llm_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     adapter = get_adapter("qwen_responses_web_search_basic")
@@ -115,6 +167,28 @@ def test_duckdb_comparison_observational_when_analysis_fingerprint_differs(tmp_p
     assert rows == [("observational", 2)]
 
 
+def test_duckdb_comparison_observational_for_single_adapter_group(tmp_path):
+    pytest.importorskip("duckdb")
+    runs = tmp_path / "runs"
+    settings = Settings(llm_api_key=None)
+    first = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings)
+    second = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings)
+    _write_strong_summary(Path(first["bundle_dir"]))
+    _write_strong_summary(Path(second["bundle_dir"]))
+    _rewrite_attempts(Path(first["bundle_dir"]), web_search_requirement_status="satisfied", source_parse_status="parsed")
+    _rewrite_attempts(Path(second["bundle_dir"]), web_search_requirement_status="satisfied", source_parse_status="parsed")
+
+    db = tmp_path / "geo.duckdb"
+    build_duckdb(runs, db)
+    columns, rows = query_duckdb(
+        db,
+        "select comparison_group_count, comparison_conclusion_strength from comparison_cohorts",
+    )
+
+    assert columns == ["comparison_group_count", "comparison_conclusion_strength"]
+    assert rows == [(1, "observational")]
+
+
 def test_duckdb_comparison_observational_when_web_or_source_evidence_is_bad(tmp_path):
     pytest.importorskip("duckdb")
     settings = Settings(llm_api_key=None)
@@ -142,7 +216,57 @@ def test_duckdb_comparison_observational_when_web_or_source_evidence_is_bad(tmp_
     assert source_rows == [("observational", False)]
 
 
-def _build_and_run_mock_job(tmp_path: Path, runs: Path, analysis_model: str, settings: Settings) -> dict:
+def test_duckdb_source_metrics_not_comparable_when_sources_are_empty(tmp_path):
+    pytest.importorskip("duckdb")
+    runs = tmp_path / "runs"
+    settings = Settings(llm_api_key=None)
+    first = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings, adapter="doubao_responses_web_search", model="doubao-test")
+    second = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings, adapter="qwen_responses_web_search_basic", model="qwen3.7-plus")
+    _write_strong_summary(Path(first["bundle_dir"]))
+    _write_strong_summary(Path(second["bundle_dir"]))
+    _rewrite_attempts(Path(first["bundle_dir"]), web_search_requirement_status="satisfied", source_parse_status="provider_returned_empty")
+    _rewrite_attempts(Path(second["bundle_dir"]), web_search_requirement_status="satisfied", source_parse_status="provider_returned_empty")
+
+    db = tmp_path / "geo.duckdb"
+    build_duckdb(runs, db)
+    _, rows = query_duckdb(
+        db,
+        "select comparison_group_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts",
+    )
+
+    assert rows == [(2, "strong", False)]
+
+
+def test_duckdb_source_metrics_not_comparable_without_source_url_facts(tmp_path):
+    pytest.importorskip("duckdb")
+    runs = tmp_path / "runs"
+    settings = Settings(llm_api_key=None)
+    first = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings, adapter="doubao_responses_web_search", model="doubao-test")
+    second = _build_and_run_mock_job(tmp_path, runs, "analysis-fixed", settings, adapter="qwen_responses_web_search_basic", model="qwen3.7-plus")
+    _write_strong_summary(Path(first["bundle_dir"]))
+    _write_strong_summary(Path(second["bundle_dir"]))
+    _rewrite_attempts(Path(first["bundle_dir"]), web_search_requirement_status="satisfied", source_parse_status="parsed")
+    _rewrite_attempts(Path(second["bundle_dir"]), web_search_requirement_status="satisfied", source_parse_status="parsed")
+
+    db = tmp_path / "geo.duckdb"
+    build_duckdb(runs, db)
+    _, rows = query_duckdb(
+        db,
+        "select comparison_group_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts",
+    )
+
+    assert rows == [(2, "strong", False)]
+
+
+def _build_and_run_mock_job(
+    tmp_path: Path,
+    runs: Path,
+    analysis_model: str,
+    settings: Settings,
+    *,
+    adapter: str = "openai_responses_web_search",
+    model: str = "test-model",
+) -> dict:
     config = tmp_path / f"{analysis_model}.json"
     config.write_text(
         json.dumps(
@@ -151,7 +275,8 @@ def _build_and_run_mock_job(tmp_path: Path, runs: Path, analysis_model: str, set
                 "industry": "Industry",
                 "queries": ["best providers"],
                 "repeats": 1,
-                "model": "test-model",
+                "model": model,
+                "adapter": adapter,
                 "analysis_model": analysis_model,
             }
         ),

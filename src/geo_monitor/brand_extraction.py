@@ -186,7 +186,7 @@ def normalize_extraction_items_with_quarantine(items: Any, record: dict) -> tupl
             "rank_position": _rank_value(item.get("rank_position") or item.get("rank")),
             "sentiment": _sentiment_value(item.get("sentiment")),
             "mention_context": _mention_context_value(item.get("mention_context") or item.get("context")),
-            "sov_eligible": _bool_value(item.get("sov_eligible"), default=False) if brand_type else False,
+            "sov_eligible": _optional_bool_value(item.get("sov_eligible")) if brand_type else False,
             "canonical_hint": str(item.get("canonical_hint") or item.get("canonical_name") or "")[:200],
         })
     return rows, quarantined
@@ -261,6 +261,22 @@ def _bool_value(value: Any, *, default: bool = False) -> bool:
         if text in {"false", "0", "no", "n", "否", "未推荐"}:
             return False
     return default
+
+
+def _optional_bool_value(value: Any) -> bool | str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y", "是", "推荐"}:
+            return True
+        if text in {"false", "0", "no", "n", "否", "未推荐"}:
+            return False
+    return ""
 
 
 def _rank_value(value: Any) -> int | str:

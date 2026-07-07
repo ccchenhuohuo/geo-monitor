@@ -204,6 +204,7 @@ def _create_views(con: Any) -> None:
             count(distinct analysis_fingerprint) as analysis_fingerprint_count,
             case
                 when count(*) > 1
+                 and count(distinct provider || ':' || adapter || ':' || api_family) > 1
                  and count(distinct analysis_fingerprint) = 1
                  and min(case when job_conclusion_strength = 'strong' then 1 else 0 end) = 1
                  and min(case when coalesce(web_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
@@ -213,7 +214,9 @@ def _create_views(con: Any) -> None:
             end as comparison_conclusion_strength,
             case
                 when min(case when source_grain = 'url' then 1 else 0 end) = 1
-                 and min(case when coalesce(source_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
+                 and min(case when coalesce(source_status_not_parsed.bad_count, 0) = 0 then 1 else 0 end) = 1
+                 and min(case when coalesce(source_status_parsed.parsed_count, 0) > 0 then 1 else 0 end) = 1
+                 and min(case when coalesce(source_url_facts.url_count, 0) > 0 then 1 else 0 end) = 1
                 then true
                 else false
             end as source_metrics_comparable
@@ -224,6 +227,24 @@ def _create_views(con: Any) -> None:
             where source_parse_status not in ('', 'parsed', 'provider_returned_empty')
             group by job_id
         ) source_status_bad using (job_id)
+        left join (
+            select job_id, count(*) as bad_count
+            from attempts
+            where coalesce(source_parse_status, '') != 'parsed'
+            group by job_id
+        ) source_status_not_parsed using (job_id)
+        left join (
+            select job_id, count(*) as parsed_count
+            from attempts
+            where source_parse_status = 'parsed'
+            group by job_id
+        ) source_status_parsed using (job_id)
+        left join (
+            select job_id, count(*) as url_count
+            from source_urls
+            where coalesce(url, '') != '' and coalesce(parsed_source_occurrences, 0) > 0
+            group by job_id
+        ) source_url_facts using (job_id)
         left join (
             select job_id, count(*) as bad_count
             from attempts

@@ -49,6 +49,7 @@ class ProviderRequest:
     sampling_profile: dict[str, Any]
     payload: dict[str, Any]
     request_fingerprint_basis: dict[str, Any]
+    legacy_request_hashes: tuple[str, ...] = ()
 
     @property
     def request_hash(self) -> str:
@@ -222,4 +223,3 @@ def _web_search_tool_count(raw: dict[str, Any]) -> int:
         except Exception:
             continue
     return total
-

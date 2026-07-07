@@ -1430,6 +1430,38 @@ def test_analyze_job_allows_business_institution_and_honors_string_sov_false(tmp
     assert source_mentions[0]["brand_name_raw"] == "TestExcludedEntity"
 
 
+def test_analyze_job_missing_sov_eligible_falls_back_to_brand_type(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {"run_id": "r", "query_id": "q001", "repeat_index": 1, "repeat_total": 1, "request_hash": "a", "model": "test-model", "input_query": "best local providers", "status": "success", "response_text": "TestStudio", "sources": [], "raw_response": {"status": "completed"}, "started_at": "2026-01-01T00:00:00+00:00", "completed_at": "2026-01-01T00:00:01+00:00"}
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    def extractor(record):
+        return [
+            {
+                "query_id": "q001",
+                "repeat_index": 1,
+                "input_query": record["input_query"],
+                "brand_name_raw": "TestStudio",
+                "brand_type": "公司",
+                "evidence": "TestStudio",
+                "role": "mentioned",
+                "confidence": 0.9,
+            }
+        ], None
+
+    result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    assert [row["brand_name_canonical"] for row in result["brand_summary"]] == ["TestStudio"]
+
+
 def test_analyze_job_data_quality_detects_request_hash_mismatch(tmp_path):
     config_path = tmp_path / "job_config.json"
     bundle = tmp_path / "bundle"

@@ -1093,7 +1093,7 @@ def _resume_matched_unit_count(raw_path: Path, queries: list[QueryRecord], manif
     adapter_options = dict(manifest.get("adapter_options") or {})
     for query in queries:
         provider_request = adapter.build_request(query, sampling_profile, settings, adapter_options)
-        request_hashes = {provider_request.request_hash, compute_request_hash(provider_request.payload)}
+        request_hashes = {provider_request.request_hash, compute_request_hash(provider_request.payload), *provider_request.legacy_request_hashes}
         for repeat_index in range(1, repeats + 1):
             if request_hashes & done_hashes.get((query.query_id, repeat_index), set()):
                 count += 1

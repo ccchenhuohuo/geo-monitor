@@ -1,5 +1,6 @@
-from geo_monitor.llm_client import LLMResponsesClient, is_retryable_api_error
+from geo_monitor.llm_client import LLMResponsesClient, build_responses_payload, is_retryable_api_error
 from geo_monitor.config import Settings
+from geo_monitor.schemas import QueryRecord
 
 
 class FakeStatusError(Exception):
@@ -41,6 +42,19 @@ def test_client_disables_openai_sdk_retries(monkeypatch):
     LLMResponsesClient(Settings(llm_api_key="test", llm_base_url="https://provider.example/v1"))
 
     assert captured["max_retries"] == 0
+
+
+def test_build_responses_payload_uses_current_web_search_shape():
+    payload = build_responses_payload(
+        QueryRecord(query_id="q001", query="best providers"),
+        Settings(llm_api_key=None),
+        model="gpt-5.5",
+        web_search_limit=5,
+    )
+
+    assert payload["tools"] == [{"type": "web_search"}]
+    assert payload["tool_choice"] == "required"
+    assert payload["include"] == ["web_search_call.action.sources"]
 
 
 def test_client_retries_retryable_status_then_succeeds():

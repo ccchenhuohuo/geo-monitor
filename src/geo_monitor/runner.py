@@ -85,10 +85,10 @@ class MonitorRunner:
         for query, repeat_index in _iter_units(query_list, repeats, repeat_order):
             provider_request = adapter.build_request(query, actual_sampling_profile, self.settings, actual_adapter_options)
             request_hash = provider_request.request_hash
-            legacy_hash = compute_request_hash(provider_request.payload)
+            resume_hashes = {request_hash, compute_request_hash(provider_request.payload), *provider_request.legacy_request_hashes}
             done_key = (query.query_id, repeat_index)
             existing_hashes = done_hashes.get(done_key, set())
-            if request_hash in existing_hashes or legacy_hash in existing_hashes:
+            if resume_hashes & existing_hashes:
                 continue
             if existing_hashes:
                 warnings.warn(
