@@ -2,10 +2,13 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+
 from geo_monitor.analysis.cache import extraction_cache_key, response_text_hash
 from geo_monitor.config import Settings
+from geo_monitor.db import build_duckdb, query_duckdb
 from geo_monitor.exporters import read_jsonl
-from geo_monitor.job import BUNDLE_LOCK, JobError, build_job_bundle, cleanup_job_bundle, estimate_job_run, run_job_bundle, validate_job_config, _job_lock
+from geo_monitor.job import BUNDLE_LOCK, JobError, build_job_bundle, cleanup_job_bundle, estimate_job_run, load_job_manifest, run_job_bundle, validate_job_config, _job_lock
 from geo_monitor.job_analysis import CSV_FIELD_SCHEMAS, analyze_job_bundle
 from geo_monitor.analysis.pipeline import EXTRACTION_SCHEMA_VERSION
 from geo_monitor.runner import compute_request_hash
@@ -70,6 +73,46 @@ def test_build_job_creates_query_manifest_without_business_context(tmp_path):
     assert query_manifest.splitlines()[0] == "query_id,query"
     assert "TestAEntity" not in query_manifest
     assert "TestIndustry" not in query_manifest
+
+
+def test_inline_query_metadata_changes_query_set_hash(tmp_path):
+    first_config = tmp_path / "first.json"
+    second_config = tmp_path / "second.json"
+    base = {
+        "target_brand": "TestAEntity",
+        "industry": "TestIndustry",
+        "queries": [{"query_id": "q001", "query": "best local providers", "persona": "buyer"}],
+        "repeats": 1,
+        "model": "test-model",
+    }
+    first_config.write_text(json.dumps(base, ensure_ascii=False), encoding="utf-8")
+    changed = dict(base)
+    changed["queries"] = [{"query_id": "q001", "query": "best local providers", "persona": "architect"}]
+    second_config.write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
+
+    first = build_job_bundle(first_config, tmp_path / "first", settings=Settings(llm_api_key=None))
+    second = build_job_bundle(second_config, tmp_path / "second", settings=Settings(llm_api_key=None))
+
+    assert first["comparability_profile"]["query_manifest_sha256"] != second["comparability_profile"]["query_manifest_sha256"]
+
+
+def test_v3_external_query_manifest_requires_non_empty_sha(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    query_manifest = tmp_path / "queries.csv"
+    query_manifest.write_text("query_id,query\nq001,best local providers\n", encoding="utf-8")
+    config_path.write_text(
+        json.dumps({"target_brand": "TestAEntity", "industry": "TestIndustry", "queries": ["placeholder"], "repeats": 1, "model": "test-model"}),
+        encoding="utf-8",
+    )
+    bundle = tmp_path / "bundle"
+    build_job_bundle(config_path, bundle, query_manifest_path=query_manifest, settings=Settings(llm_api_key=None))
+    manifest_path = bundle / "job_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["query_manifest"]["sha256"] = ""
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(JobError, match="sha256"):
+        load_job_manifest(bundle)
 
 
 def test_query_manifest_preserves_formula_like_query_text(tmp_path):
@@ -1541,6 +1584,91 @@ def test_analyze_job_data_quality_detects_missing_raw_response(tmp_path):
     assert result["brand_summary"] == []
 
 
+def test_analyze_job_latest_error_overrides_old_success(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    success = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "OldBrand",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(success)
+    error = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "error",
+        "error": {"type": "ProviderError", "message": "later failure"},
+        "started_at": "2026-01-01T00:00:02+00:00",
+        "completed_at": "2026-01-01T00:00:03+00:00",
+    }
+    (bundle / "raw" / "attempts.jsonl").write_text(
+        json.dumps(success, ensure_ascii=False) + "\n" + json.dumps(error, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    def extractor(record):
+        return [{"query_id": "q001", "repeat_index": 1, "input_query": record["input_query"], "brand_name_raw": "OldBrand", "brand_type": "品牌", "evidence": "OldBrand", "role": "mentioned", "confidence": 0.9}], None
+
+    result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    assert result["brand_summary"] == []
+    assert result["data_quality"]["latest_failed_units"] == [{"query_id": "q001", "repeat_index": 1, "status": "error", "error": "later failure"}]
+    assert result["data_quality"]["conclusion_strength"] == "observational"
+
+
+def test_analyze_job_missing_legacy_web_and_source_evidence_downgrades(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "TestStudio",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    def extractor(record):
+        return [{"query_id": "q001", "repeat_index": 1, "input_query": record["input_query"], "brand_name_raw": "TestStudio", "brand_type": "品牌", "evidence": "TestStudio", "role": "mentioned", "confidence": 0.9}], None
+
+    result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    assert result["data_quality"]["conclusion_strength"] == "observational"
+    assert result["data_quality"]["web_search_quality_flags"]
+    assert result["data_quality"]["source_quality_flags"]
+
+
 def test_target_missing_queries_excludes_unsampled_queries(tmp_path):
     config_path = tmp_path / "job_config.json"
     bundle = tmp_path / "bundle"
@@ -1606,6 +1734,79 @@ def test_analyze_job_downgrades_on_extraction_errors(tmp_path):
     header = (bundle / "result" / "brand_summary.csv").read_text(encoding="utf-8-sig").splitlines()[0]
     assert "sov_rank" in header
     assert header != "empty"
+
+
+def test_analyze_job_writes_denominator_fact_csvs(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = [{"query": "best local providers", "persona": "buyer", "tags": ["local", "urgent"]}]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
+    row = {"run_id": "r", "query_id": "q001", "repeat_index": 1, "repeat_total": 1, "model": "test-model", "input_query": "best local providers", "status": "success", "response_text": "TestStudio", "sources": [], "web_search_requirement_status": "satisfied", "web_search_evidence": "provider_trace", "source_parse_status": "provider_returned_empty", "started_at": "2026-01-01T00:00:00+00:00", "completed_at": "2026-01-01T00:00:01+00:00"}
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    def extractor(record):
+        return [{"query_id": "q001", "repeat_index": 1, "input_query": record["input_query"], "brand_name_raw": "TestStudio", "brand_type": "品牌", "evidence": "TestStudio", "role": "mentioned", "confidence": 0.9}], None
+
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+
+    quality = list(csv.DictReader((bundle / "result" / "quality_summary.csv").open(encoding="utf-8-sig")))
+    attempts = list(csv.DictReader((bundle / "result" / "attempt_facts.csv").open(encoding="utf-8-sig")))
+    queries = list(csv.DictReader((bundle / "result" / "query_facts.csv").open(encoding="utf-8-sig")))
+    brands = list(csv.DictReader((bundle / "result" / "brand_attempt_facts.csv").open(encoding="utf-8-sig")))
+    assert quality[0]["stats_record_count"] == "1"
+    assert attempts[0]["latest_status"] == "success"
+    assert queries[0]["planned_attempts"] == "1"
+    assert "buyer" in queries[0]["query_metadata_json"]
+    assert brands[0]["brand_name_canonical"] == "TestStudio"
+
+
+def test_rerun_invalidates_old_analysis_outputs_before_db_ingest(tmp_path):
+    pytest.importorskip("duckdb")
+    config_path = tmp_path / "job_config.json"
+    runs = tmp_path / "runs"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    bundle_info = build_job_bundle(config_path, runs_dir=runs, settings=Settings(llm_api_key=None))
+    bundle = Path(bundle_info["bundle_dir"])
+    run_job_bundle(bundle, mock=True, settings=Settings(llm_api_key=None))
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), include_mock=True)
+    assert (bundle / "result" / "brand_summary.csv").exists()
+
+    run_job_bundle(bundle, mock=True, settings=Settings(llm_api_key=None))
+    assert not (bundle / "result" / "brand_summary.csv").exists()
+
+    db = tmp_path / "geo.duckdb"
+    build_duckdb(runs, db)
+    _, brand_rows = query_duckdb(db, "select count(*) from brand_summary")
+    _, run_rows = query_duckdb(db, "select status, job_conclusion_strength from runs")
+    assert brand_rows == [(0,)]
+    assert run_rows[0][0].startswith("ran")
+    assert run_rows[0][1] == ""
+
+
+def test_duckdb_queries_use_planned_manifest_universe_for_partial_run(tmp_path):
+    pytest.importorskip("duckdb")
+    config_path = tmp_path / "job_config.json"
+    runs = tmp_path / "runs"
+    _write_job_config(config_path)
+    bundle_info = build_job_bundle(config_path, runs_dir=runs, settings=Settings(llm_api_key=None))
+    bundle = Path(bundle_info["bundle_dir"])
+    run_job_bundle(bundle, mock=True, only_query_ids=["q001"], settings=Settings(llm_api_key=None))
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), include_mock=True)
+
+    db = tmp_path / "geo.duckdb"
+    build_duckdb(runs, db)
+    _, rows = query_duckdb(db, "select count(distinct query_id) from queries")
+
+    assert rows == [(2,)]
 
 
 def test_analyze_job_uses_exact_schema_for_brand_summary_csv(tmp_path):

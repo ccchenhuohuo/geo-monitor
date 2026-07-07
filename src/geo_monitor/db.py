@@ -7,11 +7,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .job import JOB_MANIFEST, RAW_ATTEMPTS, load_job_manifest
+from .job import JOB_MANIFEST, RAW_ATTEMPTS, load_job_manifest, load_job_queries
 from .query_meta import query_metadata_json, tags_text
 
 
-DUCKDB_SCHEMA_VERSION = "duckdb-schema-v4"
+DUCKDB_SCHEMA_VERSION = "duckdb-schema-v5"
 SAFE_QUERY_START_RE = re.compile(r"^\s*(select|with|show|describe|explain)\b", re.IGNORECASE | re.DOTALL)
 FORBIDDEN_SQL_RE = re.compile(
     r"\b(attach|copy|create|delete|detach|drop|export|import|insert|install|load|merge|pragma|set|update|alter|call)\b"
@@ -70,13 +70,16 @@ def inspect_duckdb(db_path: str | Path) -> dict[str, Any]:
         con.close()
 
 
-def query_duckdb(db_path: str | Path, sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
+def query_duckdb(db_path: str | Path, sql: str, *, max_rows: int = 10_000) -> tuple[list[str], list[tuple[Any, ...]]]:
     _validate_safe_query_sql(sql)
     con = _connect_readonly(db_path)
     try:
         result = con.execute(sql)
         columns = [item[0] for item in result.description or []]
-        return columns, result.fetchall()
+        rows = result.fetchmany(max_rows + 1)
+        if len(rows) > max_rows:
+            raise DuckDBError(f"查询结果超过 max_rows={max_rows}，请添加过滤或 LIMIT")
+        return columns, rows
     except Exception as exc:
         raise DuckDBError(str(exc)) from exc
     finally:
@@ -104,6 +107,14 @@ def _create_schema(con: Any) -> None:
             analysis_model varchar,
             analysis_adapter varchar,
             analysis_fingerprint varchar,
+            study_fingerprint varchar,
+            sampling_fingerprint varchar,
+            sample_mode varchar,
+            partial_sample boolean,
+            success_record_count integer,
+            stats_record_count integer,
+            run_generation integer,
+            inferred_from_legacy boolean,
             job_conclusion_strength varchar,
             sample_count integer,
             query_manifest_sha256 varchar,
@@ -171,6 +182,10 @@ def _create_schema(con: Any) -> None:
     con.execute("create table query_stability(job_id varchar, query_id varchar, successful_repeats integer, expected_repeats integer, brand_set_jaccard_avg double)")
     con.execute("create table source_domains(job_id varchar, domain varchar, response_coverage_rate double, query_coverage_rate double)")
     con.execute("create table source_urls(job_id varchar, url varchar, domain varchar, title varchar, parsed_source_occurrences integer)")
+    con.execute("create table quality_summary(job_id varchar, sample_mode varchar, conclusion_strength varchar, partial_sample boolean, planned_units integer, analysis_record_count integer, stats_record_count integer, missing_unit_count integer, latest_failed_unit_count integer, web_search_quality_flag_count integer, source_quality_flag_count integer, extraction_error_record_count integer, extraction_error_rate double)")
+    con.execute("create table attempt_facts(job_id varchar, query_id varchar, repeat_index integer, latest_status varchar, completed_at varchar, valid_attempt integer, stats_included integer, web_search_requirement_status varchar, web_search_evidence varchar, source_parse_status varchar, request_hash varchar, attempt_id varchar)")
+    con.execute("create table query_facts(job_id varchar, query_id varchar, query varchar, planned_attempts integer, latest_terminal_attempts integer, completed_attempts integer, valid_attempts integer, stats_included_attempts integer, latest_failed_attempts integer, sample_completeness double, usable_sample_rate double, query_metadata_json varchar)")
+    con.execute("create table brand_attempt_facts(job_id varchar, query_id varchar, repeat_index integer, brand_name_canonical varchar, brand_name_raw varchar, is_target_brand integer, sov_eligible boolean, is_recommended integer, rank_position integer, sentiment varchar, confidence double, evidence varchar, stats_included integer)")
     con.execute("create table quality_flags(job_id varchar, type varchar, message varchar, path varchar, raw_line_number integer, query_id varchar)")
 
 
@@ -202,11 +217,19 @@ def _create_views(con: Any) -> None:
             count(*) as job_count,
             count(distinct provider || ':' || adapter || ':' || api_family) as comparison_group_count,
             count(distinct analysis_fingerprint) as analysis_fingerprint_count,
+            count(distinct study_fingerprint) as study_fingerprint_count,
+            count(distinct sampling_fingerprint) as sampling_fingerprint_count,
             case
                 when count(*) > 1
                  and count(distinct provider || ':' || adapter || ':' || api_family) > 1
                  and count(distinct analysis_fingerprint) = 1
+                 and count(distinct study_fingerprint) = 1
+                 and count(distinct sampling_fingerprint) = 1
+                 and min(case when coalesce(study_fingerprint, '') != '' then 1 else 0 end) = 1
+                 and min(case when coalesce(sampling_fingerprint, '') != '' then 1 else 0 end) = 1
                  and min(case when job_conclusion_strength = 'strong' then 1 else 0 end) = 1
+                 and min(case when coalesce(partial_sample, false) = false then 1 else 0 end) = 1
+                 and min(case when coalesce(inferred_from_legacy, false) = false then 1 else 0 end) = 1
                  and min(case when coalesce(web_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
                  and min(case when coalesce(source_status_bad.bad_count, 0) = 0 then 1 else 0 end) = 1
                 then 'strong'
@@ -224,7 +247,7 @@ def _create_views(con: Any) -> None:
         left join (
             select job_id, count(*) as bad_count
             from attempts
-            where source_parse_status not in ('', 'parsed', 'provider_returned_empty')
+            where coalesce(source_parse_status, '') not in ('parsed', 'provider_returned_empty')
             group by job_id
         ) source_status_bad using (job_id)
         left join (
@@ -248,7 +271,8 @@ def _create_views(con: Any) -> None:
         left join (
             select job_id, count(*) as bad_count
             from attempts
-            where web_search_requirement_status not in ('', 'satisfied', 'not_applicable')
+            where coalesce(web_search_requirement_status, '') not in ('satisfied', 'not_applicable')
+               or (web_search_requirement_status = 'satisfied' and coalesce(web_search_evidence, '') = '')
             group by job_id
         ) web_status_bad using (job_id)
         group by query_manifest_sha256, repeats, execution_window_bucket
@@ -295,10 +319,20 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
     analysis_profile = manifest.get("analysis_profile") if isinstance(manifest.get("analysis_profile"), dict) else {}
     comparability_profile = manifest.get("comparability_profile") if isinstance(manifest.get("comparability_profile"), dict) else {}
     analysis_summary = _read_analysis_summary(run_dir)
+    analysis_current = _analysis_summary_is_current(manifest, analysis_summary)
+    if not analysis_current and str(manifest.get("status") or "").startswith("analyzed"):
+        _quality(con, job_id, "stale_or_missing_analysis_summary", "analysis_summary.json does not match latest run_generation", str(run_dir / "logs" / "analysis_summary.json"))
+        counts["quality_flags"] += 1
     report_path = run_dir / "result" / "report.html"
     completed_at = _completed_at(run_dir, attempts)
+    inferred_from_legacy = bool(
+        sampling_profile.get("inferred_from_legacy")
+        or analysis_profile.get("inferred_from_legacy")
+        or comparability_profile.get("inferred_from_legacy")
+    )
+    data_quality = analysis_summary.get("data_quality") if analysis_current and isinstance(analysis_summary.get("data_quality"), dict) else {}
     con.execute(
-        "insert into runs values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into runs values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             job_id,
             manifest.get("status"),
@@ -315,12 +349,20 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
             analysis_profile.get("model", ""),
             analysis_profile.get("adapter", ""),
             analysis_profile.get("analysis_fingerprint", ""),
-            analysis_summary.get("job_conclusion_strength") or (analysis_summary.get("data_quality") or {}).get("conclusion_strength", ""),
+            comparability_profile.get("study_fingerprint", ""),
+            comparability_profile.get("sampling_fingerprint", ""),
+            analysis_summary.get("sample_mode", "") if analysis_current else "",
+            bool(analysis_summary.get("partial_sample") or data_quality.get("partial_sample")) if analysis_current else None,
+            _to_int(analysis_summary.get("success_record_count")) if analysis_current else None,
+            _to_int(analysis_summary.get("stats_record_count")) if analysis_current else None,
+            _to_int(manifest.get("run_generation")),
+            inferred_from_legacy,
+            (analysis_summary.get("job_conclusion_strength") or data_quality.get("conclusion_strength", "")) if analysis_current else "",
             len(attempts),
             comparability_profile.get("query_manifest_sha256") or info.get("sha256", ""),
             info.get("source_type", ""),
             info.get("source_uri", ""),
-            str(report_path) if report_path.exists() else "",
+            str(report_path) if analysis_current and report_path.exists() else "",
         ],
     )
     counts["runs"] += 1
@@ -359,7 +401,13 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
             ],
         )
         counts["attempts"] += 1
-    for row in query_rows.values():
+    planned_query_rows = _planned_query_rows(run_dir, manifest)
+    for qid, row in query_rows.items():
+        if qid in planned_query_rows:
+            planned_query_rows[qid].update({key: value for key, value in row.items() if value not in (None, "")})
+        else:
+            planned_query_rows[qid] = row
+    for row in planned_query_rows.values():
         con.execute(
             "insert into queries values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
@@ -385,7 +433,11 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
             ],
         )
         counts["queries"] += 1
-    counts["quality_flags"] += _ingest_csv_outputs(con, run_dir, job_id)
+    if analysis_current:
+        counts["quality_flags"] += _ingest_csv_outputs(con, run_dir, job_id)
+    elif (run_dir / "result").exists() and any((run_dir / "result").iterdir()):
+        _quality(con, job_id, "stale_result_csv_ignored", "result CSV ignored because analysis_summary is stale or missing", str(run_dir / "result"))
+        counts["quality_flags"] += 1
     return counts
 
 
@@ -532,6 +584,10 @@ def _ingest_csv_outputs(con: Any, run_dir: Path, job_id: str) -> int:
         "query_stability.csv",
         "source_domains.csv",
         "source_urls.csv",
+        "quality_summary.csv",
+        "attempt_facts.csv",
+        "query_facts.csv",
+        "brand_attempt_facts.csv",
     ]
     for name in expected_files:
         path = result / name
@@ -548,6 +604,80 @@ def _ingest_csv_outputs(con: Any, run_dir: Path, job_id: str) -> int:
         con.execute("insert into source_domains values (?, ?, ?, ?)", [job_id, row.get("domain", ""), _pct(row.get("response_coverage_rate")), _pct(row.get("query_coverage_rate"))])
     for row in _read_csv(result / "source_urls.csv"):
         con.execute("insert into source_urls values (?, ?, ?, ?, ?)", [job_id, row.get("url", ""), row.get("domain", ""), row.get("title", ""), _to_int(row.get("parsed_source_occurrences"))])
+    for row in _read_csv(result / "quality_summary.csv"):
+        con.execute(
+            "insert into quality_summary values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                job_id,
+                row.get("sample_mode", ""),
+                row.get("conclusion_strength", ""),
+                _to_bool(row.get("partial_sample")),
+                _to_int(row.get("planned_units")),
+                _to_int(row.get("analysis_record_count")),
+                _to_int(row.get("stats_record_count")),
+                _to_int(row.get("missing_unit_count")),
+                _to_int(row.get("latest_failed_unit_count")),
+                _to_int(row.get("web_search_quality_flag_count")),
+                _to_int(row.get("source_quality_flag_count")),
+                _to_int(row.get("extraction_error_record_count")),
+                _pct(row.get("extraction_error_rate")),
+            ],
+        )
+    for row in _read_csv(result / "attempt_facts.csv"):
+        con.execute(
+            "insert into attempt_facts values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                job_id,
+                row.get("query_id", ""),
+                _to_int(row.get("repeat_index")),
+                row.get("latest_status", ""),
+                row.get("completed_at", ""),
+                _to_int(row.get("valid_attempt")),
+                _to_int(row.get("stats_included")),
+                row.get("web_search_requirement_status", ""),
+                row.get("web_search_evidence", ""),
+                row.get("source_parse_status", ""),
+                row.get("request_hash", ""),
+                row.get("attempt_id", ""),
+            ],
+        )
+    for row in _read_csv(result / "query_facts.csv"):
+        con.execute(
+            "insert into query_facts values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                job_id,
+                row.get("query_id", ""),
+                row.get("query", ""),
+                _to_int(row.get("planned_attempts")),
+                _to_int(row.get("latest_terminal_attempts")),
+                _to_int(row.get("completed_attempts")),
+                _to_int(row.get("valid_attempts")),
+                _to_int(row.get("stats_included_attempts")),
+                _to_int(row.get("latest_failed_attempts")),
+                _pct(row.get("sample_completeness")),
+                _pct(row.get("usable_sample_rate")),
+                row.get("query_metadata_json", ""),
+            ],
+        )
+    for row in _read_csv(result / "brand_attempt_facts.csv"):
+        con.execute(
+            "insert into brand_attempt_facts values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                job_id,
+                row.get("query_id", ""),
+                _to_int(row.get("repeat_index")),
+                row.get("brand_name_canonical", ""),
+                row.get("brand_name_raw", ""),
+                _to_int(row.get("is_target_brand")),
+                _to_bool(row.get("sov_eligible")),
+                _to_int(row.get("is_recommended")),
+                _to_int(row.get("rank_position")),
+                row.get("sentiment", ""),
+                _to_float(row.get("confidence")),
+                row.get("evidence", ""),
+                _to_int(row.get("stats_included")),
+            ],
+        )
     return quality_count
 
 
@@ -593,6 +723,56 @@ def _read_analysis_summary(run_dir: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _analysis_summary_is_current(manifest: dict[str, Any], summary: dict[str, Any]) -> bool:
+    if not str(manifest.get("status") or "").startswith("analyzed"):
+        return False
+    if not summary:
+        return False
+    manifest_generation = _to_int(manifest.get("run_generation")) or 0
+    summary_generation = _to_int(summary.get("run_generation")) or 0
+    return manifest_generation == summary_generation
+
+
+def _planned_query_rows(run_dir: Path, manifest: dict[str, Any]) -> dict[str, dict[str, str]]:
+    rows: dict[str, dict[str, str]] = {}
+    try:
+        records = load_job_queries(run_dir, manifest, materialize=False)
+    except Exception:
+        records = []
+    for record in records:
+        meta = dict(record.metadata)
+        if record.locale:
+            meta["locale"] = record.locale
+        if record.market:
+            meta["market"] = record.market
+        if record.category:
+            meta["category"] = record.category
+        if record.tags:
+            meta["tags"] = ",".join(record.tags)
+        row: dict[str, str] = {
+            "query_id": str(record.query_id),
+            "variant_id": str(meta.get("variant_id") or ""),
+            "seed_id": str(meta.get("seed_id") or ""),
+            "seed_query": str(meta.get("seed_query") or ""),
+            "category": str(meta.get("category") or ""),
+            "intent": str(meta.get("intent") or ""),
+            "persona": str(meta.get("persona") or ""),
+            "template_id": str(meta.get("template_id") or ""),
+            "query": str(record.query),
+            "locale": str(meta.get("locale") or ""),
+            "market": str(meta.get("market") or ""),
+            "tags": tags_text(meta.get("tags")),
+            "language": str(meta.get("language") or ""),
+            "generation_method": str(meta.get("generation_method") or ""),
+            "fanout_version": str(meta.get("fanout_version") or ""),
+            "manifest_version": str(meta.get("manifest_version") or ""),
+            "locked_at": str(meta.get("locked_at") or ""),
+            "query_metadata_json": query_metadata_json(meta),
+        }
+        rows[str(record.query_id)] = row
+    return rows
 
 
 def _pct(value: Any) -> float | None:
@@ -646,16 +826,39 @@ def validate_schema(con: Any) -> None:
         raise DuckDBError(f"DuckDB schema_info 缺失或不可读：{exc}") from exc
     if not row or str(row[0]) != DUCKDB_SCHEMA_VERSION:
         raise DuckDBError(f"DuckDB schema_version 不支持：{row[0] if row else 'unknown'}；请重建 DuckDB")
+    required = {
+        "runs": {"job_id", "status", "sample_mode", "partial_sample", "study_fingerprint", "sampling_fingerprint", "job_conclusion_strength"},
+        "queries": {"job_id", "query_id", "query", "query_metadata_json"},
+        "attempts": {"job_id", "attempt_id", "query_id", "web_search_requirement_status", "source_parse_status"},
+        "quality_summary": {"job_id", "sample_mode", "stats_record_count"},
+        "attempt_facts": {"job_id", "query_id", "repeat_index", "latest_status", "stats_included"},
+        "query_facts": {"job_id", "query_id", "planned_attempts", "usable_sample_rate"},
+        "brand_attempt_facts": {"job_id", "query_id", "brand_name_canonical", "stats_included"},
+        "comparison_cohorts": {"query_manifest_sha256", "comparison_conclusion_strength", "source_metrics_comparable"},
+    }
+    for table, columns in required.items():
+        try:
+            rows = con.execute(
+                "select column_name from information_schema.columns where table_schema='main' and table_name=?",
+                [table],
+            ).fetchall()
+        except Exception as exc:
+            raise DuckDBError(f"DuckDB schema 校验失败：{table}: {exc}") from exc
+        existing = {str(item[0]) for item in rows}
+        missing = sorted(columns - existing)
+        if missing:
+            raise DuckDBError(f"DuckDB schema 缺少 {table} 字段：{', '.join(missing)}；请重建 DuckDB")
 
 
 def _connect_readonly(db_path: str | Path) -> Any:
     duckdb = _duckdb()
     try:
-        return duckdb.connect(str(db_path), read_only=True, config={"enable_external_access": "false"})
+        return duckdb.connect(str(db_path), read_only=True, config={"enable_external_access": "false", "memory_limit": "512MB"})
     except TypeError:
         con = duckdb.connect(str(db_path), read_only=True)
         try:
             con.execute("set enable_external_access=false")
+            con.execute("set memory_limit='512MB'")
         except Exception:
             con.close()
             raise

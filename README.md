@@ -117,6 +117,11 @@ actual query text and a `query_meta` snapshot containing dimensions such as
 `seed_id`, `persona`, `intent`, `template_id`, `variant_id`, `locked_at`, and
 custom manifest metadata preserved in `query_metadata_json`.
 
+A job is a single-adapter experiment. A cross-provider study is a set of sibling
+jobs over the same frozen `query_manifest.csv`; comparison strength is computed
+later in DuckDB/dashboard cohorts using provider, adapter, API family, sampling
+fingerprint, and analysis fingerprint.
+
 For real studies, prefer a directory outside the repository. The repository also
 ignores common local study outputs such as `my-geo-study/`, `study/`, and
 `*.duckdb`. There is intentionally no repository-root `outputs/` placeholder; if
@@ -344,6 +349,10 @@ runs/{job_id}/
     source_domains.csv
     source_urls.csv
     source_by_query.csv
+    quality_summary.csv
+    attempt_facts.csv
+    query_facts.csv
+    brand_attempt_facts.csv
     report.md
     report.html
     report.pdf              # optional, best-effort
@@ -380,14 +389,16 @@ flowchart LR
     RawAnswer --> Quality["data_quality.json"]
 ```
 
-See [docs/metrics.md](docs/metrics.md) for metric denominators, grain, mock/live
-rules, partial-sample caveats, and currently overlapping SOV fields.
+See [docs/metrics.md](docs/metrics.md) for metric denominators, latest-terminal
+attempt semantics, mock/live rules, partial-sample caveats, denominator facts,
+and the current compatible meaning of `sov_event_share`.
 
 Current metrics include:
 
 - **Mention rate**: responses mentioning a brand / successful responses.
 - **SOV response share**: responses mentioning a brand / all brand response hits.
-- **SOV event share**: eligible brand mention events / all eligible events.
+- **SOV event share**: currently compatible with SOV response share; reserved
+  for a future true event-grain migration.
 - **Query coverage**: queries where a brand appeared / planned query count.
 - **Recommendation rates**: recommendation signals over mentions and samples.
 - **Rank signals**: observed ranks, average rank, and top-3 presence.

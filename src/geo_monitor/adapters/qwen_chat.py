@@ -21,6 +21,13 @@ class QwenChatEnableSearchAdapter(BaseAdapter):
     )
     allowed_options = {"forced_search", "search_options"}
 
+    def validate_options(self, options: dict[str, Any]) -> None:
+        super().validate_options(options)
+        self._require_bool_option(options, "forced_search")
+        search_options = self._require_object_option(options, "search_options")
+        if "forced_search" in search_options and not isinstance(search_options.get("forced_search"), bool):
+            raise ValueError(f"{self.name} adapter_options.search_options.forced_search 必须是布尔值")
+
     def build_request(
         self,
         query_record: QueryRecord,
@@ -30,10 +37,14 @@ class QwenChatEnableSearchAdapter(BaseAdapter):
     ) -> ProviderRequest:
         self.validate_options(adapter_options)
         extra_body: dict[str, Any] = {"enable_search": True}
-        search_options = dict(adapter_options.get("search_options") or {})
+        search_options = self._require_object_option(adapter_options, "search_options")
         forced_search = adapter_options.get("forced_search")
         if forced_search is None:
+            forced_search = search_options.get("forced_search")
+        if forced_search is None:
             forced_search = bool(sampling_profile.get("web_search_required", True))
+        if sampling_profile.get("web_search_required", True) and forced_search is False:
+            raise ValueError("qwen_chat_enable_search 要求联网搜索时 forced_search 不能为 false")
         if forced_search:
             search_options["forced_search"] = True
         if search_options:
@@ -56,4 +67,3 @@ class QwenChatEnableSearchAdapter(BaseAdapter):
 
     def send(self, client: Any, request: ProviderRequest) -> Any:
         return client.chat.completions.create(**request.payload)
-

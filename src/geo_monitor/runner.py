@@ -10,7 +10,6 @@ from uuid import uuid4
 from .adapters import OpenAICompatibleClientFactory, ProviderRequest, build_sampling_profile, get_adapter
 from .config import Settings, redact_secret
 from .exporters import append_jsonl, successful_result_hashes
-from .llm_client import LLMResponsesClient
 from .mock_client import build_mock_response
 from .query_meta import query_record_meta
 from .request_fingerprint import legacy_payload_hash
@@ -110,8 +109,6 @@ class MonitorRunner:
 
         if dry_run or mock:
             client = None
-        elif adapter.name == "openai_responses_web_search":
-            client = LLMResponsesClient(self.settings)
         else:
             client = OpenAICompatibleClientFactory(self.settings).create()
         if actual_concurrency == 1 or len(work_items) <= 1:

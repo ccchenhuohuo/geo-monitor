@@ -5,9 +5,10 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-from .llm_client import LLMResponsesClient
+from .adapters import OpenAICompatibleClientFactory, build_sampling_profile, get_adapter
 from .config import Settings
 from .response_parser import parse_response
+from .schemas import QueryRecord
 
 
 BrandMentionExtractor = Callable[[dict], tuple[list[dict[str, Any]], dict[str, Any] | None]]
@@ -57,10 +58,19 @@ def normalize_brand_name(value: str) -> str:
 
 
 class LLMBrandExtractor:
-    def __init__(self, settings: Settings, *, model: str | None = None):
+    def __init__(self, settings: Settings, *, model: str | None = None, adapter_name: str = "openai_responses_text"):
         self.settings = settings
         self.model = model or settings.llm_model
-        self.client = LLMResponsesClient(settings)
+        self.adapter = get_adapter(adapter_name)
+        if self.adapter.name != "openai_responses_text":
+            raise ValueError("analysis extractor 目前只支持 openai_responses_text")
+        self.analysis_profile = build_sampling_profile(
+            adapter_name=self.adapter.name,
+            model=self.model,
+            settings=settings,
+            web_search_required=False,
+        )
+        self.client = OpenAICompatibleClientFactory(settings).create()
 
     def extract_record(self, record: dict) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         text = str(record.get("response_text") or "").strip()
@@ -71,7 +81,7 @@ class LLMBrandExtractor:
             "input": _brand_extraction_prompt(text),
         }
         try:
-            response = self.client.create_response(payload)
+            response = self._create_response(payload, query_id="analysis_extraction")
             output_text, _, _, raw = parse_response(response)
             data = parse_json_payload(output_text or "")
             mentions, quarantined = normalize_extraction_items_with_quarantine(data.get("brands", []), record)
@@ -102,12 +112,23 @@ class LLMBrandExtractor:
             "input": _canonicalization_prompt(unique_names),
         }
         try:
-            response = self.client.create_response(payload)
+            response = self._create_response(payload, query_id="analysis_canonicalization")
             output_text, _, _, raw = parse_response(response)
             data = parse_json_payload(output_text or "")
             return parse_canonical_map(data, unique_names), None
         except Exception as exc:  # noqa: BLE001
             return fallback, {"type": exc.__class__.__name__, "message": str(exc), "stage": "canonicalization"}
+
+    def _create_response(self, payload: dict[str, Any], *, query_id: str) -> Any:
+        if not hasattr(self, "adapter"):
+            return self.client.create_response(payload)
+        request = self.adapter.build_request(
+            QueryRecord(query_id=query_id, query=str(payload.get("input") or "")),
+            self.analysis_profile,
+            self.settings,
+            {},
+        )
+        return self.adapter.send(self.client, request)
 
 
 def parse_json_payload(text: str) -> dict[str, Any]:

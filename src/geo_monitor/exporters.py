@@ -6,10 +6,12 @@ import math
 from pathlib import Path
 from typing import Iterable
 
+from .request_fingerprint import REQUEST_FINGERPRINT_VERSION, legacy_payload_hash, request_fingerprint
 from .schemas import MonitorResult
 
 
 RESUME_SUCCESS_STATUSES = {"success"}
+TERMINAL_STATUSES = {"success", "mock", "error", "dry_run"}
 
 CSV_FIELDS = [
     "run_id",
@@ -101,16 +103,16 @@ def read_jsonl_with_errors(path: str | Path) -> tuple[list[dict], list[dict]]:
 
 
 def canonical_request_hash(record: dict) -> str | None:
+    basis = record.get("request_fingerprint_basis")
+    if isinstance(basis, dict) and record.get("request_fingerprint_version") == REQUEST_FINGERPRINT_VERSION:
+        return request_fingerprint(basis)
+    raw_request = record.get("raw_request")
+    if isinstance(raw_request, dict) and raw_request:
+        return legacy_payload_hash(raw_request)
     existing = record.get("request_hash")
     if existing:
         return str(existing)
-    raw_request = record.get("raw_request")
-    if not isinstance(raw_request, dict) or not raw_request:
-        return None
-    stable = json.dumps(raw_request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    import hashlib
-
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    return None
 
 
 def result_key(record: dict) -> tuple[str, int]:
@@ -196,6 +198,10 @@ def successful_query_ids(path: str | Path) -> set[str]:
 
 def latest_success_records(records: Iterable[dict]) -> list[dict]:
     return latest_records(records, statuses={"success"})
+
+
+def latest_terminal_records(records: Iterable[dict]) -> list[dict]:
+    return latest_records(records, statuses=TERMINAL_STATUSES)
 
 
 def latest_records(records: Iterable[dict], *, statuses: set[str]) -> list[dict]:

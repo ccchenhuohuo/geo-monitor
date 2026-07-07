@@ -23,8 +23,8 @@ from .cache import (
 )
 from ..brand_extraction import BrandCanonicalizer, BrandMentionExtractor, LLMBrandExtractor, fallback_canonicalize, normalize_brand_name
 from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings, workspace_root
-from ..exporters import canonical_request_hash, latest_records, read_jsonl, read_jsonl_with_errors, safe_result_key, sanitize_csv_row, write_jsonl
-from ..job import BUNDLE_LOCK, RUNS_DIR, QueryManifestIntegrityError, QueryManifestSourceError, load_job_manifest, load_job_queries, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir, _cleanup_job_bundle_unlocked, _job_lock
+from ..exporters import canonical_request_hash, latest_records, latest_terminal_records, read_jsonl, read_jsonl_with_errors, safe_result_key, sanitize_csv_row, write_jsonl
+from ..job import RUNS_DIR, QueryManifestIntegrityError, QueryManifestSourceError, cleanup_job_work_dir_unlocked, job_bundle_lock, load_job_manifest, load_job_queries, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir
 from ..query_meta import query_metadata_json, tags_text
 from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, legacy_payload_hash, request_fingerprint
 from ..reporting import build_html, markdown_text, table_cell, try_generate_pdf
@@ -142,6 +142,64 @@ CSV_FIELD_SCHEMAS = {
         "avg_source_order",
         "top_urls",
     ],
+    "quality_summary": [
+        "job_id",
+        "sample_mode",
+        "conclusion_strength",
+        "partial_sample",
+        "planned_units",
+        "analysis_record_count",
+        "stats_record_count",
+        "missing_unit_count",
+        "latest_failed_unit_count",
+        "web_search_quality_flag_count",
+        "source_quality_flag_count",
+        "extraction_error_record_count",
+        "extraction_error_rate",
+    ],
+    "attempt_facts": [
+        "job_id",
+        "query_id",
+        "repeat_index",
+        "latest_status",
+        "completed_at",
+        "valid_attempt",
+        "stats_included",
+        "web_search_requirement_status",
+        "web_search_evidence",
+        "source_parse_status",
+        "request_hash",
+        "attempt_id",
+    ],
+    "query_facts": [
+        "job_id",
+        "query_id",
+        "query",
+        "planned_attempts",
+        "latest_terminal_attempts",
+        "completed_attempts",
+        "valid_attempts",
+        "stats_included_attempts",
+        "latest_failed_attempts",
+        "sample_completeness",
+        "usable_sample_rate",
+        "query_metadata_json",
+    ],
+    "brand_attempt_facts": [
+        "job_id",
+        "query_id",
+        "repeat_index",
+        "brand_name_canonical",
+        "brand_name_raw",
+        "is_target_brand",
+        "sov_eligible",
+        "is_recommended",
+        "rank_position",
+        "sentiment",
+        "confidence",
+        "evidence",
+        "stats_included",
+    ],
     "brand_trends": [
         "job_id",
         "target_brand",
@@ -181,6 +239,15 @@ CSV_FIELD_SCHEMAS = {
 }
 
 
+def _analysis_terminal_records(raw_records: list[dict[str, Any]], *, include_mock: bool) -> list[dict[str, Any]]:
+    live_terminal = latest_records(raw_records, statuses={"success", "error"})
+    if any(str(record.get("status") or "") in {"success", "error"} for record in live_terminal):
+        return live_terminal
+    if include_mock:
+        return latest_records(raw_records, statuses={"mock", "error"})
+    return live_terminal
+
+
 def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False, refresh_extraction_cache: bool = False) -> dict[str, Any]:
     root = Path(bundle_dir)
     manifest = load_job_manifest(root)
@@ -190,8 +257,9 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
     manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
     analysis_profile = _analysis_profile(manifest)
-    live_records = latest_records(raw_records, statuses={"success"})
-    mock_records = latest_records(raw_records, statuses={"mock"}) if include_mock else []
+    terminal_records = _analysis_terminal_records(raw_records, include_mock=include_mock)
+    live_records = [record for record in terminal_records if record.get("status") == "success"]
+    mock_records = [record for record in terminal_records if record.get("status") == "mock"] if include_mock else []
     if live_records:
         analysis_records = live_records
         sample_mode = "live"
@@ -243,7 +311,7 @@ def analyze_job_bundle(
     write_aggregates: bool = True,
 ) -> dict[str, Any]:
     root = Path(bundle_dir)
-    with _job_lock(root / BUNDLE_LOCK):
+    with job_bundle_lock(root):
         update_job_manifest(root, status="analyzing")
         try:
             return _analyze_job_bundle_unlocked(
@@ -294,13 +362,14 @@ def _analyze_job_bundle_unlocked(
     manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
     analysis_profile = _analysis_profile(manifest)
     analysis_model = str(analysis_profile.get("model") or manifest["model"])
-    live_records = latest_records(raw_records, statuses={"success"})
-    mock_records = latest_records(raw_records, statuses={"mock"}) if include_mock else []
+    terminal_records = _analysis_terminal_records(raw_records, include_mock=include_mock)
+    live_records = [record for record in terminal_records if record.get("status") == "success"]
+    mock_records = [record for record in terminal_records if record.get("status") == "mock"] if include_mock else []
     if live_records:
         analysis_statuses = {"success"}
         success_records = live_records
         sample_mode = "live"
-        ignored_mock_record_count = len(mock_records)
+        ignored_mock_record_count = len(latest_records(raw_records, statuses={"mock"})) if include_mock else 0
     elif include_mock:
         analysis_statuses = {"mock"}
         success_records = mock_records
@@ -388,6 +457,15 @@ def _analyze_job_bundle_unlocked(
 
     stats = compute_open_brand_stats(enriched_mentions, success_records_for_stats, manifest)
     source_stats = compute_source_stats(success_records_for_stats, manifest)
+    facts = build_fact_rows(
+        manifest=manifest,
+        raw_records=raw_records,
+        terminal_records=terminal_records,
+        stats_records=success_records_for_stats,
+        mentions=enriched_mentions,
+        data_quality=data_quality,
+        sample_mode=sample_mode,
+    )
     files = write_job_analysis_files(
         root=root,
         work=work,
@@ -398,6 +476,7 @@ def _analyze_job_bundle_unlocked(
         canonical_map=canonical_map,
         stats=stats,
         source_stats=source_stats,
+        facts=facts,
         data_quality=data_quality,
     )
 
@@ -416,11 +495,13 @@ def _analyze_job_bundle_unlocked(
         "sampling_profile": manifest.get("sampling_profile", {}),
         "analysis_profile": analysis_profile,
         "comparability_profile": manifest.get("comparability_profile", {}),
+        "run_generation": manifest.get("run_generation", 0),
         "job_conclusion_strength": data_quality.get("conclusion_strength", "observational"),
         "query_set_hash": query_set_hash(manifest),
         "raw_record_count": len(raw_records),
         "success_record_count": len(success_records_for_stats),
         "analysis_record_count": len(success_records),
+        "stats_record_count": len(success_records_for_stats),
         "sample_mode": sample_mode,
         "query_ids": [q["query_id"] for q in manifest["queries"]],
         "partial_sample": bool(data_quality["partial_sample"]),
@@ -440,6 +521,10 @@ def _analyze_job_bundle_unlocked(
         "source_domains": source_stats["source_domains"],
         "source_urls": source_stats["source_urls"],
         "source_by_query": source_stats["source_by_query"],
+        "quality_summary": facts["quality_summary"],
+        "attempt_facts": facts["attempt_facts"],
+        "query_facts": facts["query_facts"],
+        "brand_attempt_facts": facts["brand_attempt_facts"],
         "target_diagnosis": stats["target_diagnosis"],
         "analysis_files": {key: _rel(root, value) for key, value in files.items()},
         "method_note": "本报告基于 query 文本采样后的 LLM 开放式品牌抽取；SOV 主口径为品牌命中事件份额，不等同于市场份额。",
@@ -454,7 +539,7 @@ def _analyze_job_bundle_unlocked(
     analysis_status = "analyzed_partial" if data_quality.get("conclusion_strength") == "observational" or error_rows else "analyzed"
     update_job_manifest(root, status=analysis_status)
     if not keep_work:
-        _cleanup_job_bundle_unlocked(root)
+        cleanup_job_work_dir_unlocked(root)
     return {"bundle_dir": str(root), "analysis_dir": str(result), "report_dir": str(result), **summary}
 
 
@@ -744,6 +829,150 @@ def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: li
     }
 
 
+def build_fact_rows(
+    *,
+    manifest: dict[str, Any],
+    raw_records: list[dict[str, Any]],
+    terminal_records: list[dict[str, Any]],
+    stats_records: list[dict[str, Any]],
+    mentions: list[dict[str, Any]],
+    data_quality: dict[str, Any],
+    sample_mode: str,
+) -> dict[str, list[dict[str, Any]]]:
+    job_id = str(manifest.get("job_id") or "")
+    expected_repeats = int(manifest.get("repeats") or 1)
+    stats_keys = {key for record in stats_records if (key := safe_result_key(record)) is not None}
+    terminal_by_key = {key: record for record in terminal_records if (key := safe_result_key(record)) is not None}
+    valid_statuses = {"mock"} if sample_mode == "mock" else {"success"}
+
+    attempt_facts = []
+    for key, record in sorted(terminal_by_key.items()):
+        status = str(record.get("status") or "")
+        attempt_facts.append({
+            "job_id": job_id,
+            "query_id": key[0],
+            "repeat_index": key[1],
+            "latest_status": status,
+            "completed_at": record.get("completed_at", ""),
+            "valid_attempt": int(status in valid_statuses),
+            "stats_included": int(key in stats_keys),
+            "web_search_requirement_status": record.get("web_search_requirement_status", ""),
+            "web_search_evidence": record.get("web_search_evidence", ""),
+            "source_parse_status": record.get("source_parse_status", ""),
+            "request_hash": canonical_request_hash(record) or "",
+            "attempt_id": record.get("attempt_id", ""),
+        })
+
+    query_facts = []
+    for query in manifest.get("queries", []):
+        qid = str(query.get("query_id") or "")
+        query_keys = [(qid, repeat) for repeat in range(1, expected_repeats + 1)]
+        latest_terminal_attempts = sum(1 for key in query_keys if key in terminal_by_key)
+        completed_attempts = sum(1 for key in query_keys if str((terminal_by_key.get(key) or {}).get("status") or "") in valid_statuses)
+        stats_included_attempts = sum(1 for key in query_keys if key in stats_keys)
+        latest_failed_attempts = sum(1 for key in query_keys if str((terminal_by_key.get(key) or {}).get("status") or "") == "error")
+        meta = {key: value for key, value in query.items() if key not in {"query_id", "query"} and value not in (None, "")}
+        query_facts.append({
+            "job_id": job_id,
+            "query_id": qid,
+            "query": query.get("query", ""),
+            "planned_attempts": expected_repeats,
+            "latest_terminal_attempts": latest_terminal_attempts,
+            "completed_attempts": completed_attempts,
+            "valid_attempts": completed_attempts,
+            "stats_included_attempts": stats_included_attempts,
+            "latest_failed_attempts": latest_failed_attempts,
+            "sample_completeness": _pct(latest_terminal_attempts / (expected_repeats or 1)),
+            "usable_sample_rate": _pct(stats_included_attempts / (expected_repeats or 1)),
+            "query_metadata_json": json.dumps(meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        })
+
+    target_keys = {normalize_brand_name(str(manifest.get("target_brand") or ""))}
+    target_keys.update(normalize_brand_name(alias) for alias in manifest.get("target_aliases", []) if alias)
+    brand_events: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for row in mentions:
+        if not _is_brand_sov_candidate(row):
+            continue
+        qid = str(row.get("query_id") or "")
+        repeat_index = int(row.get("repeat_index") or 1)
+        canonical = str(row.get("brand_name_canonical") or row.get("brand_name_raw") or "")
+        key = (canonical, qid, repeat_index)
+        event = brand_events.setdefault(
+            key,
+            {
+                "job_id": job_id,
+                "query_id": qid,
+                "repeat_index": repeat_index,
+                "brand_name_canonical": canonical,
+                "raw_names": set(),
+                "recommended": False,
+                "rank_positions": [],
+                "sentiments": Counter(),
+                "confidences": [],
+                "evidence": "",
+                "stats_included": int((qid, repeat_index) in stats_keys),
+            },
+        )
+        event["raw_names"].add(str(row.get("brand_name_raw") or canonical))
+        if _as_bool(row.get("is_recommended")) or str(row.get("role") or "").lower() == "recommended":
+            event["recommended"] = True
+        rank = _as_positive_int(row.get("rank_position"))
+        if rank is not None:
+            event["rank_positions"].append(rank)
+        sentiment = str(row.get("sentiment") or "unknown").lower()
+        event["sentiments"][sentiment if sentiment in {"positive", "neutral", "negative", "unknown"} else "unknown"] += 1
+        if isinstance(row.get("confidence"), (int, float)):
+            event["confidences"].append(float(row["confidence"]))
+        if not event["evidence"] and row.get("evidence"):
+            event["evidence"] = str(row.get("evidence") or "")
+
+    brand_attempt_facts = []
+    for event in brand_events.values():
+        raw_names = sorted(event["raw_names"])
+        brand_keys = {normalize_brand_name(event["brand_name_canonical"]), *{normalize_brand_name(name) for name in raw_names}}
+        brand_attempt_facts.append({
+            "job_id": job_id,
+            "query_id": event["query_id"],
+            "repeat_index": event["repeat_index"],
+            "brand_name_canonical": event["brand_name_canonical"],
+            "brand_name_raw": " | ".join(raw_names),
+            "is_target_brand": int(bool(target_keys & brand_keys)),
+            "sov_eligible": True,
+            "is_recommended": int(bool(event["recommended"])),
+            "rank_position": min(event["rank_positions"]) if event["rank_positions"] else "",
+            "sentiment": _dominant_sentiment(event["sentiments"]),
+            "confidence": round(max(event["confidences"]), 3) if event["confidences"] else "",
+            "evidence": event["evidence"],
+            "stats_included": event["stats_included"],
+        })
+
+    quality_summary = [{
+        "job_id": job_id,
+        "sample_mode": sample_mode,
+        "conclusion_strength": data_quality.get("conclusion_strength", ""),
+        "partial_sample": bool(data_quality.get("partial_sample")),
+        "planned_units": data_quality.get("planned_units", 0),
+        "analysis_record_count": data_quality.get("analysis_record_count", 0),
+        "stats_record_count": data_quality.get("stats_record_count", 0),
+        "missing_unit_count": len(data_quality.get("missing_units", [])),
+        "latest_failed_unit_count": len(data_quality.get("latest_failed_units", [])),
+        "web_search_quality_flag_count": len(data_quality.get("web_search_quality_flags", [])),
+        "source_quality_flag_count": len(data_quality.get("source_quality_flags", [])),
+        "extraction_error_record_count": data_quality.get("extraction_error_record_count", 0),
+        "extraction_error_rate": data_quality.get("extraction_error_rate", "0.0%"),
+    }]
+
+    return {
+        "quality_summary": quality_summary,
+        "attempt_facts": attempt_facts,
+        "query_facts": query_facts,
+        "brand_attempt_facts": sorted(
+            brand_attempt_facts,
+            key=lambda row: (str(row["query_id"]), int(row["repeat_index"]), str(row["brand_name_canonical"])),
+        ),
+    }
+
+
 def write_job_analysis_files(
     *,
     root: Path,
@@ -755,6 +984,7 @@ def write_job_analysis_files(
     canonical_map: dict[str, str],
     stats: dict[str, Any],
     source_stats: dict[str, Any],
+    facts: dict[str, list[dict[str, Any]]],
     data_quality: dict[str, Any],
 ) -> dict[str, Path]:
     work.mkdir(parents=True, exist_ok=True)
@@ -780,6 +1010,10 @@ def write_job_analysis_files(
         "source_domains": result / "source_domains.csv",
         "source_urls": result / "source_urls.csv",
         "source_by_query": result / "source_by_query.csv",
+        "quality_summary": result / "quality_summary.csv",
+        "attempt_facts": result / "attempt_facts.csv",
+        "query_facts": result / "query_facts.csv",
+        "brand_attempt_facts": result / "brand_attempt_facts.csv",
     }
     write_jsonl(files["extraction_errors_jsonl"], errors)
     write_jsonl(files["raw_read_errors_jsonl"], data_quality.get("raw_read_errors", []))
@@ -795,6 +1029,10 @@ def write_job_analysis_files(
     _write_csv(files["source_domains"], source_stats["source_domains"], schema="source_domains")
     _write_csv(files["source_urls"], source_stats["source_urls"], schema="source_urls")
     _write_csv(files["source_by_query"], source_stats["source_by_query"], schema="source_by_query")
+    _write_csv(files["quality_summary"], facts["quality_summary"], schema="quality_summary")
+    _write_csv(files["attempt_facts"], facts["attempt_facts"], schema="attempt_facts")
+    _write_csv(files["query_facts"], facts["query_facts"], schema="query_facts")
+    _write_csv(files["brand_attempt_facts"], facts["brand_attempt_facts"], schema="brand_attempt_facts")
     return files
 
 
@@ -1015,6 +1253,12 @@ def evaluate_data_quality(
     missing_unknown_units_count = 0
     if manifest.get("_query_universe_incomplete"):
         missing_unknown_units_count = int(manifest.get("_missing_unknown_query_count") or 0) * int(manifest["repeats"])
+    latest_terminal = latest_terminal_records(raw_records)
+    latest_failed_units = [
+        {"query_id": key[0], "repeat_index": key[1], "status": str(record.get("status") or ""), "error": _record_error_message(record)}
+        for record in latest_terminal
+        if (key := safe_result_key(record)) is not None and record.get("status") == "error"
+    ]
     actual_units = {key for record in analysis_records if (key := safe_result_key(record)) is not None}
     manifest_ids = {str(query["query_id"]) for query in manifest["queries"]}
     manifest_queries = {str(query["query_id"]): str(query["query"]) for query in manifest["queries"]}
@@ -1049,9 +1293,10 @@ def evaluate_data_quality(
     missing_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(expected_units - actual_units)]
     extra_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(actual_units - expected_units)]
     extra_query_ids = sorted({qid for qid, _, _ in raw_units if qid not in manifest_ids and qid != "None"})
-    web_search_quality_flags = _web_search_quality_flags(analysis_records)
-    source_quality_flags = _source_quality_flags(analysis_records)
-    partial = bool(missing_units or missing_unknown_units_count or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches or web_search_quality_flags or source_quality_flags)
+    profile_quality_flags = _profile_quality_flags(manifest)
+    web_search_quality_flags = _web_search_quality_flags(analysis_records, manifest)
+    source_quality_flags = _source_quality_flags(analysis_records, manifest)
+    partial = bool(latest_failed_units or missing_units or missing_unknown_units_count or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches or profile_quality_flags or web_search_quality_flags or source_quality_flags)
     conclusion_strength = "observational" if partial else "strong"
     result = {
         "planned_units": len(expected_units) + missing_unknown_units_count,
@@ -1062,10 +1307,12 @@ def evaluate_data_quality(
         "missing_units": missing_units,
         "extra_units": extra_units,
         "extra_query_ids": extra_query_ids,
+        "latest_failed_units": latest_failed_units,
         "duplicate_units": duplicate_units,
         "invalid_records": invalid_records,
         "contract_mismatches": contract_mismatches,
         "superseded_contract_mismatches": superseded_contract_mismatches,
+        "profile_quality_flags": profile_quality_flags,
         "web_search_quality_flags": web_search_quality_flags,
         "source_quality_flags": source_quality_flags,
         "raw_read_errors": raw_read_errors,
@@ -1089,13 +1336,46 @@ def _record_attempt_signature(record: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _web_search_quality_flags(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _record_error_message(record: dict[str, Any]) -> str:
+    error = record.get("error") if isinstance(record.get("error"), dict) else {}
+    return str(error.get("message") or error.get("type") or "")
+
+
+def _profile_quality_flags(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    flags = []
+    for name in ["sampling_profile", "analysis_profile", "comparability_profile"]:
+        profile = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+        if profile.get("inferred_from_legacy"):
+            flags.append({"type": "inferred_from_legacy", "profile": name, "status": "observational"})
+    return flags
+
+
+def _web_search_quality_flags(records: list[dict[str, Any]], manifest: dict[str, Any]) -> list[dict[str, Any]]:
     flags: list[dict[str, Any]] = []
+    manifest_profile = manifest.get("sampling_profile") if isinstance(manifest.get("sampling_profile"), dict) else {}
     for record in records:
+        sampling_profile = record.get("sampling_profile") if isinstance(record.get("sampling_profile"), dict) else manifest_profile
+        required = bool(sampling_profile.get("web_search_required", manifest_profile.get("web_search_required", True)))
         status = record.get("web_search_requirement_status")
         if status in (None, ""):
+            if required:
+                flags.append({
+                    "query_id": record.get("query_id", ""),
+                    "repeat_index": record.get("repeat_index", 1),
+                    "status": "not_verifiable",
+                    "evidence": record.get("web_search_evidence", ""),
+                    "reason": "missing_web_search_requirement_status",
+                })
             continue
         if status in {"satisfied", "not_applicable"}:
+            if required and status == "satisfied" and not record.get("web_search_evidence"):
+                flags.append({
+                    "query_id": record.get("query_id", ""),
+                    "repeat_index": record.get("repeat_index", 1),
+                    "status": "not_verifiable",
+                    "evidence": "",
+                    "reason": "missing_web_search_evidence",
+                })
             continue
         flags.append({
             "query_id": record.get("query_id", ""),
@@ -1106,11 +1386,21 @@ def _web_search_quality_flags(records: list[dict[str, Any]]) -> list[dict[str, A
     return flags
 
 
-def _source_quality_flags(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _source_quality_flags(records: list[dict[str, Any]], manifest: dict[str, Any]) -> list[dict[str, Any]]:
     flags: list[dict[str, Any]] = []
+    manifest_profile = manifest.get("sampling_profile") if isinstance(manifest.get("sampling_profile"), dict) else {}
     for record in records:
+        sampling_profile = record.get("sampling_profile") if isinstance(record.get("sampling_profile"), dict) else manifest_profile
+        source_grain = str(sampling_profile.get("source_grain") or manifest_profile.get("source_grain") or "unknown")
         status = record.get("source_parse_status")
         if status in (None, ""):
+            if source_grain == "url":
+                flags.append({
+                    "query_id": record.get("query_id", ""),
+                    "repeat_index": record.get("repeat_index", 1),
+                    "status": "missing",
+                    "reason": "missing_source_parse_status",
+                })
             continue
         if status in {"parsed", "provider_returned_empty", "unsupported_by_protocol", "not_applicable"}:
             continue

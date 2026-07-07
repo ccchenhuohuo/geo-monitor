@@ -3,13 +3,26 @@ from pathlib import Path
 import pytest
 
 from geo_monitor.config import Settings
+from geo_monitor.adapters import build_sampling_profile, get_adapter
 from geo_monitor.dataset import load_queries
 from geo_monitor.exporters import append_jsonl, read_jsonl
+from geo_monitor.request_fingerprint import REQUEST_FINGERPRINT_VERSION
 from geo_monitor.runner import MonitorRunner, compute_request_hash
 from geo_monitor.schemas import MonitorResult
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _patch_live_client(monkeypatch, client):
+    class Factory:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def create(self):
+            return client
+
+    monkeypatch.setattr("geo_monitor.runner.OpenAICompatibleClientFactory", Factory)
 
 
 def test_mock_repeats_create_expected_units(tmp_path):
@@ -51,14 +64,14 @@ def test_runner_attempt_contract_for_all_statuses(tmp_path, monkeypatch):
         def create_response(self, payload):
             return {"status": "completed", "output_text": "ok", "usage": {}}
 
-    monkeypatch.setattr("geo_monitor.runner.LLMResponsesClient", lambda settings: SuccessClient())
+    _patch_live_client(monkeypatch, SuccessClient())
     runner.run(queries[:1], output_path=tmp_path / "success.jsonl", repeats=1, run_id="success")
 
     class ErrorClient:
         def create_response(self, payload):
             return {"status": "completed", "output_text": "", "usage": {}}
 
-    monkeypatch.setattr("geo_monitor.runner.LLMResponsesClient", lambda settings: ErrorClient())
+    _patch_live_client(monkeypatch, ErrorClient())
     runner.run(queries[:1], output_path=tmp_path / "error.jsonl", repeats=1, run_id="error")
 
     rows = []
@@ -163,6 +176,52 @@ def test_resume_reruns_when_request_hash_changes(tmp_path):
     assert rows[-1]["model"] == "new-model"
 
 
+def test_resume_recomputes_fingerprint_before_trusting_stored_hash(tmp_path):
+    settings = Settings(llm_api_key=None)
+    queries = load_queries(FIXTURES / "queries.small.csv")
+    out = tmp_path / "basis_mismatch_resume.jsonl"
+    runner = MonitorRunner(settings)
+    adapter = get_adapter("openai_responses_web_search")
+    old_profile = build_sampling_profile(
+        adapter_name="openai_responses_web_search",
+        model="old-model",
+        settings=settings,
+        web_search_limit=settings.web_search_limit,
+    )
+    new_profile = build_sampling_profile(
+        adapter_name="openai_responses_web_search",
+        model=settings.llm_model,
+        settings=settings,
+        web_search_limit=settings.web_search_limit,
+    )
+    old_request = adapter.build_request(queries[0], old_profile, settings, {})
+    new_request = adapter.build_request(queries[0], new_profile, settings, {})
+    old_success = MonitorResult(
+        run_id="old",
+        query_id=queries[0].query_id,
+        repeat_index=1,
+        repeat_total=1,
+        request_hash=new_request.request_hash,
+        request_fingerprint_version=REQUEST_FINGERPRINT_VERSION,
+        request_fingerprint_basis=old_request.request_fingerprint_basis,
+        model="old-model",
+        input_query=queries[0].query,
+        status="success",
+        response_text="old success",
+        raw_request=old_request.payload,
+        raw_response={"status": "completed", "output_text": "old success"},
+        started_at="2026-01-01T00:00:00+00:00",
+        completed_at="2026-01-01T00:00:01+00:00",
+    )
+    append_jsonl(out, old_success)
+
+    with pytest.warns(RuntimeWarning, match="request_hash changed"):
+        results = runner.run(queries[:1], output_path=out, mock=True, repeats=1, run_id="new", resume=True)
+
+    assert len(results) == 1
+    assert len(read_jsonl(out)) == 2
+
+
 def test_resume_ignores_malformed_jsonl_tail(tmp_path):
     queries = load_queries(Path("tests/fixtures/queries.small.csv"))
     out = tmp_path / "broken_tail.jsonl"
@@ -241,7 +300,7 @@ def test_empty_live_response_becomes_error(tmp_path, monkeypatch):
         def create_response(self, payload):
             return {"status": "completed", "output_text": "", "usage": {}}
 
-    monkeypatch.setattr("geo_monitor.runner.LLMResponsesClient", lambda settings: DummyClient())
+    _patch_live_client(monkeypatch, DummyClient())
     results = runner.run(queries[:1], output_path=out, repeats=1, run_id="live_test")
     assert len(results) == 1
     assert results[0].status == "error"
