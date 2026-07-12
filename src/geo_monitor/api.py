@@ -95,9 +95,10 @@ def run_geo_monitor(
     resume: bool = True,
     keep_work: bool = False,
     refresh_extraction_cache: bool = False,
-    build_db: bool = True,
+    build_db: bool = False,
     build_dashboard: bool = False,
-    write_aggregates: bool = True,
+    write_aggregates: bool = False,
+    report_formats: tuple[str, ...] = ("markdown", "pdf"),
     settings: Settings | None = None,
 ) -> GeoMonitorResult:
     if bundle_dir is None and config_path is None:
@@ -178,6 +179,7 @@ def run_geo_monitor(
             keep_work=keep_work,
             refresh_extraction_cache=refresh_extraction_cache,
             write_aggregates=write_aggregates,
+            report_formats=report_formats,
             settings=settings,
         )
     final_manifest = load_job_manifest(bundle["bundle_dir"])
@@ -201,6 +203,12 @@ def run_geo_monitor(
         {
             key: str(Path(value) if Path(value).is_absolute() else bundle_dir / str(value))
             for key, value in (analysis_result.get("analysis_files") or {}).items()
+        }
+    )
+    artifact_paths.update(
+        {
+            f"report_{key}": str(Path(value) if Path(value).is_absolute() else bundle_dir / str(value))
+            for key, value in (analysis_result.get("report_files") or {}).items()
         }
     )
     return GeoMonitorResult(

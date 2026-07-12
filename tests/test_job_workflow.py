@@ -1383,8 +1383,8 @@ def test_analyze_job_computes_sov_and_upserts_cross_job_aggregates(tmp_path):
             }
         ], None
 
-    first = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
-    second = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+    first = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor, write_aggregates=True)
+    second = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor, write_aggregates=True)
 
     target = next(row for row in second["brand_summary"] if row["brand_name_canonical"] == "TestAEntity")
     assert target["sov_response_share"] == "50.0%"
@@ -1440,7 +1440,7 @@ def test_cross_job_brand_trends_has_stable_header_when_no_brands(tmp_path):
     def extractor(record):
         return [], None
 
-    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
+    analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor, write_aggregates=True)
 
     header = (runs_root / "aggregate" / "brand_trends.csv").read_text(encoding="utf-8-sig").splitlines()[0]
     assert "job_id" in header

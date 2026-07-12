@@ -9,7 +9,8 @@ from geo_monitor.config import Settings
 from geo_monitor.dashboard import DashboardError, build_dashboard
 from geo_monitor.dataset import DatasetError, load_queries
 from geo_monitor.fanout import FanoutError, build_query_manifest
-from geo_monitor.reporting import build_html, markdown_text
+from geo_monitor.renderers import render_html
+from geo_monitor.report_model import ReportModel, ReportSection, paragraph
 from geo_monitor.response_parser import parse_response
 
 
@@ -122,10 +123,17 @@ def test_source_urls_are_canonicalized_and_tracking_variants_deduplicated():
     assert sources[0].raw["url"] == first
 
 
-def test_html_renderer_does_not_double_escape_safe_markdown_entities():
-    escaped = markdown_text("<script>alert('x')</script> & copy")
+def test_html_renderer_escapes_report_model_text_once():
+    model = ReportModel(
+        title="Report",
+        job_id="j1",
+        generated_at="2026-01-01T00:00:00Z",
+        sample_mode="live",
+        conclusion_strength="strong",
+        sections=(ReportSection(key="summary", title="Summary", blocks=(paragraph("<script>alert('x')</script> & copy"),)),),
+    )
 
-    rendered = build_html(f"# Report\n\n{escaped}", {"title": "Report"})
+    rendered = render_html(model)
 
     assert "<script>" not in rendered
     assert "&amp;lt;script&amp;gt;" not in rendered

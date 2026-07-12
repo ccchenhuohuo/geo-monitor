@@ -203,7 +203,8 @@ def analyze_job_command(
     include_mock: bool = typer.Option(False, "--include-mock", help="允许 mock 样本进入 demo 分析，报告会标注非 live 结论"),
     confirm_cost: bool = typer.Option(False, "--confirm-cost", help="确认执行分析阶段 LLM 抽取请求预算"),
     refresh_extraction_cache: bool = typer.Option(False, "--refresh-extraction-cache", help="忽略已有抽取/归一化缓存并重新执行分析抽取"),
-    aggregate: bool = typer.Option(True, "--aggregate/--no-aggregate", help="是否更新 runs/index.jsonl 和 runs/aggregate/* 跨 job 聚合"),
+    aggregate: bool = typer.Option(False, "--aggregate/--no-aggregate", help="显式更新跨 Run 聚合；单次报告默认关闭"),
+    html_report: bool = typer.Option(False, "--html-report", help="额外生成静态 report.html；Markdown/PDF 始终生成"),
 ) -> None:
     try:
         estimate = estimate_job_analysis(bundle_dir, include_mock=include_mock, refresh_extraction_cache=refresh_extraction_cache)
@@ -223,10 +224,14 @@ def analyze_job_command(
             confirm_cost=confirm_cost,
             refresh_extraction_cache=refresh_extraction_cache,
             write_aggregates=aggregate,
+            report_formats=("markdown", "pdf", "html") if html_report else ("markdown", "pdf"),
         )
     except (LLMClientError, DatasetError, JobError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    console.print(f"[green]开放式品牌发现分析完成：{result['report_dir']}[/green]")
+    console.print(
+        f"[green]分析报告已生成：{result['report_files']['markdown']}；"
+        f"PDF：{result['report_files']['pdf']}[/green]"
+    )
 
 
 @app.command("cleanup-job")

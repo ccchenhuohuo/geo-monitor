@@ -26,6 +26,24 @@ INTELLIGENCE_MODULES = {
     "trends.py",
 }
 
+ANALYSIS_MODULES = {
+    "__init__.py",
+    "contracts.py",
+    "history.py",
+    "orchestrator.py",
+    "pipeline.py",
+}
+
+REPORT_MODULES = {
+    "geo_monitor/report_builder.py",
+    "geo_monitor/report_model.py",
+    "geo_monitor/reporting.py",
+    "geo_monitor/renderers/__init__.py",
+    "geo_monitor/renderers/html.py",
+    "geo_monitor/renderers/markdown.py",
+    "geo_monitor/renderers/pdf.py",
+}
+
 WHEEL_RESOURCES = {
     "geo_monitor/data/job_config.schema.json",
     "geo_monitor/docs/README.zh-CN.md",
@@ -73,6 +91,19 @@ def _assert_wheel(wheel: Path) -> None:
         missing = sorted(WHEEL_RESOURCES - names)
         if missing:
             raise AssertionError(f"wheel missing resources: {', '.join(missing)}")
+        missing_report_modules = sorted(REPORT_MODULES - names)
+        if missing_report_modules:
+            raise AssertionError(f"wheel missing report modules: {', '.join(missing_report_modules)}")
+
+        analysis_prefix = "geo_monitor/analysis/"
+        analysis_modules = {
+            name.removeprefix(analysis_prefix)
+            for name in names
+            if name.startswith(analysis_prefix) and "/" not in name.removeprefix(analysis_prefix)
+        }
+        missing_analysis_modules = sorted(ANALYSIS_MODULES - analysis_modules)
+        if missing_analysis_modules:
+            raise AssertionError(f"wheel missing analysis modules: {', '.join(missing_analysis_modules)}")
 
         intelligence_prefix = "geo_monitor/analysis/intelligence/"
         modules = {name.removeprefix(intelligence_prefix) for name in names if name.startswith(intelligence_prefix) and name.endswith(".py")}
@@ -89,6 +120,8 @@ def _assert_wheel(wheel: Path) -> None:
             raise AssertionError("wheel metadata does not declare Python >=3.11")
         if not re.search(r"^Requires-Dist: openai.*>=1\.66\.0", metadata, re.MULTILINE):
             raise AssertionError("wheel metadata does not retain the OpenAI SDK >=1.66.0 floor")
+        if not re.search(r"^Requires-Dist: reportlab.*>=4\.2\.0", metadata, re.MULTILINE | re.IGNORECASE):
+            raise AssertionError("wheel metadata does not declare ReportLab as a core dependency")
         if not any(name.endswith(".dist-info/licenses/LICENSE") for name in names):
             raise AssertionError("wheel is missing the declared license file")
 
@@ -105,6 +138,18 @@ def _assert_sdist(sdist: Path) -> None:
     missing = sorted(SDIST_RESOURCES - names)
     if missing:
         raise AssertionError(f"sdist missing resources: {', '.join(missing)}")
+    missing_report_modules = sorted({f"src/{name}" for name in REPORT_MODULES} - names)
+    if missing_report_modules:
+        raise AssertionError(f"sdist missing report modules: {', '.join(missing_report_modules)}")
+    analysis_prefix = "src/geo_monitor/analysis/"
+    analysis_modules = {
+        name.removeprefix(analysis_prefix)
+        for name in names
+        if name.startswith(analysis_prefix) and "/" not in name.removeprefix(analysis_prefix)
+    }
+    missing_analysis_modules = sorted(ANALYSIS_MODULES - analysis_modules)
+    if missing_analysis_modules:
+        raise AssertionError(f"sdist missing analysis modules: {', '.join(missing_analysis_modules)}")
     intelligence_prefix = "src/geo_monitor/analysis/intelligence/"
     modules = {name.removeprefix(intelligence_prefix) for name in names if name.startswith(intelligence_prefix) and name.endswith(".py")}
     missing_modules = sorted(INTELLIGENCE_MODULES - modules)

@@ -613,7 +613,9 @@ def _ingest_run(con: Any, run_dir: Path, fallback_rows: dict[str, dict[str, str]
             str(run_dir / "result"),
         )
         counts["quality_flags"] += 1
-    report_path = run_dir / "result" / "report.html"
+    pdf_report = run_dir / "result" / "report.pdf"
+    markdown_report = run_dir / "result" / "report.md"
+    report_path = pdf_report if pdf_report.exists() else markdown_report
     completed_at = _completed_at(run_dir, attempts)
     inferred_from_legacy = bool(
         sampling_profile.get("inferred_from_legacy") or analysis_profile.get("inferred_from_legacy") or comparability_profile.get("inferred_from_legacy")

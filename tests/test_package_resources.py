@@ -48,3 +48,11 @@ def test_intelligence_subpackage_is_part_of_the_distribution():
         "trends.py",
     }
     assert expected <= {item.name for item in root.iterdir() if item.is_file()}
+
+
+def test_report_renderers_are_part_of_the_distribution():
+    root = files("geo_monitor.renderers")
+
+    assert {"__init__.py", "html.py", "markdown.py", "pdf.py"} <= {
+        item.name for item in root.iterdir() if item.is_file()
+    }

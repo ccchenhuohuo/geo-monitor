@@ -129,15 +129,18 @@ jobs:
           python -m venv /tmp/geo-monitor-wheel-smoke
           /tmp/geo-monitor-wheel-smoke/bin/python -m pip install dist/*.whl
 
-      - name: Smoke test installed CLI, API, resources, and intelligence package
+      - name: Smoke test installed CLI, API, resources, intelligence, and reports
         run: |
           /tmp/geo-monitor-wheel-smoke/bin/geo-monitor --help
           cd /tmp
           /tmp/geo-monitor-wheel-smoke/bin/python - <<'PY'
           from importlib import resources
+          from pathlib import Path
 
           from geo_monitor import run_geo_monitor
           from geo_monitor.analysis.intelligence import INTELLIGENCE_SCHEMA_VERSION
+          from geo_monitor.report_model import REPORT_MODEL_SCHEMA_VERSION
+          from geo_monitor.reporting import render_report_bundle
 
           assert callable(run_geo_monitor)
           assert INTELLIGENCE_SCHEMA_VERSION == "geo-intelligence-v1"
@@ -152,6 +155,20 @@ jobs:
           for package, name in checks:
               content = resources.files(package).joinpath(name).read_text(encoding="utf-8")
               assert content.strip(), f"empty package resource: {package}/{name}"
+
+          model, reports = render_report_bundle(
+              {
+                  "title": "wheel smoke",
+                  "job_id": "wheel-smoke",
+                  "sample_mode": "mock",
+                  "success_record_count": 0,
+                  "data_quality": {"conclusion_strength": "observational"},
+              },
+              Path("/tmp/geo-monitor-wheel-report"),
+          )
+          assert model.schema_version == REPORT_MODEL_SCHEMA_VERSION
+          assert reports["markdown"].read_text(encoding="utf-8").startswith("# wheel smoke")
+          assert reports["pdf"].read_bytes().startswith(b"%PDF-")
           PY
 
   # This network-backed dependency check is isolated from deterministic tests so
