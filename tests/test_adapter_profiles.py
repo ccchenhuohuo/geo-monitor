@@ -21,8 +21,23 @@ def test_openai_responses_payload_omits_legacy_limit_and_requires_search():
     assert request.payload["tools"] == [{"type": "web_search"}]
     assert "limit" not in request.payload["tools"][0]
     assert request.payload["tool_choice"] == "required"
-    assert request.payload["include"] == ["web_search_call.action.sources"]
+    assert "include" not in request.payload
     assert request.legacy_request_hashes
+
+
+def test_openai_responses_preserves_explicit_provider_specific_include():
+    settings = Settings(llm_api_key=None, llm_base_url="https://api.openai.com/v1")
+    adapter = get_adapter("openai_responses_web_search")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="gpt-5.5", settings=settings)
+
+    request = adapter.build_request(
+        QueryRecord(query_id="q001", query="best providers"),
+        profile,
+        settings,
+        {"include": ["web_search_call.action.sources"]},
+    )
+
+    assert request.payload["include"] == ["web_search_call.action.sources"]
 
 
 @pytest.mark.parametrize("tool_choice", ["auto", "none"])
@@ -124,6 +139,87 @@ def test_doubao_responses_rejects_reserved_web_search_option_type():
 
     with pytest.raises(ValueError, match="保留字段"):
         adapter.build_request(QueryRecord(query_id="q001", query="best providers"), profile, settings, {"web_search_options": {"type": "none"}})
+
+
+@pytest.mark.parametrize(
+    ("adapter_name", "model"),
+    [
+        ("openai_responses_web_search", "gpt-5.5"),
+        ("doubao_responses_web_search", "doubao-test"),
+        ("qwen_responses_web_search_basic", "qwen3.7-plus"),
+    ],
+)
+@pytest.mark.parametrize("include", ["web_search_call.action.sources", ["valid", 3], {"bad": "shape"}])
+def test_responses_adapters_reject_invalid_include_shapes(adapter_name, model, include):
+    settings = Settings(llm_api_key=None, llm_base_url="https://provider.example/v1")
+    adapter = get_adapter(adapter_name)
+    profile = build_sampling_profile(adapter_name=adapter.name, model=model, settings=settings)
+
+    with pytest.raises(ValueError, match="include.*字符串数组"):
+        adapter.build_request(
+            QueryRecord(query_id="q001", query="best providers"),
+            profile,
+            settings,
+            {"include": include},
+        )
+
+
+@pytest.mark.parametrize("adapter_name", ["openai_responses_web_search", "doubao_responses_web_search"])
+@pytest.mark.parametrize(
+    "tool_choice",
+    ["require", "web_search", {"type": "web_search", "extra": True}, {"type": "web-search"}, 1],
+)
+def test_forced_search_adapters_reject_tool_choice_typos_and_extra_fields(adapter_name, tool_choice):
+    settings = Settings(llm_api_key=None, llm_base_url="https://provider.example/v1")
+    adapter = get_adapter(adapter_name)
+    model = "gpt-5.5" if adapter_name.startswith("openai") else "doubao-test"
+    profile = build_sampling_profile(adapter_name=adapter.name, model=model, settings=settings)
+
+    with pytest.raises(ValueError, match="tool_choice"):
+        adapter.build_request(
+            QueryRecord(query_id="q001", query="best providers"),
+            profile,
+            settings,
+            {"tool_choice": tool_choice},
+        )
+
+
+@pytest.mark.parametrize(
+    ("adapter_name", "model"),
+    [
+        ("openai_responses_web_search", "gpt-5.5"),
+        ("doubao_responses_web_search", "doubao-test"),
+        ("qwen_responses_web_search_basic", "qwen3.7-plus"),
+    ],
+)
+@pytest.mark.parametrize("max_tool_calls", [0, 11, True, 1.5, "many"])
+def test_responses_adapters_bound_max_tool_calls(adapter_name, model, max_tool_calls):
+    settings = Settings(llm_api_key=None, llm_base_url="https://provider.example/v1")
+    adapter = get_adapter(adapter_name)
+    profile = build_sampling_profile(adapter_name=adapter.name, model=model, settings=settings)
+
+    with pytest.raises(ValueError, match="max_tool_calls"):
+        adapter.build_request(
+            QueryRecord(query_id="q001", query="best providers"),
+            profile,
+            settings,
+            {"max_tool_calls": max_tool_calls},
+        )
+
+
+def test_qwen_responses_preserves_valid_include_list():
+    settings = Settings(llm_api_key=None, llm_base_url="https://provider.example/v1")
+    adapter = get_adapter("qwen_responses_web_search_basic")
+    profile = build_sampling_profile(adapter_name=adapter.name, model="qwen3.7-plus", settings=settings)
+
+    request = adapter.build_request(
+        QueryRecord(query_id="q001", query="best providers"),
+        profile,
+        settings,
+        {"include": ["web_search_call.action.sources"]},
+    )
+
+    assert request.payload["include"] == ["web_search_call.action.sources"]
 
 
 def test_adapter_options_fail_fast(tmp_path):
@@ -273,7 +369,7 @@ def test_duckdb_source_metrics_not_comparable_when_sources_are_empty(tmp_path):
         "select comparison_group_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts",
     )
 
-    assert rows == [(2, "strong", False)]
+    assert rows == [(2, "observational", False)]
 
 
 def test_duckdb_source_metrics_not_comparable_without_source_url_facts(tmp_path):
@@ -294,7 +390,7 @@ def test_duckdb_source_metrics_not_comparable_without_source_url_facts(tmp_path)
         "select comparison_group_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts",
     )
 
-    assert rows == [(2, "strong", False)]
+    assert rows == [(2, "observational", False)]
 
 
 def _build_and_run_mock_job(

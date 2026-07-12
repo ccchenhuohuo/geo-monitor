@@ -1,6 +1,7 @@
 {
   "target_brand": "ExampleBrand",
   "target_aliases": ["Example Brand"],
+  "owned_domains": ["example.com"],
   "industry": "ExampleIndustry",
   "market": "ExampleMarket",
   "queries": ["example fallback query"],

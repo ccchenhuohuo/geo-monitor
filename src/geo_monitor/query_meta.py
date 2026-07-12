@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-
 QUERY_META_SCHEMA_VERSION = "query-meta-v1"
 
 QUERY_META_FIRST_CLASS_FIELDS = {
@@ -92,11 +91,7 @@ def query_record_meta(query: Any) -> dict[str, str]:
             return default
         return str(item)
 
-    custom_metadata = {
-        key: value
-        for key, value in metadata.items()
-        if key not in QUERY_META_FIRST_CLASS_FIELDS and value not in (None, "")
-    }
+    custom_metadata = {key: value for key, value in metadata.items() if key not in QUERY_META_FIRST_CLASS_FIELDS and value not in (None, "")}
     return {
         "schema_version": QUERY_META_SCHEMA_VERSION,
         "variant_id": text("variant_id"),

@@ -1,12 +1,13 @@
-from __future__ import annotations
-
 """Stable public Python API for GEO Brand Monitor."""
+
+from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .config import Settings
 from .dashboard import build_dashboard as build_static_dashboard
 from .db import build_duckdb
 from .fanout import build_query_manifest
@@ -55,18 +56,28 @@ def resolve_study_paths(
     query_manifest_path: str | Path | None = None,
 ) -> StudyPaths:
     study = Path(study_dir) if study_dir is not None else None
+    runs = Path(runs_dir) if runs_dir is not None else (study / "runs" if study is not None else None)
+    database = (
+        Path(db_path) if db_path is not None else (study / "geo.duckdb" if study is not None else runs.parent / "geo.duckdb" if runs is not None else None)
+    )
+    dashboard = (
+        Path(dashboard_out)
+        if dashboard_out is not None
+        else (study / "dashboard" if study is not None else runs.parent / "dashboard" if runs is not None else None)
+    )
     return StudyPaths(
         study_dir=str(study) if study is not None else None,
-        runs_dir=str(Path(runs_dir) if runs_dir is not None else (study / "runs" if study is not None else "")) or None,
-        db_path=str(Path(db_path) if db_path is not None else (study / "geo.duckdb" if study is not None else "")) or None,
-        dashboard_out=str(Path(dashboard_out) if dashboard_out is not None else (study / "dashboard" if study is not None else "")) or None,
+        runs_dir=str(runs) if runs is not None else None,
+        db_path=str(database) if database is not None else None,
+        dashboard_out=str(dashboard) if dashboard is not None else None,
         query_manifest_path=str(Path(query_manifest_path)) if query_manifest_path is not None else None,
     )
 
 
 def run_geo_monitor(
     *,
-    config_path: str | Path,
+    config_path: str | Path | None = None,
+    bundle_dir: str | Path | None = None,
     study_dir: str | Path | None = None,
     runs_dir: str | Path | None = None,
     seed_prompts_path: str | Path | None = None,
@@ -87,14 +98,28 @@ def run_geo_monitor(
     build_db: bool = True,
     build_dashboard: bool = False,
     write_aggregates: bool = True,
+    settings: Settings | None = None,
 ) -> GeoMonitorResult:
+    if bundle_dir is None and config_path is None:
+        raise ValueError("run_geo_monitor 需要 config_path（新建任务）或 bundle_dir（续跑已有任务）")
+    if bundle_dir is not None and config_path is not None:
+        raise ValueError("config_path 与 bundle_dir 不能同时传入；续跑必须沿用已有 frozen manifest")
+    if bundle_dir is not None and seed_prompts_path is not None:
+        raise ValueError("续跑已有 bundle 时不能重新 fanout；请使用 bundle 内冻结的 query manifest")
+    if bundle_dir is not None and runs_dir is not None and Path(runs_dir).resolve() != Path(bundle_dir).parent.resolve():
+        raise ValueError("续跑已有 bundle 时 runs_dir 必须等于 bundle 的父目录，避免分析与 DuckDB 指向不同 study")
+    inferred_runs = runs_dir
+    if bundle_dir is not None and study_dir is None and runs_dir is None:
+        inferred_runs = Path(bundle_dir).parent
     paths = resolve_study_paths(
         study_dir=study_dir,
-        runs_dir=runs_dir,
+        runs_dir=inferred_runs,
         db_path=db_path,
         dashboard_out=dashboard_out,
         query_manifest_path=query_manifest_path,
     )
+    if bundle_dir is not None and (not paths.runs_dir or Path(paths.runs_dir).resolve() != Path(bundle_dir).parent.resolve()):
+        raise ValueError("续跑已有 bundle 时 study/runs 路径必须指向 bundle 的父目录")
     if not paths.runs_dir:
         raise ValueError("run_geo_monitor 需要 study_dir 或 runs_dir")
     if seed_prompts_path and not paths.query_manifest_path:
@@ -118,8 +143,21 @@ def run_geo_monitor(
             fanout_result = {**built, "action": "overwritten" if existed else "generated"}
         else:
             fanout_result = {"output": str(manifest_path), "action": "reused"}
-    bundle = build_job_bundle(config_path, runs_dir=paths.runs_dir, query_manifest_path=paths.query_manifest_path)
+    if bundle_dir is not None:
+        existing_bundle = Path(bundle_dir)
+        existing_manifest = load_job_manifest(existing_bundle)
+        bundle = {**existing_manifest, "bundle_dir": str(existing_bundle)}
+    else:
+        assert config_path is not None
+        bundle = build_job_bundle(
+            config_path,
+            runs_dir=paths.runs_dir,
+            query_manifest_path=paths.query_manifest_path,
+            settings=settings,
+        )
     only_query_ids = _normalize_only_query_id(only_query_id)
+    if only_query_id is not None and not only_query_ids:
+        raise ValueError("only_query_id 已提供但没有有效 ID；拒绝回退为全量执行")
     run_result = run_job_bundle(
         bundle["bundle_dir"],
         mock=mock,
@@ -127,7 +165,9 @@ def run_geo_monitor(
         confirm_cost=confirm_cost,
         limit=limit,
         only_query_ids=only_query_ids,
+        query_manifest_path=paths.query_manifest_path if bundle_dir is not None else None,
         resume=resume,
+        settings=settings,
     )
     analysis_result: dict[str, Any] = {}
     if not dry_run:
@@ -138,13 +178,14 @@ def run_geo_monitor(
             keep_work=keep_work,
             refresh_extraction_cache=refresh_extraction_cache,
             write_aggregates=write_aggregates,
+            settings=settings,
         )
     final_manifest = load_job_manifest(bundle["bundle_dir"])
     status = str(final_manifest.get("status") or ("dry_run" if dry_run else "ran"))
     db_result = None
     dashboard_result = None
     db_available = existing_db_available
-    if build_db and status.startswith("analyzed") and paths.db_path:
+    if build_db and not dry_run and status.startswith("analyzed") and paths.db_path:
         db_result = build_duckdb(paths.runs_dir, paths.db_path)
         db_available = True
     if build_dashboard and db_available and paths.dashboard_out and paths.db_path:
@@ -191,11 +232,13 @@ def _quality_flags_from_analysis(analysis_result: dict[str, Any]) -> list[dict[s
         return []
     flags: list[dict[str, Any]] = []
     if data_quality.get("partial_sample"):
-        flags.append({
-            "type": "partial_sample",
-            "message": "样本或抽取质量不足，结论强度已降级",
-            "conclusion_strength": data_quality.get("conclusion_strength", "observational"),
-        })
+        flags.append(
+            {
+                "type": "partial_sample",
+                "message": "样本或抽取质量不足，结论强度已降级",
+                "conclusion_strength": data_quality.get("conclusion_strength", "observational"),
+            }
+        )
     for key in ["missing_units", "extra_units", "duplicate_units", "contract_mismatches", "raw_read_errors", "invalid_records"]:
         values = data_quality.get(key)
         if isinstance(values, list) and values:

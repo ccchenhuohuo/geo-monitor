@@ -46,6 +46,13 @@ foundation for later intelligence scoring and DuckDB/dashboard views:
 Downstream recommendation, competitor, citation, or overview scores should be
 derived from these facts or DuckDB views, not directly from raw summary CSVs.
 
+Across intelligence tables, `planned_attempts` is the frozen-manifest
+denominator, `completed_attempts` is terminal work observed, `valid_attempts` is
+contract-valid work, and `eligible_attempts` / `stats_included_attempts` is the
+subset admitted to metrics. `sample_completeness` and `usable_sample_rate` must
+travel with every slice; they are not interchangeable with business scores.
+Missing or unobservable values are N/A (empty CSV / SQL `NULL`), not zero.
+
 ## Brand Summary
 
 Exported in `brand_summary.csv`, `sov_summary.csv`, and
@@ -105,7 +112,7 @@ Exported in `query_stability.csv`.
 | `successful_repeats` | Latest successful/mock repeats included in analysis | Query/repeat grain |
 | `expected_repeats` | Configured repeats | Query grain |
 | `sample_sufficient` | 1 when enough repeats exist for a basic stability read | `successful_repeats >= min(2, expected_repeats)` |
-| `brand_set_jaccard_avg` | Average pairwise Jaccard similarity | Non-empty brand sets across successful repeats |
+| `brand_set_jaccard_avg` | Average pairwise Jaccard similarity | All successful-repeat brand sets, including empty sets |
 | `unique_brand_sets` | Distinct canonical brand sets observed | Successful repeats |
 | `top_brands` | Most common canonical brands in repeat brand sets | Successful repeats |
 
@@ -161,3 +168,22 @@ Exported in `logs/data_quality.json` and summarized in
 hits, misses, and writes. Cache keys include response text hash, extraction
 schema version, model, and prompt version for extraction; canonicalization keys
 include sorted raw-name hash, model, and prompt version.
+
+## Intelligence Layer
+
+The issue-2 intelligence layer derives five explainable `0..100` overview
+scores—visibility, recommendation, competitor, source, and quality—from the
+facts above. Component breakdowns and denominators are retained. Quality stays
+independent from business scores, and source is N/A when citation evidence is
+not observable.
+
+Situation tables use equal-weight macro-by-query as the primary rate and expose
+micro-by-attempt only as a diagnostic. Recommendation types, pairwise
+competitor win/loss and replacement risk, canonical citation attribution,
+evidence-gated perception, adjacent-run trend/drift/volatility, and rule-based
+opportunity tables all retain trace IDs back to jobs, queries, and attempts.
+
+See [intelligence.md](intelligence.md) for the complete CSV catalog, formulas,
+N/A rules, eligibility gates, and DuckDB view contract. Provider request,
+retry, circuit-breaker, and resume semantics are defined in
+[providers.md](providers.md).

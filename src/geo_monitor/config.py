@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from functools import lru_cache
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 DEFAULT_LLM_BASE_URL = "https://api.example.com/v1"
 GEO_MONITOR_ENV_FILE = "GEO_MONITOR_ENV_FILE"
@@ -52,10 +51,68 @@ def live_endpoint_status(value: str | None) -> str:
         return "invalid"
     if is_placeholder_base_url(text):
         return "placeholder"
-    parsed = urlparse(text)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        parsed = urlparse(text)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
         return "invalid"
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
+        return "invalid"
+    if parsed.username or parsed.password or parsed.fragment:
+        return "invalid"
+    if parsed.scheme == "http":
+        return "insecure"
     return "configured"
+
+
+SENSITIVE_URL_QUERY_KEYS = {
+    "access_key",
+    "api-key",
+    "api_key",
+    "apikey",
+    "authorization",
+    "key",
+    "secret",
+    "signature",
+    "sig",
+    "token",
+    "access_token",
+    "auth",
+    "credential",
+    "password",
+}
+
+
+def _is_sensitive_url_query_key(value: str) -> bool:
+    key = value.strip().lower().replace("-", "_")
+    return key in {item.replace("-", "_") for item in SENSITIVE_URL_QUERY_KEYS} or key.endswith(
+        ("_token", "_key", "_secret", "_signature", "_password", "_credential")
+    )
+
+
+def redact_url(value: str | None) -> str | None:
+    """Return a display-safe endpoint without exposing URL credentials or tokens."""
+    if value is None:
+        return None
+    text = str(value)
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return "<invalid-url>"
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        return f"{parsed.scheme}://{host}:***"
+    if port:
+        host = f"{host}:{port}"
+    query = urlencode([(key, "***" if _is_sensitive_url_query_key(key) else item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)])
+    return urlunparse((parsed.scheme, host, parsed.path, parsed.params, query, ""))
 
 
 def validate_live_settings(settings: Settings) -> None:
@@ -68,7 +125,9 @@ def validate_live_settings(settings: Settings) -> None:
     if endpoint_status == "placeholder":
         raise LiveSettingsError("LLM_BASE_URL 仍是默认示例 endpoint；请配置真实 OpenAI-compatible endpoint 后再执行 live 调用")
     if endpoint_status == "invalid":
-        raise LiveSettingsError("LLM_BASE_URL 无效；请配置包含 http(s) scheme 和 host 的 OpenAI-compatible endpoint")
+        raise LiveSettingsError("LLM_BASE_URL 无效；禁止 URL credentials/fragment，并要求有效 host")
+    if endpoint_status == "insecure" and not settings.allow_insecure_http:
+        raise LiveSettingsError("LLM_BASE_URL 使用明文 HTTP；如确需本地开发，请显式设置 ALLOW_INSECURE_HTTP=true")
 
 
 class Settings(BaseSettings):
@@ -85,6 +144,14 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = Field(default=90, ge=5)
     retry_max_attempts: int = Field(default=3, ge=1, le=10)
     concurrency: int = Field(default=1, ge=1, le=8)
+    max_output_tokens: int = Field(default=2_000, ge=64, le=32_768)
+    analysis_max_output_tokens: int = Field(default=4_000, ge=64, le=32_768)
+    analysis_max_canonical_names: int = Field(default=500, ge=1, le=10_000)
+    analysis_max_canonical_chars: int = Field(default=50_000, ge=1_000, le=1_000_000)
+    max_job_units: int = Field(default=10_000, ge=1, le=1_000_000)
+    max_consecutive_errors: int = Field(default=5, ge=1, le=1_000)
+    max_error_rate: float = Field(default=0.5, gt=0.0, le=1.0)
+    allow_insecure_http: bool = False
 
     @field_validator("llm_base_url")
     @classmethod
@@ -119,7 +186,7 @@ class Settings(BaseSettings):
             "LLM_API_KEY": "***" if self.has_api_key else None,
             "LLM_API_KEY_STATUS": self.api_key_status,
             "LLM_API_KEY_SOURCE": _setting_source("LLM_API_KEY"),
-            "LLM_BASE_URL": self.llm_base_url,
+            "LLM_BASE_URL": redact_url(self.llm_base_url),
             "LLM_BASE_URL_STATUS": self.llm_base_url_status,
             "LLM_BASE_URL_SOURCE": _setting_source("LLM_BASE_URL"),
             "LLM_MODEL": self.llm_model,
@@ -128,6 +195,14 @@ class Settings(BaseSettings):
             "REQUEST_TIMEOUT_SECONDS": self.request_timeout_seconds,
             "RETRY_MAX_ATTEMPTS": self.retry_max_attempts,
             "CONCURRENCY": self.concurrency,
+            "MAX_OUTPUT_TOKENS": self.max_output_tokens,
+            "ANALYSIS_MAX_OUTPUT_TOKENS": self.analysis_max_output_tokens,
+            "ANALYSIS_MAX_CANONICAL_NAMES": self.analysis_max_canonical_names,
+            "ANALYSIS_MAX_CANONICAL_CHARS": self.analysis_max_canonical_chars,
+            "MAX_JOB_UNITS": self.max_job_units,
+            "MAX_CONSECUTIVE_ERRORS": self.max_consecutive_errors,
+            "MAX_ERROR_RATE": self.max_error_rate,
+            "ALLOW_INSECURE_HTTP": self.allow_insecure_http,
         }
 
 
@@ -147,6 +222,9 @@ def redact_secret(text: str | None, settings: Settings | None = None) -> str | N
         secret = settings.llm_api_key.get_secret_value()  # type: ignore[union-attr]
         if secret:
             text = text.replace(secret, "***")
+    safe_url = redact_url(settings.llm_base_url)
+    if settings.llm_base_url and safe_url and safe_url != settings.llm_base_url:
+        text = text.replace(settings.llm_base_url, safe_url)
     return text
 
 

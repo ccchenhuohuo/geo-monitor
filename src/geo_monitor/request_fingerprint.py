@@ -4,7 +4,6 @@ import hashlib
 import json
 from typing import Any
 
-
 REQUEST_FINGERPRINT_VERSION = "request-fingerprint-v1"
 
 
@@ -31,4 +30,3 @@ def base_url_fingerprint(base_url: str | None) -> str:
 def analysis_fingerprint(profile: dict[str, Any]) -> str:
     basis = {key: value for key, value in profile.items() if key != "analysis_fingerprint"}
     return stable_hash({"analysis_profile": basis})
-

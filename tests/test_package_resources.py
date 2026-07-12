@@ -27,3 +27,24 @@ def test_packaged_docs_are_available():
 
     assert "Metrics Reference" in root.joinpath("docs/metrics.md").read_text(encoding="utf-8")
     assert root.joinpath("docs/README.zh-CN.md").read_text(encoding="utf-8") == Path("README.zh-CN.md").read_text(encoding="utf-8")
+    for name in ("intelligence.md", "metrics.md", "providers.md"):
+        assert root.joinpath(f"docs/{name}").read_text(encoding="utf-8") == Path(f"docs/{name}").read_text(encoding="utf-8")
+
+
+def test_intelligence_subpackage_is_part_of_the_distribution():
+    root = files("geo_monitor.analysis.intelligence")
+
+    expected = {
+        "__init__.py",
+        "citation.py",
+        "common.py",
+        "competitor.py",
+        "opportunities.py",
+        "orchestration.py",
+        "overview.py",
+        "perception.py",
+        "recommendation.py",
+        "situation.py",
+        "trends.py",
+    }
+    assert expected <= {item.name for item in root.iterdir() if item.is_file()}

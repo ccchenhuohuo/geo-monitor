@@ -23,8 +23,9 @@ class QwenResponsesWebSearchBasicAdapter(BaseAdapter):
 
     def validate_options(self, options: dict[str, Any]) -> None:
         super().validate_options(options)
+        self._string_list_option(options, "include")
         if "max_tool_calls" in options:
-            self._positive_int_option(options, "max_tool_calls", 1)
+            self._positive_int_option(options, "max_tool_calls", 1, maximum=10)
 
     def build_request(
         self,
@@ -38,10 +39,12 @@ class QwenResponsesWebSearchBasicAdapter(BaseAdapter):
             "model": sampling_profile["model"],
             "input": query_record.query,
             "tools": [{"type": "web_search"}],
-            "max_tool_calls": self._positive_int_option(adapter_options, "max_tool_calls", settings.max_tool_calls),
+            "max_tool_calls": self._positive_int_option(adapter_options, "max_tool_calls", settings.max_tool_calls, maximum=10),
+            "max_output_tokens": settings.max_output_tokens,
         }
-        if "include" in adapter_options:
-            payload["include"] = adapter_options["include"]
+        include = self._string_list_option(adapter_options, "include")
+        if include is not None:
+            payload["include"] = include
         return ProviderRequest(
             sampling_profile=sampling_profile,
             payload=payload,

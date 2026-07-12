@@ -1,4 +1,12 @@
-from geo_monitor.brand_extraction import LLMBrandExtractor, normalize_extraction_items, normalize_extraction_items_with_quarantine, parse_canonical_map, parse_json_payload
+import pytest
+
+from geo_monitor.brand_extraction import (
+    LLMBrandExtractor,
+    normalize_extraction_items,
+    normalize_extraction_items_with_quarantine,
+    parse_canonical_map,
+    parse_json_payload,
+)
 
 
 def test_parse_json_payload_accepts_code_fence():
@@ -8,6 +16,12 @@ def test_parse_json_payload_accepts_code_fence():
 ```"""
     )
     assert data["brands"][0]["brand_name_raw"] == "TestStudio"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_parse_json_payload_rejects_non_finite_numbers(constant):
+    with pytest.raises(ValueError, match="非有限"):
+        parse_json_payload(f'{{"confidence":{constant}}}')
 
 
 def test_normalize_extraction_items_adds_record_context():
@@ -132,6 +146,74 @@ def test_normalize_extraction_items_requires_raw_name_traceability_not_only_evid
 
     assert rows == []
     assert quarantined[0]["brand_name_raw"] == "HallucinatedBrand"
+
+
+def test_normalize_extraction_items_rejects_substring_and_invalid_numeric_evidence():
+    rows, quarantined = normalize_extraction_items_with_quarantine(
+        [
+            {"brand_name_raw": "AI", "evidence": "chair", "confidence": 0.9},
+            {"brand_name_raw": "ValidBrand", "evidence": "ValidBrand", "confidence": 1.1},
+        ],
+        {
+            "query_id": "q001",
+            "repeat_index": 1,
+            "input_query": "best tools",
+            "response_text": "A CHAIR is present and ValidBrand is mentioned.",
+        },
+    )
+
+    assert rows == []
+    assert [row["reason"] for row in quarantined] == ["untraceable_extraction_item", "invalid_confidence"]
+
+
+def test_normalize_extraction_items_keeps_strict_rank_and_perception_evidence():
+    rows = normalize_extraction_items(
+        [
+            {
+                "brand_name_raw": "TestStudio",
+                "evidence": "TestStudio is recommended",
+                "confidence": 0.8,
+                "role": "recommended",
+                "rank_position": 1.9,
+                "recommendation_type": "best_for_use_case",
+                "use_case": "small teams",
+                "strengths": [
+                    {"text": "fast", "evidence": "fast setup", "confidence": 0.7},
+                    {"text": "invented", "evidence": "not in response", "confidence": 0.9},
+                ],
+            }
+        ],
+        {
+            "query_id": "q001",
+            "repeat_index": 1,
+            "input_query": "best studios",
+            "response_text": "TestStudio is recommended for its fast setup.",
+        },
+    )
+
+    assert rows[0]["rank_position"] == ""
+    assert rows[0]["recommendation_type"] == "best_for_use_case"
+    assert rows[0]["recommendation_strength"] == 4
+    assert rows[0]["perception"] == [{"claim_type": "strength", "claim_text": "fast", "evidence": "fast setup", "confidence": 0.7}]
+
+
+def test_explicit_not_recommended_is_not_overridden_by_observed_rank():
+    rows = normalize_extraction_items(
+        [
+            {
+                "brand_name_raw": "RunnerUp",
+                "evidence": "RunnerUp ranked second but is not recommended",
+                "confidence": 0.9,
+                "role": "mentioned",
+                "is_recommended": False,
+                "rank_position": 2,
+            }
+        ],
+        {"query_id": "q1", "repeat_index": 1, "input_query": "compare"},
+    )
+
+    assert rows[0]["recommendation_type"] == "mentioned_only"
+    assert rows[0]["is_recommended"] is False
 
 
 def test_llm_extractor_returns_quarantine_error_without_losing_valid_rows():

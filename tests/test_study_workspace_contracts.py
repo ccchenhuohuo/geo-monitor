@@ -9,7 +9,15 @@ from geo_monitor.config import Settings
 from geo_monitor.db import build_duckdb, query_duckdb
 from geo_monitor.exporters import read_jsonl
 from geo_monitor.fanout import build_query_manifest
-from geo_monitor.job import JobError, build_job_bundle, estimate_job_run, run_job_bundle, validate_job_config, _resolve_query_manifest_source, _trusted_query_manifest_roots
+from geo_monitor.job import (
+    JobError,
+    _resolve_query_manifest_source,
+    _trusted_query_manifest_roots,
+    build_job_bundle,
+    estimate_job_run,
+    run_job_bundle,
+    validate_job_config,
+)
 from geo_monitor.job_analysis import analyze_job_bundle
 from geo_monitor.tool import run_geo_monitor
 
@@ -249,8 +257,7 @@ def test_raw_only_rebuild_preserves_query_dimensions_and_custom_manifest_metadat
     config = tmp_path / "job_config.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(
-        "query_id,query,locale,market,category,tags,locked_at,channel\n"
-        "q001,example query,zh-CN,CN,test,\"alpha,beta\",2026-07-06T00:00:00Z,vip\n",
+        'query_id,query,locale,market,category,tags,locked_at,channel\nq001,example query,zh-CN,CN,test,"alpha,beta",2026-07-06T00:00:00Z,vip\n',
         encoding="utf-8",
     )
     _write_config(config)
@@ -286,8 +293,23 @@ def test_duckdb_merges_later_query_meta_and_keeps_duplicate_attempts(tmp_path):
     raw.write_text(
         "\n".join(
             [
-                json.dumps({"job_id": result["job_id"], "attempt_id": "same", "query_id": qid, "repeat_index": 1, "status": "error", "query": "q", "model": "m"}, ensure_ascii=False),
-                json.dumps({"job_id": result["job_id"], "attempt_id": "same", "query_id": qid, "repeat_index": 1, "status": "mock", "query": "q", "model": "m", "query_meta": {"seed_id": "sample_beginner", "persona": "beginner", "variant_id": qid}}, ensure_ascii=False),
+                json.dumps(
+                    {"job_id": result["job_id"], "attempt_id": "same", "query_id": qid, "repeat_index": 1, "status": "error", "query": "q", "model": "m"},
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "job_id": result["job_id"],
+                        "attempt_id": "same",
+                        "query_id": qid,
+                        "repeat_index": 1,
+                        "status": "mock",
+                        "query": "q",
+                        "model": "m",
+                        "query_meta": {"seed_id": "sample_beginner", "persona": "beginner", "variant_id": qid},
+                    },
+                    ensure_ascii=False,
+                ),
             ]
         ),
         encoding="utf-8",

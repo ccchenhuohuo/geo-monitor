@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import re
 import string
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .dataset import encode_manifest_csv_cell
+from .filesystem import UnsafeOutputPathError, ensure_private_directory, open_private_text, prepare_private_output, secure_private_file
 
 QUERY_MANIFEST_SCHEMA_VERSION = "query-manifest-v1"
 DEFAULT_FANOUT_VERSION = "template-v1"
+MAX_FANOUT_INPUT_BYTES = 10 * 1024 * 1024
 PERSONA_TEMPLATE_REGISTRY_SCHEMA_VERSION = "persona-template-registry-v1"
 FANOUT_FIELDS = [
     "query_id",
@@ -95,14 +100,29 @@ def build_query_manifest(
     if target.exists() and not force:
         raise FanoutError(f"输出 manifest 已存在：{target}。如需覆盖请使用 --force")
     registry = _load_persona_template_registry(persona_template_registry_path)
-    data = _load_yaml(source.read_text(encoding="utf-8"))
+    data = _load_yaml(_read_input_text(source))
     rows = _fanout_seed_rows(data, fanout_version=fanout_version, manifest_version=manifest_version, locked_at=locked_at, registry=registry)
     fieldnames = FANOUT_FIELDS + REGISTRY_AUDIT_FIELDS if registry is not None else FANOUT_FIELDS
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        ensure_private_directory(target.parent)
+        prepare_private_output(target)
+    except UnsafeOutputPathError as exc:
+        raise FanoutError(str(exc)) from exc
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with open_private_text(tmp, newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows({key: encode_manifest_csv_cell(value) if isinstance(value, str) else value for key, value in row.items()} for row in rows)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        secure_private_file(target)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
     result: dict[str, Any] = {"output": str(target), "row_count": len(rows), "schema_version": QUERY_MANIFEST_SCHEMA_VERSION}
     if registry is not None:
         result.update(registry_metadata(registry))
@@ -118,8 +138,16 @@ def fanout_seed_prompts(
     persona_template_registry_path: str | Path | None = None,
 ) -> list[dict[str, str]]:
     registry = _load_persona_template_registry(persona_template_registry_path)
-    data = _load_yaml(Path(input_path).read_text(encoding="utf-8"))
+    data = _load_yaml(_read_input_text(Path(input_path)))
     return _fanout_seed_rows(data, fanout_version=fanout_version, manifest_version=manifest_version, locked_at=locked_at, registry=registry)
+
+
+def _read_input_text(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise FanoutError(f"fanout 输入必须是普通非 symlink 文件：{path}")
+    if path.stat().st_size > MAX_FANOUT_INPUT_BYTES:
+        raise FanoutError(f"fanout 输入超过 {MAX_FANOUT_INPUT_BYTES} bytes 上限：{path}")
+    return path.read_text(encoding="utf-8")
 
 
 def validate_slug(value: str, field: str) -> str:
@@ -206,7 +234,10 @@ def _fanout_seed_rows(
 
 def _resolve_persona_template(persona: str, *, seed_id: str, registry: PersonaTemplateRegistry | None) -> ResolvedPersonaTemplate:
     if registry is None:
-        template_id, template = PERSONA_TEMPLATES.get(persona, ("default", "{seed_query}"))
+        try:
+            template_id, template = PERSONA_TEMPLATES[persona]
+        except KeyError as exc:
+            raise FanoutError(f"{seed_id}.personas 包含未知内置 persona：{persona}") from exc
         _validate_template(template)
         return ResolvedPersonaTemplate(template_id=_validate_slug(template_id, "template_id"), template=template)
     source = "registry"
@@ -232,6 +263,10 @@ def _load_persona_template_registry(path: str | Path | None) -> PersonaTemplateR
     if path is None:
         return None
     registry_path = Path(path)
+    if registry_path.is_symlink() or not registry_path.is_file():
+        raise FanoutError(f"persona template registry 必须是普通非 symlink 文件：{registry_path}")
+    if registry_path.stat().st_size > MAX_FANOUT_INPUT_BYTES:
+        raise FanoutError(f"persona template registry 超过 {MAX_FANOUT_INPUT_BYTES} bytes 上限")
     raw = registry_path.read_bytes()
     text = raw.decode("utf-8")
     data = _load_registry_yaml(text)

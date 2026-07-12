@@ -12,9 +12,12 @@ def build_html(markdown: str, summary: dict[str, Any]) -> str:
 <html lang=\"zh-CN\">
 <head>
 <meta charset=\"utf-8\">
-<title>{html.escape(summary.get('title', 'GEO 深入洞察报告'))}</title>
+<title>{html.escape(summary.get("title", "GEO 深入洞察报告"))}</title>
 <style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.65; color: #111827; max-width: 1100px; margin: 36px auto; padding: 0 28px; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  line-height: 1.65; color: #111827; max-width: 1100px; margin: 36px auto; padding: 0 28px;
+}}
 h1, h2 {{ color: #0f172a; }}
 table {{ border-collapse: collapse; width: 100%; margin: 12px 0 24px; font-size: 13px; }}
 th, td {{ border: 1px solid #d1d5db; padding: 6px 8px; vertical-align: top; }}
@@ -76,7 +79,7 @@ def markdown_to_html(markdown: str) -> str:
 
 
 def inline(text: str) -> str:
-    escaped = html.escape(text)
+    escaped = _escape_html_once(text)
     escaped = re_bold(escaped)
     return escaped.replace("`", "")
 
@@ -92,6 +95,7 @@ def table_cell(value: object) -> str:
 
 def re_bold(text: str) -> str:
     import re
+
     return re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
 
 
@@ -157,15 +161,19 @@ def generate_pdf_with_reportlab(markdown_path: Path, pdf_path: Path) -> None:
                 data.append(cells)
             if data:
                 table = Table(data, repeatRows=1)
-                table.setStyle(TableStyle([
-                    ("FONTNAME", (0, 0), (-1, -1), "STSong-Light"),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ]))
+                table.setStyle(
+                    TableStyle(
+                        [
+                            ("FONTNAME", (0, 0), (-1, -1), "STSong-Light"),
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
+                            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("FONTSIZE", (0, 0), (-1, -1), 7),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                        ]
+                    )
+                )
                 story.append(table)
             continue
         elif line.startswith("- "):
@@ -180,7 +188,15 @@ def generate_pdf_with_reportlab(markdown_path: Path, pdf_path: Path) -> None:
 
 def _clean_md_inline(text: str) -> str:
     import re
-    text = html.escape(text)
+
+    text = _escape_html_once(text)
     text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
     text = text.replace("`", "")
     return text
+
+
+def _escape_html_once(text: str) -> str:
+    # Dynamic report values are escaped in Markdown so the Markdown artifact is
+    # safe on its own. Normalize those entities before escaping for HTML to
+    # avoid rendering them as literal ``&lt;...&gt;`` text.
+    return html.escape(html.unescape(str(text)))

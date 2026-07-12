@@ -18,6 +18,7 @@ LLM 回答、分析品牌可见性，并生成可复现的本地报告。
 - job-based sampling 和 raw JSONL audit log；
 - 品牌 / 实体抽取与 canonicalization；
 - visibility、SOV、recommendation、rank、sentiment、source、stability CSV；
+- 可解释的 overview、竞品、引用、场景、认知、趋势和规则型机会 intelligence layer；
 - 可重建的 DuckDB analysis cache；
 - 本地静态 dashboard；
 - 面向 Plugin / Skill / Agent workflow 的 Python API。
@@ -48,6 +49,8 @@ manifest 下，OpenAI-compatible Responses API 返回的回答样本。
 - **Raw audit logs**：每条 attempt 都以 JSONL 保存，并包含 `query` 和 `query_meta`。
 - **Brand extraction**：从回答中发现品牌 / 实体，不依赖内置竞品列表。
 - **Metrics and reports**：输出 CSV、Markdown、HTML，以及 best-effort 可选 PDF。
+- **Explainable intelligence**：五个相互独立的 overview score、明确分母 / N-A
+  语义、macro-by-query 分群和可追溯 gap table。
 - **DuckDB analysis layer**：本地可重建的跨 run 分析缓存。
 - **Static dashboard**：无后端服务的本地静态 HTML dashboard。
 - **Python API**：返回结构化结果，方便外部 Agent / workflow 调用。
@@ -136,10 +139,11 @@ flowchart TB
   "input": "<QUERY_TEXT>",
   "tools": [{"type": "web_search"}],
   "tool_choice": "required",
-  "include": ["web_search_call.action.sources"],
   "max_tool_calls": 2
 }
 ```
+
+`include` 等 provider 专用可选字段仅在显式配置并确认 endpoint 支持时发送。
 
 请求中不会包含 `target_brand`、`industry`、`market` 或 competitor names。
 
@@ -193,8 +197,10 @@ geo-monitor dashboard build --db "$DB" --out "$DASHBOARD"
 
 ## 真实 API 配置
 
-通过环境变量配置 OpenAI-compatible Responses API provider；如果要使用 env file，需要显式
-指定。CLI 默认不再信任当前工作目录中的 `.env`。
+通过环境变量配置 OpenAI-compatible Responses API；如果要使用 env file，需要显式指定。
+CLI 默认不信任当前工作目录中的 `.env`。`openai_responses_web_search` 是通用 adapter；
+`doubao_responses_web_search` 使用相同的兼容 SDK transport，但保留豆包 / 火山 Ark 的
+web-search 请求和 trace 语义。
 
 ```bash
 cp .env.example /tmp/geo-monitor.env
@@ -207,14 +213,43 @@ LLM_BASE_URL=https://api.example.com/v1
 LLM_MODEL=provider-model
 WEB_SEARCH_LIMIT=5
 MAX_TOOL_CALLS=2
+MAX_OUTPUT_TOKENS=2000
+ANALYSIS_MAX_OUTPUT_TOKENS=4000
 REQUEST_TIMEOUT_SECONDS=90
 RETRY_MAX_ATTEMPTS=3
 CONCURRENCY=1
+MAX_JOB_UNITS=10000
+MAX_CONSECUTIVE_ERRORS=5
+MAX_ERROR_RATE=0.5
 ```
 
 `https://api.example.com/v1` 是示例 endpoint。只有 `LLM_BASE_URL` 指向真实 `http(s)`
 endpoint 且 `LLM_API_KEY` 已配置时，live 命令才会继续执行。可以用 `geo-monitor doctor`
 查看当前 endpoint、API key 状态和 env file 来源。
+
+豆包 Ark 使用下面的 key/model 占位符，不要把密钥写入 job config：
+
+```bash
+export LLM_API_KEY='<ARK_API_KEY>'
+export LLM_BASE_URL='https://ark.cn-beijing.volces.com/api/v3'
+export LLM_MODEL='<ARK_MODEL_OR_ENDPOINT_ID>'
+```
+
+在 job config 中选择一个 adapter：
+
+```json
+{
+  "model": "<ARK_MODEL_OR_ENDPOINT_ID>",
+  "adapter": "doubao_responses_web_search",
+  "analysis_model": "<ARK_MODEL_OR_ENDPOINT_ID>",
+  "analysis_adapter": "openai_responses_text"
+}
+```
+
+`WEB_SEARCH_LIMIT` 仍是经过校验的历史兼容字段，但当前没有 adapter 能把它实现成跨 provider
+等价的结果数量限制；manifest 会记录 `web_search_limit_effective=false`。
+`MAX_TOOL_CALLS`、输出 token 上限和 adapter options 才是实际请求条件，并会冻结到审计与
+comparability fingerprint 中。
 
 真实采样和真实 LLM extraction 可能产生 provider 成本。会产生 live 成本的命令需要显式
 传入 `--confirm-cost`。
@@ -223,6 +258,16 @@ endpoint 且 `LLM_API_KEY` 已配置时，live 命令才会继续执行。可以
 geo-monitor run-job "$JOB_DIR" --confirm-cost
 geo-monitor analyze-job "$JOB_DIR" --confirm-cost
 ```
+
+SDK 自身 retry 已关闭。应用层只重试瞬时 transport、rate-limit 和 5xx 错误；连续错误数或
+达到最小样本后的累计错误率超过阈值时，live circuit breaker 会停止继续派发。Resume 只看
+每个单元的 latest terminal attempt：更新的 error / interruption 会覆盖旧 success，并触发
+重试。`run_execution_id`、`run_generation`、`diagnostic_generation`、
+`logical_unit_id` 和唯一 `attempt_id` 会区分物理执行；dry/mock diagnostics 不会使已经分析的
+live generation 失效。
+
+Adapter options、有效 / 兼容字段、retry/circuit、endpoint 安全和完整恢复身份契约见
+[docs/providers.md](docs/providers.md)。
 
 ## Persona Fan-out
 
@@ -328,6 +373,35 @@ runs/{job_id}/
     attempt_facts.csv
     query_facts.csv
     brand_attempt_facts.csv
+    geo_overview_scores.csv
+    visibility_summary.csv
+    recommendations.csv
+    recommendation_summary.csv
+    recommendation_by_persona.csv
+    competitor_edges.csv
+    competitor_win_loss.csv
+    competitor_replacements.csv
+    rank_gap.csv
+    source_types.csv
+    brand_source_domains.csv
+    brand_source_urls.csv
+    source_gaps.csv
+    visibility_by_seed.csv
+    visibility_by_persona.csv
+    visibility_by_intent.csv
+    visibility_by_scenario.csv
+    perception_claims.csv
+    perception_strengths.csv
+    perception_weaknesses.csv
+    perception_pricing.csv
+    perception_audience_fit.csv
+    trend_deltas.csv
+    trend_drift.csv
+    trend_volatility.csv
+    opportunity_query_gaps.csv
+    opportunity_persona_gaps.csv
+    opportunity_source_gaps.csv
+    opportunity_messaging_gaps.csv
     report.md
     report.html
     report.pdf              # optional, best-effort
@@ -377,6 +451,15 @@ flowchart LR
 - **Stability**：重复回答中的品牌集合相似度。
 - **Source coverage**：source domain 和 URL 的出现与覆盖。
 - **Data quality**：partial sample、bad raw lines、duplicate units、contract mismatch、extraction error。
+- **Overview scores**：相互独立的 `0..100` visibility、recommendation、competitor、source、
+  quality 分数和组件 breakdown；未观测到 source evidence 时是 N/A，不是 0。
+- **Intelligence**：推荐类型、目标 / 竞品 win-loss 与 replacement risk、引用归因 / gap、
+  evidence-gated perception、run delta/drift/volatility，以及可追溯的规则型机会。
+
+Situation table 默认使用 query 等权的 macro-by-query 作为业务口径，并同时保留
+micro-by-attempt 作为诊断。每类 intelligence 都携带 planned/eligible 分母与 trace ID。
+完整公式、稳定 CSV 名称、eligibility gate、N/A 规则和解释边界见
+[docs/intelligence.md](docs/intelligence.md)。
 
 ## DuckDB 和 Dashboard
 
@@ -387,11 +470,18 @@ geo-monitor db build --runs ./study/runs --output ./study/geo.duckdb
 geo-monitor db inspect --db ./study/geo.duckdb
 geo-monitor db query --db ./study/geo.duckdb \
   "select seed_id, persona, count(*) from queries group by 1,2"
+geo-monitor db query --db ./study/geo.duckdb \
+  "select * from geo_overview_scores order by visibility_score desc nulls last"
 ```
 
 `db query` 是受限的本地只读分析辅助命令。它会拒绝多语句 SQL、写入/admin 语句，以及 DuckDB
 外部文件读取函数。高级 admin SQL 应由可信操作者使用 DuckDB 官方工具执行。Agent-facing 或嵌入式
 工作流应优先使用结构化 Python API 结果，而不是暴露原始 SQL。
+
+当前 generation 的 intelligence CSV 会登记到 `intelligence_artifacts`，以 lossless JSON
+保存在 `intelligence_rows`，并以 CSV stem 创建只读 view，例如
+`geo_overview_scores`、`visibility_by_persona` 和 `competitor_edges`。DB builder 会忽略 stale
+或 generation 不匹配的分析文件。
 
 生成静态 dashboard：
 
@@ -456,6 +546,7 @@ src/geo_monitor/
   job.py                 # build/run/cleanup job lifecycle
   runner.py              # repeated sampling, resume, concurrency
   analysis/              # extraction pipeline, metrics, reports, aggregates
+    intelligence/        # pure overview/recommendation/competitor/gap functions
   job_analysis.py        # compatibility facade for analysis imports
   brand_extraction.py    # LLM extraction schema and canonicalization
   response_parser.py     # response text/source parsing
@@ -490,7 +581,9 @@ tests/
 ## 开发
 
 ```bash
-python -m pytest
+python -m ruff check .
+python -m pytest --cov=geo_monitor --cov-report=term-missing
+python -m build
 ```
 
 仓库默认排除 `.env`、`.runs/`、`.venv/`、local study workspace、DuckDB 文件、缓存目录和生成的任务数据。

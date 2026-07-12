@@ -26,13 +26,10 @@ class DoubaoResponsesWebSearchAdapter(BaseAdapter):
         reserved = sorted(set(web_search_options) & {"type"})
         if reserved:
             raise ValueError(f"{self.name} adapter_options.web_search_options 不能覆盖保留字段：{', '.join(reserved)}")
-        tool_choice = options.get("tool_choice")
-        if isinstance(tool_choice, str) and tool_choice in {"auto", "none"}:
-            raise ValueError("doubao_responses_web_search 要求联网搜索，tool_choice 不能是 auto 或 none")
-        if isinstance(tool_choice, dict) and str(tool_choice.get("type") or "") != "web_search":
-            raise ValueError("doubao_responses_web_search tool_choice 必须指向 web_search")
+        self._required_web_search_tool_choice(options)
+        self._string_list_option(options, "include")
         if "max_tool_calls" in options:
-            self._positive_int_option(options, "max_tool_calls", 1)
+            self._positive_int_option(options, "max_tool_calls", 1, maximum=10)
 
     def build_request(
         self,
@@ -46,16 +43,18 @@ class DoubaoResponsesWebSearchAdapter(BaseAdapter):
         web_search_options = self._require_object_option(adapter_options, "web_search_options")
         if web_search_options:
             tool.update(web_search_options)
+        tool_choice = self._required_web_search_tool_choice(adapter_options) or ("required" if sampling_profile.get("web_search_required", True) else "auto")
         payload: dict[str, Any] = {
             "model": sampling_profile["model"],
             "input": query_record.query,
             "tools": [tool],
-            "tool_choice": adapter_options.get("tool_choice") or ("required" if sampling_profile.get("web_search_required", True) else "auto"),
-            "max_tool_calls": self._positive_int_option(adapter_options, "max_tool_calls", settings.max_tool_calls),
+            "tool_choice": tool_choice,
+            "max_tool_calls": self._positive_int_option(adapter_options, "max_tool_calls", settings.max_tool_calls, maximum=10),
+            "max_output_tokens": settings.max_output_tokens,
         }
-        for key in ["include"]:
-            if key in adapter_options:
-                payload[key] = adapter_options[key]
+        include = self._string_list_option(adapter_options, "include")
+        if include is not None:
+            payload["include"] = include
         return ProviderRequest(
             sampling_profile=sampling_profile,
             payload=payload,

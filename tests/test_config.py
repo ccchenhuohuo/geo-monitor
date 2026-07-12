@@ -1,6 +1,4 @@
-from pathlib import Path
-
-from geo_monitor.config import Settings, get_settings, redact_secret, validate_live_settings
+from geo_monitor.config import Settings, get_settings, redact_secret, redact_url, validate_live_settings
 
 
 def test_default_settings_do_not_load_cwd_dotenv(tmp_path, monkeypatch):
@@ -58,3 +56,15 @@ def test_redact_secret_keeps_key_out_of_errors():
     settings = Settings(llm_api_key="super-secret", llm_base_url="https://provider.example/v1")
 
     assert redact_secret("token=super-secret", settings) == "token=***"
+
+
+def test_endpoint_validation_and_display_redaction_are_total_and_secret_safe():
+    assert Settings(llm_api_key="secret", llm_base_url="https://[::1").llm_base_url_status == "invalid"
+    assert Settings(llm_api_key="secret", llm_base_url="https://x:bad").llm_base_url_status == "invalid"
+    assert redact_url("https://[::1") == "<invalid-url>"
+    display = redact_url("https://provider.example/v1?access_token=one&password=two&auth=three&credential=four&region=cn")
+    assert "one" not in display
+    assert "two" not in display
+    assert "three" not in display
+    assert "four" not in display
+    assert "region=cn" in display

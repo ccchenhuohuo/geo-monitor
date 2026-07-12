@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..filesystem import open_private_text
 from ..schemas import utc_now_iso
 
-
-EXTRACTION_PROMPT_VERSION = "brand-extraction-prompt-v1"
+EXTRACTION_PROMPT_VERSION = "brand-extraction-prompt-v2"
 CANONICALIZATION_PROMPT_VERSION = "brand-canonicalization-prompt-v1"
 
 
@@ -25,9 +25,8 @@ class JsonlCache:
         cache_key = str(entry.get("cache_key") or "")
         if not cache_key:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         record = {"created_at": utc_now_iso(), **entry}
-        with self.path.open("a", encoding="utf-8") as f:
+        with open_private_text(self.path, append=True) as f:
             f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
             f.write("\n")
         self._load()[cache_key] = record
@@ -37,6 +36,8 @@ class JsonlCache:
             return self._entries
         entries: dict[str, dict[str, Any]] = {}
         if self.path.exists():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise ValueError(f"cache 必须是普通非 symlink 文件：{self.path}")
             with self.path.open("r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()

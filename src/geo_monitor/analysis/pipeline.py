@@ -12,6 +12,49 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ..brand_extraction import (
+    RECOMMENDATION_STRENGTH,
+    BrandCanonicalizer,
+    BrandMentionExtractor,
+    LLMBrandExtractor,
+    fallback_canonicalize,
+    is_traceable_text,
+    is_valid_canonical_map,
+    normalize_brand_name,
+)
+from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings, workspace_root
+from ..db import validate_analysis_commit
+from ..exporters import (
+    canonical_request_hash,
+    latest_live_terminal_records,
+    latest_records,
+    latest_terminal_records,
+    read_jsonl,
+    read_jsonl_with_errors,
+    safe_result_key,
+    sanitize_csv_row,
+    write_jsonl,
+)
+from ..filesystem import ensure_private_directory, open_private_text, secure_private_file
+from ..job import (
+    RUNS_DIR,
+    QueryManifestIntegrityError,
+    QueryManifestSourceError,
+    cleanup_job_work_dir_unlocked,
+    job_bundle_lock,
+    load_job_manifest,
+    load_job_queries,
+    logs_dir,
+    query_set_hash,
+    raw_attempts_path,
+    result_dir,
+    update_job_manifest,
+    work_dir,
+)
+from ..query_meta import query_metadata_json, tags_text
+from ..reporting import build_html, markdown_text, table_cell, try_generate_pdf
+from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, base_url_fingerprint, legacy_payload_hash, request_fingerprint
+from ..schemas import utc_now_iso
 from .cache import (
     JsonlCache,
     canonicalization_cache_entry,
@@ -21,16 +64,10 @@ from .cache import (
     raw_names_hash,
     response_text_hash,
 )
-from ..brand_extraction import BrandCanonicalizer, BrandMentionExtractor, LLMBrandExtractor, fallback_canonicalize, normalize_brand_name
-from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings, workspace_root
-from ..exporters import canonical_request_hash, latest_records, latest_terminal_records, read_jsonl, read_jsonl_with_errors, safe_result_key, sanitize_csv_row, write_jsonl
-from ..job import RUNS_DIR, QueryManifestIntegrityError, QueryManifestSourceError, cleanup_job_work_dir_unlocked, job_bundle_lock, load_job_manifest, load_job_queries, logs_dir, query_set_hash, raw_attempts_path, result_dir, update_job_manifest, work_dir
-from ..query_meta import query_metadata_json, tags_text
-from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, legacy_payload_hash, request_fingerprint
-from ..reporting import build_html, markdown_text, table_cell, try_generate_pdf
+from .intelligence import INTELLIGENCE_BASE_FIELDS, INTELLIGENCE_SCHEMA_VERSION, INTELLIGENCE_TABLE_NAMES, build_intelligence_outputs
+from .intelligence.common import as_ratio
 
-
-EXTRACTION_SCHEMA_VERSION = "brand-extraction-v3"
+EXTRACTION_SCHEMA_VERSION = "brand-extraction-v4"
 
 
 CSV_FIELD_SCHEMAS = {
@@ -189,15 +226,25 @@ CSV_FIELD_SCHEMAS = {
         "job_id",
         "query_id",
         "repeat_index",
+        "attempt_id",
         "brand_name_canonical",
         "brand_name_raw",
         "is_target_brand",
         "sov_eligible",
         "is_recommended",
+        "recommendation_type",
+        "recommendation_strength",
         "rank_position",
         "sentiment",
         "confidence",
         "evidence",
+        "role",
+        "condition",
+        "audience",
+        "use_case",
+        "budget_level",
+        "tradeoff",
+        "traceability_status",
         "stats_included",
     ],
     "brand_trends": [
@@ -237,14 +284,16 @@ CSV_FIELD_SCHEMAS = {
         "success_record_count",
     ],
 }
+CSV_FIELD_SCHEMAS.update(INTELLIGENCE_BASE_FIELDS)
 
 
 def _analysis_terminal_records(raw_records: list[dict[str, Any]], *, include_mock: bool) -> list[dict[str, Any]]:
-    live_terminal = latest_records(raw_records, statuses={"success", "error"})
-    if any(str(record.get("status") or "") in {"success", "error"} for record in live_terminal):
+    live_terminal = latest_live_terminal_records(raw_records)
+    if live_terminal:
         return live_terminal
     if include_mock:
-        return latest_records(raw_records, statuses={"mock", "error"})
+        mock_records = [record for record in raw_records if str(record.get("execution_mode") or "") == "mock" or record.get("status") == "mock"]
+        return latest_records(mock_records, statuses={"mock", "error"})
     return live_terminal
 
 
@@ -254,6 +303,8 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
     raw_path = raw_attempts_path(root)
     if not raw_path.exists():
         raise ValueError(f"缺少 raw attempts：{raw_path}")
+    if raw_path.is_symlink() or not raw_path.is_file():
+        raise ValueError(f"raw attempts 必须是普通非 symlink 文件：{raw_path}")
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
     manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
     analysis_profile = _analysis_profile(manifest)
@@ -351,12 +402,14 @@ def _analyze_job_bundle_unlocked(
     raw_path = raw_attempts_path(root)
     if not raw_path.exists():
         raise ValueError(f"缺少 raw attempts：{raw_path}")
+    if raw_path.is_symlink() or not raw_path.is_file():
+        raise ValueError(f"raw attempts 必须是普通非 symlink 文件：{raw_path}")
 
     work = work_dir(root)
     logs = logs_dir(root)
     result = result_dir(root)
     for path in [work, logs, result]:
-        path.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(path)
 
     raw_records, raw_read_errors = read_jsonl_with_errors(raw_path)
     manifest = _manifest_with_queries_for_analysis(root, manifest, raw_records)
@@ -403,11 +456,16 @@ def _analyze_job_bundle_unlocked(
                 validate_live_settings(settings)
             except LiveSettingsError as exc:
                 raise ValueError(str(exc)) from exc
+            _validate_analysis_runtime_profile(analysis_profile, settings)
     if extractor is None and success_records_for_stats and sample_mode == "live" and preflight_cache_stats["analysis_llm_requests_remaining"] > 0:
         extractor_obj = LLMBrandExtractor(settings, model=analysis_model)
+        extractor_obj.analysis_run_id = f"{manifest.get('job_id', 'job')}_analysis_g{manifest.get('run_generation', 0)}_{time.time_ns()}"
     active_extractor = extractor or (extractor_obj.extract_record if extractor_obj else None)
     if active_extractor is None and sample_mode == "mock":
-        active_extractor = lambda record: demo_extract_record(record, manifest)
+        def mock_extractor(record: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+            return demo_extract_record(record, manifest)
+
+        active_extractor = mock_extractor
 
     mention_rows: list[dict[str, Any]] = []
     error_rows: list[dict[str, Any]] = []
@@ -426,6 +484,8 @@ def _analyze_job_bundle_unlocked(
     raw_names = [row["brand_name_raw"] for row in mention_rows]
     if canonicalizer:
         canonical_map, canonical_error = canonicalizer(raw_names)
+    elif cache_stats.get("analysis_circuit_breaker"):
+        canonical_map, canonical_error = fallback_canonicalize(raw_names)
     elif extractor_obj and raw_names:
         canonical_map, canonical_error, canonical_cache_stats = _canonicalize_with_cache(
             raw_names=raw_names,
@@ -445,7 +505,17 @@ def _analyze_job_bundle_unlocked(
     else:
         canonical_map, canonical_error = fallback_canonicalize(raw_names)
     if canonical_error:
-        error_rows.append(_redacted_error(canonical_error, settings))
+        canonical_error_row = _redacted_error(canonical_error, settings)
+        canonical_error_row.setdefault("scope", "global")
+        canonical_error_row.setdefault("stage", "canonicalization")
+        error_rows.append(canonical_error_row)
+    analysis_audit_path = logs / "analysis_attempts.jsonl"
+    analysis_audit_events = extractor_obj.drain_audit_events() if extractor_obj and hasattr(extractor_obj, "drain_audit_events") else []
+    if analysis_audit_events:
+        if analysis_audit_path.is_symlink():
+            raise ValueError(f"analysis audit log 不能是 symlink：{analysis_audit_path}")
+        existing_audit = read_jsonl(analysis_audit_path) if analysis_audit_path.exists() else []
+        _write_jsonl_atomic(analysis_audit_path, [*existing_audit, *analysis_audit_events])
     canonical_map = _apply_target_alias_canonicalization(canonical_map, raw_names, manifest)
     _apply_extraction_quality(data_quality, error_rows, len(success_records_for_stats))
 
@@ -466,6 +536,16 @@ def _analyze_job_bundle_unlocked(
         data_quality=data_quality,
         sample_mode=sample_mode,
     )
+    history_overview, history_visibility = _load_intelligence_history(root, manifest, sample_mode)
+    intelligence = build_intelligence_outputs(
+        manifest=manifest,
+        mentions=enriched_mentions,
+        success_records=success_records_for_stats,
+        facts=facts,
+        brand_summary=stats["brand_summary"],
+        history_overview=history_overview,
+        history_visibility=history_visibility,
+    )
     files = write_job_analysis_files(
         root=root,
         work=work,
@@ -477,8 +557,11 @@ def _analyze_job_bundle_unlocked(
         stats=stats,
         source_stats=source_stats,
         facts=facts,
+        intelligence=intelligence,
         data_quality=data_quality,
     )
+    if analysis_audit_path.exists():
+        files["analysis_attempts_jsonl"] = analysis_audit_path
 
     summary = {
         "job_id": manifest["job_id"],
@@ -507,6 +590,8 @@ def _analyze_job_bundle_unlocked(
         "partial_sample": bool(data_quality["partial_sample"]),
         "data_quality": data_quality,
         "cache": cache_stats,
+        "analysis_run_id": extractor_obj.analysis_run_id if extractor_obj else "",
+        "analysis_llm_attempt_count": len(analysis_audit_events),
         "extracted_mention_count": len(enriched_mentions),
         "extraction_error_count": data_quality.get("extraction_error_count", 0),
         "extraction_error_record_count": data_quality.get("extraction_error_record_count", 0),
@@ -525,21 +610,54 @@ def _analyze_job_bundle_unlocked(
         "attempt_facts": facts["attempt_facts"],
         "query_facts": facts["query_facts"],
         "brand_attempt_facts": facts["brand_attempt_facts"],
+        "intelligence_schema_version": INTELLIGENCE_SCHEMA_VERSION,
+        "intelligence": intelligence,
         "target_diagnosis": stats["target_diagnosis"],
         "analysis_files": {key: _rel(root, value) for key, value in files.items()},
         "method_note": "本报告基于 query 文本采样后的 LLM 开放式品牌抽取；SOV 主口径为品牌命中事件份额，不等同于市场份额。",
     }
     summary_path = logs / "analysis_summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    aggregate_files = update_cross_job_aggregates(root, summary) if write_aggregates else {}
-    summary["aggregate_files"] = {key: _display_path(root, value) for key, value in aggregate_files.items()}
+    aggregate_files = _cross_job_aggregate_paths(root) if write_aggregates else {}
+    summary["aggregate_targets"] = {key: _display_path(root, value) for key, value in aggregate_files.items()}
+    summary["aggregate_files"] = {}
     report_files = generate_job_report(summary, result)
     summary["report_files"] = {key: _rel(root, value) for key, value in report_files.items()}
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    artifact_manifest_path = logs / "analysis_artifacts.json"
+    summary["analysis_artifact_manifest"] = _rel(root, artifact_manifest_path)
+    _write_json_atomic(summary_path, summary)
+    artifact_manifest = _build_analysis_artifact_manifest(
+        root=root,
+        manifest=manifest,
+        analysis_summary=summary_path,
+        analysis_files=files,
+        report_files=report_files,
+    )
+    _write_json_atomic(artifact_manifest_path, artifact_manifest)
     analysis_status = "analyzed_partial" if data_quality.get("conclusion_strength") == "observational" or error_rows else "analyzed"
     update_job_manifest(root, status=analysis_status)
+    if write_aggregates:
+        try:
+            committed_aggregates = update_cross_job_aggregates(root, summary)
+            summary["aggregate_files"] = {key: _display_path(root, value) for key, value in committed_aggregates.items()}
+        except Exception as exc:  # local committed analysis remains valid
+            aggregate_error = {
+                "type": exc.__class__.__name__,
+                "message": redact_secret(str(exc), settings) or "",
+                "completed_at": utc_now_iso(),
+            }
+            _write_json_atomic(logs / "aggregate_error.json", aggregate_error)
+            summary["aggregate_error"] = aggregate_error
     if not keep_work:
-        cleanup_job_work_dir_unlocked(root)
+        try:
+            cleanup_job_work_dir_unlocked(root)
+        except Exception as exc:  # committed analysis must remain usable
+            cleanup_error = {
+                "type": exc.__class__.__name__,
+                "message": redact_secret(str(exc), settings) or "",
+                "completed_at": utc_now_iso(),
+            }
+            _write_json_atomic(logs / "cleanup_error.json", cleanup_error)
+            summary["cleanup_error"] = cleanup_error
     return {"bundle_dir": str(root), "analysis_dir": str(result), "report_dir": str(result), **summary}
 
 
@@ -616,6 +734,15 @@ def _analysis_profile(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_analysis_runtime_profile(profile: dict[str, Any], settings: Settings) -> None:
+    expected_endpoint = str(profile.get("base_url_fingerprint") or "")
+    actual_endpoint = base_url_fingerprint(settings.llm_base_url)
+    if expected_endpoint and expected_endpoint != actual_endpoint:
+        raise ValueError("分析运行时 LLM_BASE_URL 与 frozen analysis_profile 不一致；请使用构建 job 时的 endpoint")
+    expected_tokens = profile.get("max_output_tokens")
+    if expected_tokens not in (None, "") and int(expected_tokens) != settings.analysis_max_output_tokens:
+        raise ValueError("分析运行时 ANALYSIS_MAX_OUTPUT_TOKENS 与 frozen analysis_profile 不一致；请使用构建 job 时的配置")
+
 
 def _query_rows_from_records(records: list[Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -683,7 +810,9 @@ def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: li
         sentiment = str(row.get("sentiment") or "unknown").lower()
         event["sentiments"][sentiment if sentiment in {"positive", "neutral", "negative", "unknown"} else "unknown"] += 1
         if isinstance(row.get("confidence"), (int, float)):
-            event["confidences"].append(float(row["confidence"]))
+            confidence = float(row["confidence"])
+            event["confidences"].append(confidence)
+            confidences[canonical].append(confidence)
 
     for event in brand_events.values():
         canonical = event["canonical"]
@@ -703,8 +832,6 @@ def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: li
             if rank <= 3:
                 top3_keys_by_brand[canonical].add(key)
         sentiments[canonical][_dominant_sentiment(event["sentiments"])] += 1
-        if event["confidences"]:
-            confidences[canonical].append(max(event["confidences"]))
 
     target_keys = {normalize_brand_name(str(manifest["target_brand"]))}
     target_keys.update(normalize_brand_name(alias) for alias in manifest.get("target_aliases", []) if alias)
@@ -718,38 +845,47 @@ def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: li
         sentiment_total = sum(sentiments[canonical].values()) or 1
         rank_observed_count = len(rank_positions[canonical])
         sentiment_unknown = sentiments[canonical]["unknown"]
-        brand_summary.append({
-            "brand_name_canonical": canonical,
-            "raw_names": " | ".join(sorted(raw_names_by_brand[canonical])),
-            "responses_mentioned": response_count,
-            "response_mention_count": response_count,
-            "mention_rate": _pct(response_count / total_success),
-            "response_mention_rate": _pct(response_count / total_success),
-            "query_coverage": len(queries_by_brand[canonical]),
-            "query_coverage_count": len(queries_by_brand[canonical]),
-            "query_coverage_rate": _pct(len(queries_by_brand[canonical]) / (len(query_ids) or 1)),
-            "query_macro_mention_rate": _pct(sum(by_query_rates) / len(query_ids)) if query_ids else "0.0%",
-            "sov_response_share": _pct(response_count / sov_denominator),
-            "sov_event_share": _pct(response_count / sov_denominator),
-            "recommended_count": len(recommended_keys_by_brand[canonical]),
-            "recommended_rate": _pct(len(recommended_keys_by_brand[canonical]) / response_count) if response_count else "0.0%",
-            "recommended_rate_when_mentioned": _pct(len(recommended_keys_by_brand[canonical]) / response_count) if response_count else "0.0%",
-            "recommended_rate_over_success": _pct(len(recommended_keys_by_brand[canonical]) / total_success) if total_success else "0.0%",
-            "rank_observed_count": rank_observed_count,
-            "rank_observed_rate": _pct(rank_observed_count / response_count) if response_count else "0.0%",
-            "avg_rank_position": round(statistics.mean(rank_positions[canonical]), 2) if rank_positions[canonical] else "",
-            "top3_rate": _pct(len(top3_keys_by_brand[canonical]) / response_count) if response_count else "0.0%",
-            "positive_rate": _pct(sentiments[canonical]["positive"] / sentiment_total),
-            "neutral_rate": _pct(sentiments[canonical]["neutral"] / sentiment_total),
-            "negative_rate": _pct(sentiments[canonical]["negative"] / sentiment_total),
-            "sentiment_unknown_rate": _pct(sentiment_unknown / sentiment_total),
-            "sentiment_observed_rate": _pct((sentiment_total - sentiment_unknown) / sentiment_total),
-            "avg_confidence": round(statistics.mean(confidences[canonical]), 3) if confidences[canonical] else "",
-            "target_brand_detected": int(is_target),
-            "is_target_brand": int(is_target),
-        })
+        brand_summary.append(
+            {
+                "brand_name_canonical": canonical,
+                "raw_names": " | ".join(sorted(raw_names_by_brand[canonical])),
+                "responses_mentioned": response_count,
+                "response_mention_count": response_count,
+                "mention_rate": _pct(response_count / total_success),
+                "response_mention_rate": _pct(response_count / total_success),
+                "query_coverage": len(queries_by_brand[canonical]),
+                "query_coverage_count": len(queries_by_brand[canonical]),
+                "query_coverage_rate": _pct(len(queries_by_brand[canonical]) / (len(query_ids) or 1)),
+                "query_macro_mention_rate": _pct(sum(by_query_rates) / len(query_ids)) if query_ids else "0.0%",
+                "sov_response_share": _pct(response_count / sov_denominator),
+                "sov_event_share": _pct(response_count / sov_denominator),
+                "recommended_count": len(recommended_keys_by_brand[canonical]),
+                "recommended_rate": _pct(len(recommended_keys_by_brand[canonical]) / response_count) if response_count else "0.0%",
+                "recommended_rate_when_mentioned": _pct(len(recommended_keys_by_brand[canonical]) / response_count) if response_count else "0.0%",
+                "recommended_rate_over_success": _pct(len(recommended_keys_by_brand[canonical]) / total_success) if total_success else "0.0%",
+                "rank_observed_count": rank_observed_count,
+                "rank_observed_rate": _pct(rank_observed_count / response_count) if response_count else "0.0%",
+                "avg_rank_position": round(statistics.mean(rank_positions[canonical]), 2) if rank_positions[canonical] else "",
+                "top3_rate": _pct(len(top3_keys_by_brand[canonical]) / response_count) if response_count else "0.0%",
+                "positive_rate": _pct(sentiments[canonical]["positive"] / sentiment_total),
+                "neutral_rate": _pct(sentiments[canonical]["neutral"] / sentiment_total),
+                "negative_rate": _pct(sentiments[canonical]["negative"] / sentiment_total),
+                "sentiment_unknown_rate": _pct(sentiment_unknown / sentiment_total),
+                "sentiment_observed_rate": _pct((sentiment_total - sentiment_unknown) / sentiment_total),
+                "avg_confidence": round(statistics.mean(confidences[canonical]), 3) if confidences[canonical] else "",
+                "target_brand_detected": int(is_target),
+                "is_target_brand": int(is_target),
+            }
+        )
 
-    brand_summary.sort(key=lambda row: (-_pct_to_float(row["sov_response_share"]), -_pct_to_float(row["recommended_rate"]), _rank_sort_value(row["avg_rank_position"]), str(row["brand_name_canonical"])))
+    brand_summary.sort(
+        key=lambda row: (
+            -_pct_to_float(row["sov_response_share"]),
+            -_pct_to_float(row["recommended_rate"]),
+            _rank_sort_value(row["avg_rank_position"]),
+            str(row["brand_name_canonical"]),
+        )
+    )
     leader_share = _pct_to_float(brand_summary[0]["sov_response_share"]) if brand_summary else 0.0
     top3_shares = [_pct_to_float(row["sov_response_share"]) for row in brand_summary[:3]]
     top3_avg = sum(top3_shares) / len(top3_shares) if top3_shares else 0.0
@@ -786,17 +922,23 @@ def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: li
             reps = mentions_by_query_brand.get((qid, canonical), set())
             if not reps:
                 continue
-            brand_by_query.append({
-                "query_id": qid,
-                "query": query_text.get(qid, ""),
-                "brand_name_canonical": canonical,
-                "responses_mentioned": len(reps),
-                "mention_rate_within_query": _pct(len(reps) / expected_repeats),
-                "recommended_responses": len(recommended_by_query_brand.get((qid, canonical), set())),
-                "recommended_rate_within_query": _pct(len(recommended_by_query_brand.get((qid, canonical), set())) / len(reps)) if reps else "0.0%",
-                "recommended_rate_when_mentioned_within_query": _pct(len(recommended_by_query_brand.get((qid, canonical), set())) / len(reps)) if reps else "0.0%",
-                "recommended_rate_over_success_within_query": _pct(len(recommended_by_query_brand.get((qid, canonical), set())) / expected_repeats) if expected_repeats else "0.0%",
-            })
+            brand_by_query.append(
+                {
+                    "query_id": qid,
+                    "query": query_text.get(qid, ""),
+                    "brand_name_canonical": canonical,
+                    "responses_mentioned": len(reps),
+                    "mention_rate_within_query": _pct(len(reps) / expected_repeats),
+                    "recommended_responses": len(recommended_by_query_brand.get((qid, canonical), set())),
+                    "recommended_rate_within_query": _pct(len(recommended_by_query_brand.get((qid, canonical), set())) / len(reps)) if reps else "0.0%",
+                    "recommended_rate_when_mentioned_within_query": _pct(len(recommended_by_query_brand.get((qid, canonical), set())) / len(reps))
+                    if reps
+                    else "0.0%",
+                    "recommended_rate_over_success_within_query": _pct(len(recommended_by_query_brand.get((qid, canonical), set())) / expected_repeats)
+                    if expected_repeats
+                    else "0.0%",
+                }
+            )
 
     brands_by_response: dict[tuple[str, int], set[str]] = defaultdict(set)
     for row in mentions:
@@ -807,16 +949,18 @@ def compute_open_brand_stats(mentions: list[dict[str, Any]], success_records: li
     for qid in query_ids:
         successful_repeats = sorted({int(record.get("repeat_index") or 1) for record in success_records if record.get("query_id") == qid})
         sets = [brands_by_response.get((qid, repeat_index), set()) for repeat_index in successful_repeats]
-        query_stability.append({
-            "query_id": qid,
-            "query": query_text.get(qid, ""),
-            "successful_repeats": len(successful_repeats),
-            "expected_repeats": expected_repeats,
-            "sample_sufficient": int(len(successful_repeats) >= min(2, expected_repeats)),
-            "brand_set_jaccard_avg": _fmt_float(_avg_pairwise_jaccard(sets, treat_empty_as_missing=True)),
-            "unique_brand_sets": len({tuple(sorted(item)) for item in sets}),
-            "top_brands": _top_items([brand for item in sets for brand in item]),
-        })
+        query_stability.append(
+            {
+                "query_id": qid,
+                "query": query_text.get(qid, ""),
+                "successful_repeats": len(successful_repeats),
+                "expected_repeats": expected_repeats,
+                "sample_sufficient": int(len(successful_repeats) >= min(2, expected_repeats)),
+                "brand_set_jaccard_avg": _fmt_float(_avg_pairwise_jaccard(sets)),
+                "unique_brand_sets": len({tuple(sorted(item)) for item in sets}),
+                "top_brands": _top_items([brand for item in sets for brand in item]),
+            }
+        )
 
     return {
         "target_brand_detected": any(int(row["target_brand_detected"]) for row in brand_summary),
@@ -848,20 +992,22 @@ def build_fact_rows(
     attempt_facts = []
     for key, record in sorted(terminal_by_key.items()):
         status = str(record.get("status") or "")
-        attempt_facts.append({
-            "job_id": job_id,
-            "query_id": key[0],
-            "repeat_index": key[1],
-            "latest_status": status,
-            "completed_at": record.get("completed_at", ""),
-            "valid_attempt": int(status in valid_statuses),
-            "stats_included": int(key in stats_keys),
-            "web_search_requirement_status": record.get("web_search_requirement_status", ""),
-            "web_search_evidence": record.get("web_search_evidence", ""),
-            "source_parse_status": record.get("source_parse_status", ""),
-            "request_hash": canonical_request_hash(record) or "",
-            "attempt_id": record.get("attempt_id", ""),
-        })
+        attempt_facts.append(
+            {
+                "job_id": job_id,
+                "query_id": key[0],
+                "repeat_index": key[1],
+                "latest_status": status,
+                "completed_at": record.get("completed_at", ""),
+                "valid_attempt": int(status in valid_statuses),
+                "stats_included": int(key in stats_keys),
+                "web_search_requirement_status": record.get("web_search_requirement_status", ""),
+                "web_search_evidence": record.get("web_search_evidence", ""),
+                "source_parse_status": record.get("source_parse_status", ""),
+                "request_hash": canonical_request_hash(record) or "",
+                "attempt_id": record.get("attempt_id", ""),
+            }
+        )
 
     query_facts = []
     for query in manifest.get("queries", []):
@@ -872,20 +1018,22 @@ def build_fact_rows(
         stats_included_attempts = sum(1 for key in query_keys if key in stats_keys)
         latest_failed_attempts = sum(1 for key in query_keys if str((terminal_by_key.get(key) or {}).get("status") or "") == "error")
         meta = {key: value for key, value in query.items() if key not in {"query_id", "query"} and value not in (None, "")}
-        query_facts.append({
-            "job_id": job_id,
-            "query_id": qid,
-            "query": query.get("query", ""),
-            "planned_attempts": expected_repeats,
-            "latest_terminal_attempts": latest_terminal_attempts,
-            "completed_attempts": completed_attempts,
-            "valid_attempts": completed_attempts,
-            "stats_included_attempts": stats_included_attempts,
-            "latest_failed_attempts": latest_failed_attempts,
-            "sample_completeness": _pct(latest_terminal_attempts / (expected_repeats or 1)),
-            "usable_sample_rate": _pct(stats_included_attempts / (expected_repeats or 1)),
-            "query_metadata_json": json.dumps(meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        })
+        query_facts.append(
+            {
+                "job_id": job_id,
+                "query_id": qid,
+                "query": query.get("query", ""),
+                "planned_attempts": expected_repeats,
+                "latest_terminal_attempts": latest_terminal_attempts,
+                "completed_attempts": completed_attempts,
+                "valid_attempts": completed_attempts,
+                "stats_included_attempts": stats_included_attempts,
+                "latest_failed_attempts": latest_failed_attempts,
+                "sample_completeness": _pct(latest_terminal_attempts / (expected_repeats or 1)),
+                "usable_sample_rate": _pct(stats_included_attempts / (expected_repeats or 1)),
+                "query_metadata_json": json.dumps(meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            }
+        )
 
     target_keys = {normalize_brand_name(str(manifest.get("target_brand") or ""))}
     target_keys.update(normalize_brand_name(alias) for alias in manifest.get("target_aliases", []) if alias)
@@ -906,16 +1054,40 @@ def build_fact_rows(
                 "brand_name_canonical": canonical,
                 "raw_names": set(),
                 "recommended": False,
+                "recommendation_types": [],
                 "rank_positions": [],
                 "sentiments": Counter(),
                 "confidences": [],
                 "evidence": "",
+                "roles": set(),
+                "conditions": set(),
+                "audiences": set(),
+                "use_cases": set(),
+                "budget_levels": set(),
+                "tradeoffs": set(),
+                "strongest_row": None,
+                "strongest_priority": None,
+                "attempt_id": str((terminal_by_key.get((qid, repeat_index)) or {}).get("attempt_id") or ""),
                 "stats_included": int((qid, repeat_index) in stats_keys),
             },
         )
         event["raw_names"].add(str(row.get("brand_name_raw") or canonical))
         if _as_bool(row.get("is_recommended")) or str(row.get("role") or "").lower() == "recommended":
             event["recommended"] = True
+        recommendation_type = _normalized_recommendation_type(row)
+        event["recommendation_types"].append(recommendation_type)
+        if RECOMMENDATION_STRENGTH[recommendation_type] > 0:
+            event["recommended"] = True
+        candidate_rank = _as_positive_int(row.get("rank_position"))
+        candidate_confidence = float(row["confidence"]) if isinstance(row.get("confidence"), (int, float)) else 0.0
+        candidate_priority = (
+            RECOMMENDATION_STRENGTH[recommendation_type],
+            -(candidate_rank or 999999),
+            candidate_confidence,
+        )
+        if event["strongest_priority"] is None or candidate_priority > event["strongest_priority"]:
+            event["strongest_priority"] = candidate_priority
+            event["strongest_row"] = {**row, "recommendation_type": recommendation_type}
         rank = _as_positive_int(row.get("rank_position"))
         if rank is not None:
             event["rank_positions"].append(rank)
@@ -925,42 +1097,66 @@ def build_fact_rows(
             event["confidences"].append(float(row["confidence"]))
         if not event["evidence"] and row.get("evidence"):
             event["evidence"] = str(row.get("evidence") or "")
+        _add_nonempty(event["roles"], row.get("role"))
+        _add_nonempty(event["conditions"], row.get("condition"))
+        _add_nonempty(event["audiences"], row.get("audience"))
+        _add_nonempty(event["use_cases"], row.get("use_case"))
+        _add_nonempty(event["budget_levels"], row.get("budget_level"))
+        _add_nonempty(event["tradeoffs"], row.get("tradeoff"))
 
     brand_attempt_facts = []
     for event in brand_events.values():
         raw_names = sorted(event["raw_names"])
         brand_keys = {normalize_brand_name(event["brand_name_canonical"]), *{normalize_brand_name(name) for name in raw_names}}
-        brand_attempt_facts.append({
-            "job_id": job_id,
-            "query_id": event["query_id"],
-            "repeat_index": event["repeat_index"],
-            "brand_name_canonical": event["brand_name_canonical"],
-            "brand_name_raw": " | ".join(raw_names),
-            "is_target_brand": int(bool(target_keys & brand_keys)),
-            "sov_eligible": True,
-            "is_recommended": int(bool(event["recommended"])),
-            "rank_position": min(event["rank_positions"]) if event["rank_positions"] else "",
-            "sentiment": _dominant_sentiment(event["sentiments"]),
-            "confidence": round(max(event["confidences"]), 3) if event["confidences"] else "",
-            "evidence": event["evidence"],
-            "stats_included": event["stats_included"],
-        })
+        strongest = event["strongest_row"] or {}
+        recommendation_type = str(strongest.get("recommendation_type") or "mentioned_only")
+        strongest_rank = _as_positive_int(strongest.get("rank_position"))
+        strongest_confidence = strongest.get("confidence") if isinstance(strongest.get("confidence"), (int, float)) else ""
+        brand_attempt_facts.append(
+            {
+                "job_id": job_id,
+                "query_id": event["query_id"],
+                "repeat_index": event["repeat_index"],
+                "attempt_id": event["attempt_id"],
+                "brand_name_canonical": event["brand_name_canonical"],
+                "brand_name_raw": " | ".join(raw_names),
+                "is_target_brand": int(bool(target_keys & brand_keys)),
+                "sov_eligible": True,
+                "is_recommended": int(RECOMMENDATION_STRENGTH[recommendation_type] > 0),
+                "recommendation_type": recommendation_type,
+                "recommendation_strength": RECOMMENDATION_STRENGTH[recommendation_type],
+                "rank_position": strongest_rank or "",
+                "sentiment": _dominant_sentiment(event["sentiments"]),
+                "confidence": strongest_confidence,
+                "evidence": str(strongest.get("evidence") or ""),
+                "role": str(strongest.get("role") or ""),
+                "condition": str(strongest.get("condition") or ""),
+                "audience": str(strongest.get("audience") or ""),
+                "use_case": str(strongest.get("use_case") or ""),
+                "budget_level": str(strongest.get("budget_level") or ""),
+                "tradeoff": str(strongest.get("tradeoff") or ""),
+                "traceability_status": "valid",
+                "stats_included": event["stats_included"],
+            }
+        )
 
-    quality_summary = [{
-        "job_id": job_id,
-        "sample_mode": sample_mode,
-        "conclusion_strength": data_quality.get("conclusion_strength", ""),
-        "partial_sample": bool(data_quality.get("partial_sample")),
-        "planned_units": data_quality.get("planned_units", 0),
-        "analysis_record_count": data_quality.get("analysis_record_count", 0),
-        "stats_record_count": data_quality.get("stats_record_count", 0),
-        "missing_unit_count": len(data_quality.get("missing_units", [])),
-        "latest_failed_unit_count": len(data_quality.get("latest_failed_units", [])),
-        "web_search_quality_flag_count": len(data_quality.get("web_search_quality_flags", [])),
-        "source_quality_flag_count": len(data_quality.get("source_quality_flags", [])),
-        "extraction_error_record_count": data_quality.get("extraction_error_record_count", 0),
-        "extraction_error_rate": data_quality.get("extraction_error_rate", "0.0%"),
-    }]
+    quality_summary = [
+        {
+            "job_id": job_id,
+            "sample_mode": sample_mode,
+            "conclusion_strength": data_quality.get("conclusion_strength", ""),
+            "partial_sample": bool(data_quality.get("partial_sample")),
+            "planned_units": data_quality.get("planned_units", 0),
+            "analysis_record_count": data_quality.get("analysis_record_count", 0),
+            "stats_record_count": data_quality.get("stats_record_count", 0),
+            "missing_unit_count": len(data_quality.get("missing_units", [])),
+            "latest_failed_unit_count": len(data_quality.get("latest_failed_units", [])),
+            "web_search_quality_flag_count": len(data_quality.get("web_search_quality_flags", [])),
+            "source_quality_flag_count": len(data_quality.get("source_quality_flags", [])),
+            "extraction_error_record_count": data_quality.get("extraction_error_record_count", 0),
+            "extraction_error_rate": data_quality.get("extraction_error_rate", "0.0%"),
+        }
+    ]
 
     return {
         "quality_summary": quality_summary,
@@ -985,16 +1181,14 @@ def write_job_analysis_files(
     stats: dict[str, Any],
     source_stats: dict[str, Any],
     facts: dict[str, list[dict[str, Any]]],
+    intelligence: dict[str, list[dict[str, Any]]],
     data_quality: dict[str, Any],
 ) -> dict[str, Path]:
-    work.mkdir(parents=True, exist_ok=True)
-    logs.mkdir(parents=True, exist_ok=True)
-    result.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(work)
+    ensure_private_directory(logs)
+    ensure_private_directory(result)
     write_jsonl(work / "brand_mentions_raw.jsonl", mentions)
-    (work / "brand_canonical_map_work.json").write_text(
-        json.dumps(canonical_map, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _write_text_atomic(work / "brand_canonical_map_work.json", json.dumps(canonical_map, ensure_ascii=False, indent=2))
     files = {
         "extraction_errors_jsonl": logs / "extraction_errors.jsonl",
         "raw_read_errors_jsonl": logs / "raw_read_errors.jsonl",
@@ -1015,11 +1209,16 @@ def write_job_analysis_files(
         "query_facts": result / "query_facts.csv",
         "brand_attempt_facts": result / "brand_attempt_facts.csv",
     }
+    files.update({name: result / f"{name}.csv" for name in INTELLIGENCE_TABLE_NAMES})
     write_jsonl(files["extraction_errors_jsonl"], errors)
     write_jsonl(files["raw_read_errors_jsonl"], data_quality.get("raw_read_errors", []))
-    files["data_quality"].write_text(json.dumps(data_quality, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_text_atomic(files["data_quality"], json.dumps(data_quality, ensure_ascii=False, indent=2))
     _write_csv(files["brand_mentions_extracted"], mentions, schema="brand_mentions_extracted")
-    _write_csv(files["brand_canonical_map"], [{"brand_name_raw": raw, "brand_name_canonical": canonical} for raw, canonical in sorted(canonical_map.items())], schema="brand_canonical_map")
+    _write_csv(
+        files["brand_canonical_map"],
+        [{"brand_name_raw": raw, "brand_name_canonical": canonical} for raw, canonical in sorted(canonical_map.items())],
+        schema="brand_canonical_map",
+    )
     _write_csv(files["discovered_brands"], stats["brand_summary"], schema="brand_summary")
     _write_csv(files["brand_summary"], stats["brand_summary"], schema="brand_summary")
     _write_csv(files["sov_summary"], stats["sov_summary"], schema="brand_summary")
@@ -1033,19 +1232,22 @@ def write_job_analysis_files(
     _write_csv(files["attempt_facts"], facts["attempt_facts"], schema="attempt_facts")
     _write_csv(files["query_facts"], facts["query_facts"], schema="query_facts")
     _write_csv(files["brand_attempt_facts"], facts["brand_attempt_facts"], schema="brand_attempt_facts")
+    for name in INTELLIGENCE_TABLE_NAMES:
+        _write_csv(files[name], intelligence.get(name, []), schema=name)
     return files
 
 
 def generate_job_report(summary: dict[str, Any], report_dir: Path) -> dict[str, Path]:
-    report_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(report_dir)
     md_path = report_dir / "report.md"
     html_path = report_dir / "report.html"
     pdf_path = report_dir / "report.pdf"
     markdown = build_job_markdown(summary)
-    md_path.write_text(markdown, encoding="utf-8")
-    html_path.write_text(build_html(markdown, summary), encoding="utf-8")
+    _write_text_atomic(md_path, markdown)
+    _write_text_atomic(html_path, build_html(markdown, summary))
     files = {"markdown": md_path, "html": html_path}
     if try_generate_pdf(html_path, pdf_path):
+        secure_private_file(pdf_path)
         files["pdf"] = pdf_path
     return files
 
@@ -1064,10 +1266,14 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
     else:
         top = summary["brand_summary"][0]
         diagnosis = summary.get("target_diagnosis") or {}
-        lines.append(f"- 当前品牌命中事件份额最高的是 {markdown_text(top['brand_name_canonical'])}，份额为 {top['sov_event_share']}，覆盖 {top['query_coverage_rate']} 的 query。")
+        lines.append(
+            f"- 当前品牌命中事件份额最高的是 {markdown_text(top['brand_name_canonical'])}，"
+            f"份额为 {top['sov_event_share']}，覆盖 {top['query_coverage_rate']} 的 query。"
+        )
         if diagnosis.get("target_detected"):
+            target_share = diagnosis.get("target_sov_event_share", diagnosis.get("target_sov_response_share"))
             lines.append(
-                f"- 目标品牌 {markdown_text(summary['target_brand'])} 的品牌命中事件份额为 {diagnosis.get('target_sov_event_share', diagnosis.get('target_sov_response_share'))}，"
+                f"- 目标品牌 {markdown_text(summary['target_brand'])} 的品牌命中事件份额为 {target_share}，"
                 f"样本内份额排序第 {diagnosis.get('target_rank_by_sov')}，与第一名差距 {diagnosis.get('target_sov_gap_to_leader')}。"
             )
         else:
@@ -1075,48 +1281,53 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
         unstable = [row for row in summary.get("query_stability", []) if row.get("brand_set_jaccard_avg") not in {"", 1, 1.0}]
         if unstable:
             lines.append(f"- 有 {len(unstable)} 个 query 的品牌集合在重复采样中存在波动，建议优先人工复核这些 query 的 raw response。")
-    lines.extend([
-        "",
-        "## 2. 任务配置",
-        "",
-        "| 项目 | 值 |",
-        "|---|---|",
-        f"| 目标品牌 | {table_cell(summary['target_brand'])} |",
-        f"| 行业 | {table_cell(summary['industry'])} |",
-        f"| 市场 | {table_cell(summary['market'])} |",
-        f"| Query 数 | {summary['expected_queries']} |",
-        f"| 每 query 重复次数 | {summary['expected_repeats']} |",
-        f"| 成功回答数 | {summary['success_record_count']} |",
-        f"| 抽取品牌提及数 | {summary['extracted_mention_count']} |",
-        f"| 抽取错误数 | {summary['extraction_error_count']} |",
-        f"| 样本模式 | {summary.get('sample_mode', 'live')} |",
-        f"| SOV 主口径 | 品牌命中事件份额 |",
-        "",
-        "## 3. Data Quality",
-        "",
-        "| 项目 | 值 |",
-        "|---|---:|",
-        f"| 计划采样单元 | {data_quality.get('planned_units', summary.get('expected_units'))} |",
-        f"| 可分析样本数 | {data_quality.get('analysis_record_count', summary.get('success_record_count'))} |",
-        f"| 缺失采样单元 | {len(data_quality.get('missing_units', []))} |",
-        f"| 额外采样单元 | {len(data_quality.get('extra_units', []))} |",
-        f"| 重复采样单元 | {len(data_quality.get('duplicate_units', []))} |",
-        f"| 请求契约不一致 | {len(data_quality.get('contract_mismatches', []))} |",
-        f"| raw 读取错误 | {len(data_quality.get('raw_read_errors', []))} |",
-        f"| 抽取异常回答数 | {data_quality.get('extraction_error_record_count', summary.get('extraction_error_count', 0))} |",
-        f"| 抽取异常明细行数 | {data_quality.get('extraction_error_row_count', summary.get('extraction_error_row_count', 0))} |",
-        f"| 追溯隔离项数 | {data_quality.get('traceability_quarantine_count', summary.get('traceability_quarantine_count', 0))} |",
-        f"| 抽取错误率 | {data_quality.get('extraction_error_rate', summary.get('extraction_error_rate', '0.0%'))} |",
-        f"| 结论强度 | {data_quality.get('conclusion_strength', 'strong')} |",
-        "",
-        "## 4. Brand Visibility / SOV",
-        "",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 2. 任务配置",
+            "",
+            "| 项目 | 值 |",
+            "|---|---|",
+            f"| 目标品牌 | {table_cell(summary['target_brand'])} |",
+            f"| 行业 | {table_cell(summary['industry'])} |",
+            f"| 市场 | {table_cell(summary['market'])} |",
+            f"| Query 数 | {summary['expected_queries']} |",
+            f"| 每 query 重复次数 | {summary['expected_repeats']} |",
+            f"| 成功回答数 | {summary['success_record_count']} |",
+            f"| 抽取品牌提及数 | {summary['extracted_mention_count']} |",
+            f"| 抽取错误数 | {summary['extraction_error_count']} |",
+            f"| 样本模式 | {summary.get('sample_mode', 'live')} |",
+            "| SOV 主口径 | 品牌命中事件份额 |",
+            "",
+            "## 3. Data Quality",
+            "",
+            "| 项目 | 值 |",
+            "|---|---:|",
+            f"| 计划采样单元 | {data_quality.get('planned_units', summary.get('expected_units'))} |",
+            f"| 可分析样本数 | {data_quality.get('analysis_record_count', summary.get('success_record_count'))} |",
+            f"| 缺失采样单元 | {len(data_quality.get('missing_units', []))} |",
+            f"| 额外采样单元 | {len(data_quality.get('extra_units', []))} |",
+            f"| 重复采样单元 | {len(data_quality.get('duplicate_units', []))} |",
+            f"| 请求契约不一致 | {len(data_quality.get('contract_mismatches', []))} |",
+            f"| raw 读取错误 | {len(data_quality.get('raw_read_errors', []))} |",
+            f"| 抽取异常回答数 | {data_quality.get('extraction_error_record_count', summary.get('extraction_error_count', 0))} |",
+            f"| 抽取异常明细行数 | {data_quality.get('extraction_error_row_count', summary.get('extraction_error_row_count', 0))} |",
+            f"| 追溯隔离项数 | {data_quality.get('traceability_quarantine_count', summary.get('traceability_quarantine_count', 0))} |",
+            f"| 抽取错误率 | {data_quality.get('extraction_error_rate', summary.get('extraction_error_rate', '0.0%'))} |",
+            f"| 结论强度 | {data_quality.get('conclusion_strength', 'strong')} |",
+            "",
+            "## 4. Brand Visibility / SOV",
+            "",
+        ]
+    )
     if summary.get("brand_summary"):
-        lines.extend([
-            "| 排名 | 品牌/机构 | 命中事件份额 | 回答提及率 | Query 覆盖率 | 提及后推荐率 | 全样本推荐率 | 平均排名 | 排名观测率 | 正向率 | 未知情感率 | 目标品牌 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ])
+        lines.extend(
+            [
+                "| 排名 | 品牌/机构 | 命中事件份额 | 回答提及率 | Query 覆盖率 | 提及后推荐率 | "
+                "全样本推荐率 | 平均排名 | 排名观测率 | 正向率 | 未知情感率 | 目标品牌 |",
+                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
         for row in summary["brand_summary"][:20]:
             lines.append(
                 f"| {row['sov_rank']} | {table_cell(row['brand_name_canonical'])} | {row['sov_event_share']} | "
@@ -1132,23 +1343,28 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
     if int(summary.get("success_record_count") or 0) == 0:
         lines.append("当前没有 live success 样本，不能判断目标品牌是否缺失或弱势。")
     elif diagnosis.get("target_detected"):
-        lines.extend([
-            "| 指标 | 值 |",
-            "|---|---:|",
-            f"| 目标品牌命中事件份额 | {diagnosis.get('target_sov_event_share', diagnosis.get('target_sov_response_share'))} |",
-            f"| 样本内份额排序 | {diagnosis.get('target_rank_by_sov')} |",
-            f"| 与第一名差距 | {diagnosis.get('target_sov_gap_to_leader')} |",
-            f"| 与 Top3 平均差距 | {diagnosis.get('target_sov_gap_to_top3_avg')} |",
-            f"| 回答提及率 | {diagnosis.get('target_response_mention_rate')} |",
-            f"| 提及后推荐率 | {diagnosis.get('target_recommended_rate_when_mentioned', diagnosis.get('target_recommended_rate'))} |",
-            f"| 全样本推荐率 | {diagnosis.get('target_recommended_rate_over_success', '0.0%')} |",
-            f"| 排名观测率 | {diagnosis.get('target_rank_observed_rate', '0.0%')} |",
-            f"| 情感未知率 | {diagnosis.get('target_sentiment_unknown_rate', '0.0%')} |",
-            f"| Query 覆盖率 | {diagnosis.get('target_query_coverage_rate')} |",
-            "",
-        ])
+        lines.extend(
+            [
+                "| 指标 | 值 |",
+                "|---|---:|",
+                f"| 目标品牌命中事件份额 | {diagnosis.get('target_sov_event_share', diagnosis.get('target_sov_response_share'))} |",
+                f"| 样本内份额排序 | {diagnosis.get('target_rank_by_sov')} |",
+                f"| 与第一名差距 | {diagnosis.get('target_sov_gap_to_leader')} |",
+                f"| 与 Top3 平均差距 | {diagnosis.get('target_sov_gap_to_top3_avg')} |",
+                f"| 回答提及率 | {diagnosis.get('target_response_mention_rate')} |",
+                f"| 提及后推荐率 | {diagnosis.get('target_recommended_rate_when_mentioned', diagnosis.get('target_recommended_rate'))} |",
+                f"| 全样本推荐率 | {diagnosis.get('target_recommended_rate_over_success', '0.0%')} |",
+                f"| 排名观测率 | {diagnosis.get('target_rank_observed_rate', '0.0%')} |",
+                f"| 情感未知率 | {diagnosis.get('target_sentiment_unknown_rate', '0.0%')} |",
+                f"| Query 覆盖率 | {diagnosis.get('target_query_coverage_rate')} |",
+                "",
+            ]
+        )
     else:
-        lines.append("目标品牌在当前抽取口径下未命中。建议优先检查 query 是否覆盖真实用户会触发该品牌的使用场景、target_aliases 是否完整，以及 raw response 中是否存在未被识别的别名。")
+        lines.append(
+            "目标品牌在当前抽取口径下未命中。建议优先检查 query 是否覆盖真实用户会触发该品牌的使用场景、"
+            "target_aliases 是否完整，以及 raw response 中是否存在未被识别的别名。"
+        )
     missing = diagnosis.get("missing_queries") or []
     if missing and int(summary.get("success_record_count") or 0) > 0:
         lines.extend(["", "目标品牌缺失的 query：", ""])
@@ -1157,7 +1373,9 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
 
     lines.extend(["", "## 6. Source & Citation Opportunities", ""])
     if summary.get("source_domains"):
-        lines.extend(["| 来源域名 | 解析来源数 | 去重 URL 数 | 回答覆盖率 | Query 覆盖率 | 平均来源解析序号 | Top URLs |", "|---|---:|---:|---:|---:|---:|---|"])
+        lines.extend(
+            ["| 来源域名 | 解析来源数 | 去重 URL 数 | 回答覆盖率 | Query 覆盖率 | 平均来源解析序号 | Top URLs |", "|---|---:|---:|---:|---:|---:|---|"]
+        )
         for row in summary["source_domains"][:15]:
             lines.append(
                 f"| {table_cell(row['domain'])} | {row.get('parsed_source_occurrences', row.get('citation_occurrences'))} | "
@@ -1167,12 +1385,109 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
     else:
         lines.append("当前样本没有解析到来源引用。")
 
-    lines.extend(["", "## 7. Query-Level Findings", ""])
+    intelligence = summary.get("intelligence") or {}
+    lines.extend(["", "## 7. GEO Intelligence Layer", ""])
+    overview = intelligence.get("geo_overview_scores") or []
+    if overview:
+        lines.extend(
+            [
+                "质量分独立于业务分；无可观测来源时 Source Score 为 N/A，不按 0 分处理。所有 breakdown 与分母保存在 CSV/DuckDB。",
+                "",
+                "| 品牌 | Visibility | Recommendation | Competitor | Source | Quality |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in overview[:15]:
+            lines.append(
+                f"| {table_cell(row.get('brand_name_canonical'))} | {_metric_text(row.get('visibility_score'))} | "
+                f"{_metric_text(row.get('recommendation_score'))} | {_metric_text(row.get('competitor_score'))} | "
+                f"{_metric_text(row.get('source_score'))} | {_metric_text(row.get('quality_score'))} |"
+            )
+    else:
+        lines.append("当前没有足够的可追溯品牌事实用于计算 Intelligence Score。")
+
+    recommendation_rows = intelligence.get("recommendation_summary") or []
+    if recommendation_rows:
+        lines.extend(["", "推荐情报：", "", "| 品牌 | 观测回答 | 推荐转化率 | Top Pick 率 | 加权推荐分 |", "|---|---:|---:|---:|---:|"])
+        for row in recommendation_rows[:15]:
+            lines.append(
+                f"| {table_cell(row.get('brand_name_canonical'))} | {row.get('recommendation_denominator', 0)} | "
+                f"{_ratio_text(row.get('recommendation_conversion'))} | {_ratio_text(row.get('top_pick_rate'))} | "
+                f"{_metric_text(row.get('weighted_recommendation_score'))} |"
+            )
+
+    competitor_rows = intelligence.get("competitor_edges") or []
+    if competitor_rows:
+        lines.extend(["", "目标品牌与竞品：", "", "| 竞品 | 共现 | 目标胜 | 竞品胜 | Tie | 目标胜率 | 替代风险 |", "|---|---:|---:|---:|---:|---:|---:|"])
+        for row in competitor_rows[:15]:
+            lines.append(
+                f"| {table_cell(row.get('competitor_brand'))} | {row.get('co_occurrence_count', 0)} | "
+                f"{row.get('target_wins', 0)} | {row.get('competitor_wins', 0)} | {row.get('ties', 0)} | "
+                f"{_ratio_text(row.get('target_win_rate'))} | {_ratio_text(row.get('replacement_risk'))} |"
+            )
+
+    persona_rows = intelligence.get("visibility_by_persona") or []
+    if persona_rows:
+        lines.extend(
+            [
+                "",
+                "Persona（主口径为 query 等权宏平均）：",
+                "",
+                "| Persona | Query 数 | Macro Visibility | Micro Visibility | Persona Gap | Quality |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in persona_rows[:15]:
+            lines.append(
+                f"| {table_cell(row.get('segment_value') or '(未标注)')} | {row.get('query_count', 0)} | "
+                f"{_ratio_text(row.get('visibility_rate_macro_by_query'))} | {_ratio_text(row.get('visibility_rate_micro'))} | "
+                f"{_ratio_text(row.get('persona_gap'))} | {_metric_text(row.get('quality_score'))} |"
+            )
+
+    perception_rows = [
+        *intelligence.get("perception_strengths", []),
+        *intelligence.get("perception_weaknesses", []),
+        *intelligence.get("perception_pricing", []),
+        *intelligence.get("perception_audience_fit", []),
+    ]
+    if perception_rows:
+        lines.extend(["", "可追溯感知事实：", "", "| 品牌 | 类型 | 事实 | 回答率 | 平均置信度 |", "|---|---|---|---:|---:|"])
+        for row in perception_rows[:15]:
+            lines.append(
+                f"| {table_cell(row.get('brand_name_canonical'))} | {table_cell(row.get('claim_type'))} | "
+                f"{table_cell(row.get('representative_claim_text'))} | {_ratio_text(row.get('response_rate'))} | "
+                f"{_metric_text(row.get('avg_confidence'))} |"
+            )
+
+    opportunities = [
+        *intelligence.get("opportunity_query_gaps", []),
+        *intelligence.get("opportunity_persona_gaps", []),
+        *intelligence.get("opportunity_source_gaps", []),
+        *intelligence.get("opportunity_messaging_gaps", []),
+    ]
+    if opportunities:
+        lines.extend(["", "规则化机会（非生成式建议）：", "", "| 类型 | 对象 | 得分 |", "|---|---|---:|"])
+        for row in sorted(opportunities, key=lambda item: -float(item.get("opportunity_score") or 0))[:20]:
+            subject = row.get("query_id") or row.get("persona") or row.get("domain") or row.get("claim_canonical") or row.get("competitor_brand")
+            lines.append(f"| {table_cell(row.get('opportunity_type'))} | {table_cell(subject)} | {_metric_text(row.get('opportunity_score'))} |")
+
+    trend_rows = intelligence.get("trend_deltas") or []
+    if trend_rows:
+        lines.extend(["", "与最近可比 run 的变化：", "", "| 品牌 | 指标 | 基线 | 当前 | Delta |", "|---|---|---:|---:|---:|"])
+        for row in trend_rows[:20]:
+            lines.append(
+                f"| {table_cell(row.get('brand_name_canonical'))} | {table_cell(row.get('metric'))} | "
+                f"{_metric_text(row.get('baseline_value'))} | {_metric_text(row.get('current_value'))} | {_metric_text(row.get('absolute_delta'))} |"
+            )
+
+    lines.extend(["", "## 8. Query-Level Findings", ""])
     if summary.get("brand_by_query"):
-        lines.extend([
-            "| Query ID | 品牌/机构 | 提及回答数 | Query 内提及率 | 推荐回答数 | 提及后推荐率 |",
-            "|---|---|---:|---:|---:|---:|",
-        ])
+        lines.extend(
+            [
+                "| Query ID | 品牌/机构 | 提及回答数 | Query 内提及率 | 推荐回答数 | 提及后推荐率 |",
+                "|---|---|---:|---:|---:|---:|",
+            ]
+        )
         for row in summary["brand_by_query"][:30]:
             lines.append(
                 f"| {table_cell(row['query_id'])} | {table_cell(row['brand_name_canonical'])} | "
@@ -1185,41 +1500,47 @@ def build_job_markdown(summary: dict[str, Any]) -> str:
     if summary.get("query_stability"):
         lines.extend(["", "采样稳定性：", "", "| Query ID | 成功重复数 | 样本充足 | 品牌集合 Jaccard | Top Brands |", "|---|---:|---:|---:|---|"])
         for row in summary["query_stability"]:
-            lines.append(f"| {table_cell(row['query_id'])} | {row['successful_repeats']} | {row['sample_sufficient']} | {row['brand_set_jaccard_avg']} | {table_cell(row['top_brands'])} |")
+            lines.append(
+                f"| {table_cell(row['query_id'])} | {row['successful_repeats']} | {row['sample_sufficient']} | "
+                f"{row['brand_set_jaccard_avg']} | {table_cell(row['top_brands'])} |"
+            )
 
-    lines.extend([
-        "",
-        "## 8. Methodology & Caveats",
-        "",
-        "- Runner 真实请求只发送 query 文本；目标品牌、行业和市场只用于任务记录与后处理。",
-        "- 品牌发现来自 LLM 对 response_text 的开放式实体抽取，不依赖预置竞品 alias。",
-        "- SOV 表示当前 LLM 回答样本内的品牌命中事件份额，不等同于真实市场份额或 App 端真实排名。",
-        "- 来源表基于响应结构中的 source URL 解析，来源序号不等同于页面真实排名。",
-        "- 推荐率、排名和情感来自回答文本语义抽取，低样本量或 partial sample 下应降低结论强度。",
-        "- 目标品牌是否出现基于抽取与归一化结果，仍建议对关键样本人工复核。",
-        "",
-        "## 9. Output Files",
-        "",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 9. Methodology & Caveats",
+            "",
+            "- Runner 真实请求只发送 query 文本；目标品牌、行业和市场只用于任务记录与后处理。",
+            "- 品牌发现来自 LLM 对 response_text 的开放式实体抽取，不依赖预置竞品 alias。",
+            "- SOV 表示当前 LLM 回答样本内的品牌命中事件份额，不等同于真实市场份额或 App 端真实排名。",
+            "- 来源表基于响应结构中的 source URL 解析，来源序号不等同于页面真实排名。",
+            "- 推荐率、排名和情感来自回答文本语义抽取，低样本量或 partial sample 下应降低结论强度。",
+            "- 目标品牌是否出现基于抽取与归一化结果，仍建议对关键样本人工复核。",
+            "",
+            "## 10. Output Files",
+            "",
+        ]
+    )
     for key, value in (summary.get("analysis_files") or {}).items():
         lines.append(f"- `{key}`: `{table_cell(value)}`")
     for key, value in (summary.get("report_files") or {}).items():
         lines.append(f"- 报告文件 `{key}`: `{table_cell(value)}`")
     for key, value in (summary.get("aggregate_files") or {}).items():
         lines.append(f"- 跨 job 聚合 `{key}`: `{table_cell(value)}`")
+    for key, value in (summary.get("aggregate_targets") or {}).items():
+        lines.append(f"- 跨 job 聚合目标 `{key}`（以 aggregate manifest 为提交依据）: `{table_cell(value)}`")
     lines.append("")
     return "\n".join(lines)
 
 
 def update_cross_job_aggregates(bundle_dir: Path, summary: dict[str, Any]) -> dict[str, Path]:
-    runs_root = _runs_root_for_bundle(bundle_dir)
-    aggregate_dir = runs_root / "aggregate"
-    runs_root.mkdir(parents=True, exist_ok=True)
-    aggregate_dir.mkdir(parents=True, exist_ok=True)
-
-    index_path = runs_root / "index.jsonl"
-    brand_trends_path = aggregate_dir / "brand_trends.csv"
-    target_trends_path = aggregate_dir / "target_brand_trends.csv"
+    paths = _cross_job_aggregate_paths(bundle_dir)
+    runs_root = paths["runs_index"].parent
+    ensure_private_directory(runs_root)
+    ensure_private_directory(paths["brand_trends"].parent)
+    index_path = paths["runs_index"]
+    brand_trends_path = paths["brand_trends"]
+    target_trends_path = paths["target_brand_trends"]
 
     with _file_lock(runs_root / ".aggregate.lock"):
         _upsert_jsonl(index_path, _job_index_row(bundle_dir, summary), key="job_id")
@@ -1229,16 +1550,104 @@ def update_cross_job_aggregates(bundle_dir: Path, summary: dict[str, Any]) -> di
             key_fields=["job_id", "brand_name_canonical"],
             replace_fields={"job_id": _job_id(summary, bundle_dir)},
         )
-        target_rows = [_brand_trend_row(summary, row, diagnosis=summary.get("target_diagnosis") or {}) for row in summary.get("brand_summary", []) if int(row.get("is_target_brand") or 0)]
+        target_rows = [
+            _brand_trend_row(summary, row, diagnosis=summary.get("target_diagnosis") or {})
+            for row in summary.get("brand_summary", [])
+            if int(row.get("is_target_brand") or 0)
+        ]
         if not target_rows:
             target_rows = [_empty_target_trend_row(summary)]
-        _upsert_csv_rows(target_trends_path, target_rows, key_fields=["job_id", "brand_name_canonical"], replace_fields={"job_id": _job_id(summary, bundle_dir)})
+        _upsert_csv_rows(
+            target_trends_path, target_rows, key_fields=["job_id", "brand_name_canonical"], replace_fields={"job_id": _job_id(summary, bundle_dir)}
+        )
+        aggregate_manifest = {
+            "schema_version": "geo-aggregate-v1",
+            "updated_at": utc_now_iso(),
+            "last_job_id": _job_id(summary, bundle_dir),
+            "files": {
+                key: {"path": path.name, "sha256": _file_sha256(path), "size_bytes": path.stat().st_size}
+                for key, path in paths.items()
+                if key != "aggregate_manifest"
+            },
+        }
+        _write_json_atomic(paths["aggregate_manifest"], aggregate_manifest)
 
+    return paths
+
+
+def _cross_job_aggregate_paths(bundle_dir: Path) -> dict[str, Path]:
+    runs_root = _runs_root_for_bundle(bundle_dir)
+    aggregate_dir = runs_root / "aggregate"
     return {
-        "runs_index": index_path,
-        "brand_trends": brand_trends_path,
-        "target_brand_trends": target_trends_path,
+        "runs_index": runs_root / "index.jsonl",
+        "brand_trends": aggregate_dir / "brand_trends.csv",
+        "target_brand_trends": aggregate_dir / "target_brand_trends.csv",
+        "aggregate_manifest": aggregate_dir / "aggregate_manifest.json",
     }
+
+
+def _load_intelligence_history(
+    bundle_dir: Path,
+    manifest: dict[str, Any],
+    sample_mode: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load only current, comparable sibling analyses for trend calculations."""
+
+    runs_root = _runs_root_for_bundle(bundle_dir)
+    overview_rows: list[dict[str, Any]] = []
+    visibility_rows: list[dict[str, Any]] = []
+    if not runs_root.exists():
+        return overview_rows, visibility_rows
+    bundle_resolved = bundle_dir.resolve()
+    for sibling in sorted(runs_root.iterdir(), key=lambda path: path.name):
+        if not sibling.is_dir() or sibling.is_symlink() or sibling.resolve() == bundle_resolved:
+            continue
+        summary_path = sibling / "logs" / "analysis_summary.json"
+        manifest_path = sibling / "job_manifest.json"
+        if not summary_path.is_file() or not manifest_path.is_file():
+            continue
+        try:
+            sibling_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            sibling_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not str(sibling_manifest.get("status") or "").startswith("analyzed"):
+            continue
+        commit_valid, _ = validate_analysis_commit(sibling, sibling_manifest, sibling_summary)
+        if not commit_valid:
+            continue
+        if not _comparable_history_run(manifest, sample_mode, sibling_manifest, sibling_summary):
+            continue
+        overview_path = sibling / "result" / "geo_overview_scores.csv"
+        visibility_path = sibling / "result" / "visibility_summary.csv"
+        if overview_path.is_file() and not overview_path.is_symlink():
+            overview_rows.extend(_read_csv_rows(overview_path))
+        if visibility_path.is_file() and not visibility_path.is_symlink():
+            visibility_rows.extend(_read_csv_rows(visibility_path))
+    return overview_rows, visibility_rows
+
+
+def _comparable_history_run(
+    manifest: dict[str, Any],
+    sample_mode: str,
+    sibling_manifest: dict[str, Any],
+    sibling_summary: dict[str, Any],
+) -> bool:
+    if str(sibling_summary.get("sample_mode") or "") != sample_mode:
+        return False
+    if str(sibling_summary.get("target_brand") or "") != str(manifest.get("target_brand") or ""):
+        return False
+    if int(sibling_summary.get("run_generation") or 0) != int(sibling_manifest.get("run_generation") or 0):
+        return False
+    current_profile = manifest.get("comparability_profile") or {}
+    sibling_profile = sibling_summary.get("comparability_profile") or sibling_manifest.get("comparability_profile") or {}
+    keys = ("study_fingerprint", "sampling_fingerprint", "analysis_fingerprint")
+    for key in keys:
+        current = str(current_profile.get(key) or "")
+        previous = str(sibling_profile.get(key) or "")
+        if current != previous:
+            return False
+    return True
 
 
 def evaluate_data_quality(
@@ -1263,6 +1672,7 @@ def evaluate_data_quality(
     manifest_ids = {str(query["query_id"]) for query in manifest["queries"]}
     manifest_queries = {str(query["query_id"]): str(query["query"]) for query in manifest["queries"]}
     raw_units: list[tuple[str, int, str]] = []
+    raw_execution_units: list[tuple[str, int, str, str]] = []
     invalid_records: list[dict[str, Any]] = []
     analysis_signatures = {_record_attempt_signature(record) for record in analysis_records if safe_result_key(record) is not None}
     raw_records_by_signature: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
@@ -1276,6 +1686,14 @@ def evaluate_data_quality(
             continue
         qid, repeat = key
         raw_units.append((qid, repeat, status))
+        raw_execution_units.append(
+            (
+                qid,
+                repeat,
+                status,
+                str(record.get("run_execution_id") or record.get("run_id") or "__legacy"),
+            )
+        )
         signature = _record_attempt_signature(record)
         raw_records_by_signature[signature] = (index, record)
         if status in analysis_statuses and signature not in analysis_signatures:
@@ -1288,15 +1706,40 @@ def evaluate_data_quality(
         signature = _record_attempt_signature(record)
         record_index, contract_record = raw_records_by_signature.get(signature, (0, record))
         contract_mismatches.extend(_record_contract_mismatches(contract_record, manifest, manifest_queries, qid, repeat, record_index))
-    duplicate_counts = Counter((qid, repeat) for qid, repeat, status in raw_units if status in analysis_statuses)
-    duplicate_units = [{"query_id": qid, "repeat_index": repeat, "count": count} for (qid, repeat), count in duplicate_counts.items() if count > 1]
+    duplicate_counts = Counter((qid, repeat, execution_id) for qid, repeat, status, execution_id in raw_execution_units if status in analysis_statuses)
+    duplicate_units = [
+        {"query_id": qid, "repeat_index": repeat, "run_execution_id": execution_id, "count": count}
+        for (qid, repeat, execution_id), count in duplicate_counts.items()
+        if count > 1
+    ]
+    execution_counts: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for qid, repeat, status, execution_id in raw_execution_units:
+        if status in analysis_statuses:
+            execution_counts[(qid, repeat)].add(execution_id)
+    historical_reexecution_units = [
+        {"query_id": qid, "repeat_index": repeat, "execution_count": len(executions)}
+        for (qid, repeat), executions in sorted(execution_counts.items())
+        if len(executions) > 1
+    ]
     missing_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(expected_units - actual_units)]
     extra_units = [{"query_id": qid, "repeat_index": repeat} for qid, repeat in sorted(actual_units - expected_units)]
     extra_query_ids = sorted({qid for qid, _, _ in raw_units if qid not in manifest_ids and qid != "None"})
     profile_quality_flags = _profile_quality_flags(manifest)
     web_search_quality_flags = _web_search_quality_flags(analysis_records, manifest)
     source_quality_flags = _source_quality_flags(analysis_records, manifest)
-    partial = bool(latest_failed_units or missing_units or missing_unknown_units_count or extra_units or duplicate_units or raw_read_errors or invalid_records or contract_mismatches or profile_quality_flags or web_search_quality_flags or source_quality_flags)
+    partial = bool(
+        latest_failed_units
+        or missing_units
+        or missing_unknown_units_count
+        or extra_units
+        or duplicate_units
+        or raw_read_errors
+        or invalid_records
+        or contract_mismatches
+        or profile_quality_flags
+        or web_search_quality_flags
+        or source_quality_flags
+    )
     conclusion_strength = "observational" if partial else "strong"
     result = {
         "planned_units": len(expected_units) + missing_unknown_units_count,
@@ -1309,6 +1752,7 @@ def evaluate_data_quality(
         "extra_query_ids": extra_query_ids,
         "latest_failed_units": latest_failed_units,
         "duplicate_units": duplicate_units,
+        "historical_reexecution_units": historical_reexecution_units,
         "invalid_records": invalid_records,
         "contract_mismatches": contract_mismatches,
         "superseded_contract_mismatches": superseded_contract_mismatches,
@@ -1359,30 +1803,36 @@ def _web_search_quality_flags(records: list[dict[str, Any]], manifest: dict[str,
         status = record.get("web_search_requirement_status")
         if status in (None, ""):
             if required:
-                flags.append({
-                    "query_id": record.get("query_id", ""),
-                    "repeat_index": record.get("repeat_index", 1),
-                    "status": "not_verifiable",
-                    "evidence": record.get("web_search_evidence", ""),
-                    "reason": "missing_web_search_requirement_status",
-                })
+                flags.append(
+                    {
+                        "query_id": record.get("query_id", ""),
+                        "repeat_index": record.get("repeat_index", 1),
+                        "status": "not_verifiable",
+                        "evidence": record.get("web_search_evidence", ""),
+                        "reason": "missing_web_search_requirement_status",
+                    }
+                )
             continue
         if status in {"satisfied", "not_applicable"}:
             if required and status == "satisfied" and not record.get("web_search_evidence"):
-                flags.append({
-                    "query_id": record.get("query_id", ""),
-                    "repeat_index": record.get("repeat_index", 1),
-                    "status": "not_verifiable",
-                    "evidence": "",
-                    "reason": "missing_web_search_evidence",
-                })
+                flags.append(
+                    {
+                        "query_id": record.get("query_id", ""),
+                        "repeat_index": record.get("repeat_index", 1),
+                        "status": "not_verifiable",
+                        "evidence": "",
+                        "reason": "missing_web_search_evidence",
+                    }
+                )
             continue
-        flags.append({
-            "query_id": record.get("query_id", ""),
-            "repeat_index": record.get("repeat_index", 1),
-            "status": status,
-            "evidence": record.get("web_search_evidence", ""),
-        })
+        flags.append(
+            {
+                "query_id": record.get("query_id", ""),
+                "repeat_index": record.get("repeat_index", 1),
+                "status": status,
+                "evidence": record.get("web_search_evidence", ""),
+            }
+        )
     return flags
 
 
@@ -1395,20 +1845,24 @@ def _source_quality_flags(records: list[dict[str, Any]], manifest: dict[str, Any
         status = record.get("source_parse_status")
         if status in (None, ""):
             if source_grain == "url":
-                flags.append({
-                    "query_id": record.get("query_id", ""),
-                    "repeat_index": record.get("repeat_index", 1),
-                    "status": "missing",
-                    "reason": "missing_source_parse_status",
-                })
+                flags.append(
+                    {
+                        "query_id": record.get("query_id", ""),
+                        "repeat_index": record.get("repeat_index", 1),
+                        "status": "missing",
+                        "reason": "missing_source_parse_status",
+                    }
+                )
             continue
         if status in {"parsed", "provider_returned_empty", "unsupported_by_protocol", "not_applicable"}:
             continue
-        flags.append({
-            "query_id": record.get("query_id", ""),
-            "repeat_index": record.get("repeat_index", 1),
-            "status": status,
-        })
+        flags.append(
+            {
+                "query_id": record.get("query_id", ""),
+                "repeat_index": record.get("repeat_index", 1),
+                "status": status,
+            }
+        )
     return flags
 
 
@@ -1517,9 +1971,7 @@ def _apply_target_alias_canonicalization(canonical_map: dict[str, str], raw_name
     target_keys.update(normalize_brand_name(alias) for alias in manifest.get("target_aliases", []) if alias)
     merged = dict(canonical_map)
     target_canonicals = {
-        canonical
-        for raw, canonical in merged.items()
-        if normalize_brand_name(raw) in target_keys or normalize_brand_name(canonical) in target_keys
+        canonical for raw, canonical in merged.items() if normalize_brand_name(raw) in target_keys or normalize_brand_name(canonical) in target_keys
     }
     for raw in raw_names:
         raw_key = normalize_brand_name(raw)
@@ -1531,12 +1983,14 @@ def _apply_target_alias_canonicalization(canonical_map: dict[str, str], raw_name
 
 def _apply_extraction_quality(data_quality: dict[str, Any], errors: list[dict[str, Any]], analysis_record_count: int) -> None:
     error_row_count = len(errors)
-    error_record_count = len(_error_record_keys(errors))
+    has_global_error = any(str(error.get("scope") or "").lower() == "global" for error in errors)
+    error_record_count = analysis_record_count if has_global_error else len(_error_record_keys(errors))
+    error_record_count = min(error_record_count, analysis_record_count)
     data_quality["extraction_error_count"] = error_record_count
     data_quality["extraction_error_record_count"] = error_record_count
     data_quality["extraction_error_row_count"] = error_row_count
     data_quality["extraction_error_rate"] = _pct(error_record_count / (analysis_record_count or 1))
-    quarantine_count = sum(1 for error in errors if str(error.get("reason") or error.get("type") or "") == "untraceable_extraction_item")
+    quarantine_count = sum(1 for error in errors if str(error.get("type") or "") == "TraceabilityQuarantine")
     if quarantine_count:
         data_quality["traceability_quarantine_count"] = quarantine_count
     if error_row_count:
@@ -1565,13 +2019,19 @@ def _empty_cache_stats() -> dict[str, Any]:
         "canonicalization_cache_misses": 0,
         "canonicalization_cache_writes": 0,
         "cache_load_error_count": 0,
+        "cache_validation_error_count": 0,
         "analysis_llm_requests_remaining": 0,
+        "analysis_circuit_breaker": False,
+        "analysis_circuit_breaker_reason": "",
+        "analysis_not_started_count": 0,
     }
 
 
 def _merge_cache_stats(base: dict[str, Any], update: dict[str, Any]) -> None:
     for key, value in update.items():
-        if isinstance(value, int) and isinstance(base.get(key), int):
+        if isinstance(value, bool):
+            base[key] = bool(base.get(key)) or value
+        elif isinstance(value, int) and isinstance(base.get(key), int) and not isinstance(base.get(key), bool):
             base[key] += value
         else:
             base[key] = value
@@ -1608,6 +2068,8 @@ def _estimate_live_cache_requests(
             cached_rows.extend(rows)
         else:
             stats["extraction_cache_misses"] += 1
+            if entry is not None:
+                stats["cache_validation_error_count"] += 1
     stats["cache_load_error_count"] += extraction_cache.load_error_count
     if stats["extraction_cache_misses"]:
         stats["canonicalization_cache_misses"] = 1
@@ -1623,10 +2085,12 @@ def _estimate_live_cache_requests(
                         canonicalizer_model=extractor_model,
                     )
                 )
-            if entry is not None:
+            if entry is not None and is_valid_canonical_map(entry.get("canonical_map"), raw_names):
                 stats["canonicalization_cache_hits"] = 1
             else:
                 stats["canonicalization_cache_misses"] = 1
+                if entry is not None:
+                    stats["cache_validation_error_count"] += 1
             stats["cache_load_error_count"] += canonical_cache.load_error_count
     stats["analysis_llm_requests_remaining"] = stats["extraction_cache_misses"] + stats["canonicalization_cache_misses"]
     return stats
@@ -1646,7 +2110,10 @@ def _extract_mentions(
     errors_out: list[dict[str, Any]] = []
     stats = _empty_cache_stats()
     cache = JsonlCache(logs / "extraction_cache.jsonl") if cache_enabled else None
-    for record in records:
+    observed_calls = 0
+    failed_calls = 0
+    consecutive_failures = 0
+    for record_index, record in enumerate(records):
         entry = None
         if cache is not None and not refresh_extraction_cache:
             entry = cache.get(
@@ -1667,9 +2134,18 @@ def _extract_mentions(
             continue
         if cache is not None:
             stats["extraction_cache_misses"] += 1
+            if entry is not None:
+                stats["cache_validation_error_count"] += 1
         if active_extractor is None:
             raise ValueError("抽取缓存未命中，且没有可用 extractor；请使用 --confirm-cost 后重试")
         rows, error = active_extractor(record)
+        observed_calls += 1
+        hard_failure = bool(error) and str((error or {}).get("type") or "") != "TraceabilityQuarantine"
+        if hard_failure:
+            failed_calls += 1
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
         rows_out.extend(rows)
         error_rows = _extraction_error_rows(error, settings, record=record)
         errors_out.extend(error_rows)
@@ -1684,6 +2160,27 @@ def _extract_mentions(
                 )
             )
             stats["extraction_cache_writes"] += 1
+        breaker_reason = ""
+        if consecutive_failures >= settings.max_consecutive_errors:
+            breaker_reason = "consecutive_errors"
+        elif observed_calls >= 5 and failed_calls / observed_calls >= settings.max_error_rate:
+            breaker_reason = "error_rate"
+        if breaker_reason:
+            remaining = records[record_index + 1 :]
+            stats["analysis_circuit_breaker"] = True
+            stats["analysis_circuit_breaker_reason"] = breaker_reason
+            stats["analysis_not_started_count"] = len(remaining)
+            for skipped in remaining:
+                errors_out.append(
+                    {
+                        "type": "AnalysisCircuitBreaker",
+                        "message": f"分析抽取熔断：{breaker_reason}",
+                        "query_id": skipped.get("query_id"),
+                        "repeat_index": skipped.get("repeat_index") or 1,
+                        "reason": "analysis_not_started",
+                    }
+                )
+            break
     if cache is not None:
         stats["cache_load_error_count"] += cache.load_error_count
     stats["analysis_llm_requests_remaining"] = stats["extraction_cache_misses"] + stats["canonicalization_cache_misses"]
@@ -1705,10 +2202,12 @@ def _canonicalize_with_cache(
     )
     if not refresh_extraction_cache:
         entry = cache.get(key)
-        if entry is not None and isinstance(entry.get("canonical_map"), dict):
+        if entry is not None and is_valid_canonical_map(entry.get("canonical_map"), raw_names):
             stats["canonicalization_cache_hits"] = 1
             stats["cache_load_error_count"] += cache.load_error_count
             return {str(k): str(v) for k, v in entry["canonical_map"].items()}, None, stats
+        if entry is not None:
+            stats["cache_validation_error_count"] += 1
     stats["canonicalization_cache_misses"] = 1
     canonical_map, canonical_error = extractor_obj.canonicalize(raw_names)
     if canonical_error is None:
@@ -1742,10 +2241,12 @@ def _canonicalize_from_cache_only(
                 canonicalizer_model=canonicalizer_model,
             )
         )
-    if entry is not None and isinstance(entry.get("canonical_map"), dict):
+    if entry is not None and is_valid_canonical_map(entry.get("canonical_map"), raw_names):
         stats["canonicalization_cache_hits"] = 1
         stats["cache_load_error_count"] += cache.load_error_count
         return {str(k): str(v) for k, v in entry["canonical_map"].items()}, None, stats
+    if entry is not None:
+        stats["cache_validation_error_count"] += 1
     stats["canonicalization_cache_misses"] = 1
     stats["analysis_llm_requests_remaining"] = 1
     raise ValueError("归一化缓存未命中；请使用 --confirm-cost 后重试")
@@ -1759,9 +2260,11 @@ def _cached_rows(entry: dict[str, Any], record: dict[str, Any]) -> list[dict[str
     response_text = str(record.get("response_text") or "")
     for row in rows:
         if not isinstance(row, dict):
-            continue
+            return None
         raw_name = str(row.get("brand_name_raw") or "")
-        if response_text and raw_name and normalize_brand_name(raw_name) not in normalize_brand_name(response_text):
+        if not raw_name:
+            return None
+        if response_text and not is_traceable_text(response_text, raw_name):
             return None
         copy = dict(row)
         copy["query_id"] = str(record.get("query_id"))
@@ -1789,16 +2292,20 @@ def _extraction_error_rows(error: dict[str, Any] | None, settings: Settings | No
         for row in redacted["quarantined_rows"]:
             if not isinstance(row, dict):
                 continue
-            rows.append({
-                "type": "TraceabilityQuarantine",
-                "message": redacted.get("message", ""),
-                "query_id": query_id,
-                "repeat_index": repeat_index,
-                "input_query": input_query or row.get("input_query", ""),
-                "brand_name_raw": row.get("brand_name_raw", ""),
-                "evidence": row.get("evidence", ""),
-                "reason": row.get("reason", "untraceable_extraction_item"),
-            })
+            rows.append(
+                {
+                    "type": "TraceabilityQuarantine",
+                    "message": redacted.get("message", ""),
+                    "query_id": query_id,
+                    "repeat_index": repeat_index,
+                    "input_query": input_query or row.get("input_query", ""),
+                    "brand_name_raw": row.get("brand_name_raw", ""),
+                    "evidence": row.get("evidence", ""),
+                    "reason": row.get("reason", "untraceable_extraction_item"),
+                    "claim_type": row.get("claim_type", ""),
+                    "claim_text": row.get("claim_text", ""),
+                }
+            )
         return rows
     if record:
         redacted.setdefault("query_id", record.get("query_id"))
@@ -1811,39 +2318,43 @@ def demo_extract_record(record: dict[str, Any], manifest: dict[str, Any]) -> tup
     repeat = int(record.get("repeat_index") or 1)
     query = str(record.get("input_query") or "")
     target = str(manifest.get("target_brand") or "MockTarget")
-    rows = [{
-        "query_id": qid,
-        "repeat_index": repeat,
-        "input_query": query,
-        "brand_name_raw": target,
-        "brand_type": "品牌",
-        "evidence": "mock demo sample",
-        "role": "recommended" if repeat == 1 else "mentioned",
-        "confidence": 1.0,
-        "is_recommended": repeat == 1,
-        "rank_position": 1 if repeat == 1 else "",
-        "sentiment": "neutral",
-        "mention_context": "answer",
-        "sov_eligible": True,
-        "canonical_hint": target,
-    }]
-    if repeat == 1:
-        rows.append({
+    rows = [
+        {
             "query_id": qid,
             "repeat_index": repeat,
             "input_query": query,
-            "brand_name_raw": "MockPeer",
+            "brand_name_raw": target,
             "brand_type": "品牌",
-            "evidence": "mock peer sample",
-            "role": "mentioned",
+            "evidence": "mock demo sample",
+            "role": "recommended" if repeat == 1 else "mentioned",
             "confidence": 1.0,
-            "is_recommended": False,
-            "rank_position": 2,
+            "is_recommended": repeat == 1,
+            "rank_position": 1 if repeat == 1 else "",
             "sentiment": "neutral",
             "mention_context": "answer",
             "sov_eligible": True,
-            "canonical_hint": "MockPeer",
-        })
+            "canonical_hint": target,
+        }
+    ]
+    if repeat == 1:
+        rows.append(
+            {
+                "query_id": qid,
+                "repeat_index": repeat,
+                "input_query": query,
+                "brand_name_raw": "MockPeer",
+                "brand_type": "品牌",
+                "evidence": "mock peer sample",
+                "role": "mentioned",
+                "confidence": 1.0,
+                "is_recommended": False,
+                "rank_position": 2,
+                "sentiment": "neutral",
+                "mention_context": "answer",
+                "sov_eligible": True,
+                "canonical_hint": "MockPeer",
+            }
+        )
     return rows, None
 
 
@@ -1896,46 +2407,50 @@ def compute_source_stats(records: list[dict[str, Any]], manifest: dict[str, Any]
     query_count = int(manifest.get("query_count") or len({record.get("query_id") for record in records}) or 1)
     domain_rows = []
     for domain, count in domain_occ.most_common():
-        domain_rows.append({
-            "domain": domain,
-            "citation_occurrences": count,
-            "parsed_source_occurrences": count,
-            "response_coverage": len(domain_responses[domain]),
-            "response_coverage_rate": _pct(len(domain_responses[domain]) / total_records),
-            "query_coverage": len(domain_queries[domain]),
-            "query_coverage_rate": _pct(len(domain_queries[domain]) / query_count),
-            "avg_rank": round(statistics.mean(domain_ranks[domain]), 2) if domain_ranks[domain] else "",
-            "avg_source_order": round(statistics.mean(domain_ranks[domain]), 2) if domain_ranks[domain] else "",
-            "best_rank": min(domain_ranks[domain]) if domain_ranks[domain] else "",
-            "best_source_order": min(domain_ranks[domain]) if domain_ranks[domain] else "",
-            "distinct_source_url_count": len(domain_urls[domain]),
-            "top_urls": " | ".join(url for url, _ in domain_urls[domain].most_common(3)),
-        })
+        domain_rows.append(
+            {
+                "domain": domain,
+                "citation_occurrences": count,
+                "parsed_source_occurrences": count,
+                "response_coverage": len(domain_responses[domain]),
+                "response_coverage_rate": _pct(len(domain_responses[domain]) / total_records),
+                "query_coverage": len(domain_queries[domain]),
+                "query_coverage_rate": _pct(len(domain_queries[domain]) / query_count),
+                "avg_rank": round(statistics.mean(domain_ranks[domain]), 2) if domain_ranks[domain] else "",
+                "avg_source_order": round(statistics.mean(domain_ranks[domain]), 2) if domain_ranks[domain] else "",
+                "best_rank": min(domain_ranks[domain]) if domain_ranks[domain] else "",
+                "best_source_order": min(domain_ranks[domain]) if domain_ranks[domain] else "",
+                "distinct_source_url_count": len(domain_urls[domain]),
+                "top_urls": " | ".join(url for url, _ in domain_urls[domain].most_common(3)),
+            }
+        )
     url_rows = [
         {
             "url": url,
             "domain": url_meta[url]["domain"],
-                "title": url_meta[url]["title"],
-                "citation_occurrences": count,
-                "parsed_source_occurrences": count,
-            }
+            "title": url_meta[url]["title"],
+            "citation_occurrences": count,
+            "parsed_source_occurrences": count,
+        }
         for url, count in url_occ.most_common()
     ]
     by_query_rows = []
     for (qid, domain), cell in sorted(by_query_domain.items()):
         qrecs = [record for record in records if record.get("query_id") == qid]
-        by_query_rows.append({
-            "query_id": qid,
-            "domain": domain,
-            "repeat_coverage": len(cell["repeats"]),
-            "repeat_coverage_rate": _pct(len(cell["repeats"]) / (len(qrecs) or 1)),
-            "citation_occurrences": cell["occ"],
-            "parsed_source_occurrences": cell["occ"],
-            "avg_rank": round(statistics.mean(cell["ranks"]), 2) if cell["ranks"] else "",
-            "avg_source_order": round(statistics.mean(cell["ranks"]), 2) if cell["ranks"] else "",
-            "distinct_source_url_count": len(cell["urls"]),
-            "top_urls": " | ".join(url for url, _ in cell["urls"].most_common(3)),
-        })
+        by_query_rows.append(
+            {
+                "query_id": qid,
+                "domain": domain,
+                "repeat_coverage": len(cell["repeats"]),
+                "repeat_coverage_rate": _pct(len(cell["repeats"]) / (len(qrecs) or 1)),
+                "citation_occurrences": cell["occ"],
+                "parsed_source_occurrences": cell["occ"],
+                "avg_rank": round(statistics.mean(cell["ranks"]), 2) if cell["ranks"] else "",
+                "avg_source_order": round(statistics.mean(cell["ranks"]), 2) if cell["ranks"] else "",
+                "distinct_source_url_count": len(cell["urls"]),
+                "top_urls": " | ".join(url for url, _ in cell["urls"].most_common(3)),
+            }
+        )
     return {"source_domains": domain_rows, "source_urls": url_rows, "source_by_query": by_query_rows}
 
 
@@ -2016,20 +2531,21 @@ def _coerce_optional_bool(value: Any) -> bool | None:
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]], *, schema: str | None = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     base_fields = CSV_FIELD_SCHEMAS.get(schema or "", [])
     row_fields = {key for row in rows for key in row.keys()}
-    fieldnames = list(base_fields) if base_fields else sorted(row_fields)
+    fieldnames = [*base_fields, *sorted(row_fields - set(base_fields))]
     if not fieldnames:
         fieldnames = ["empty"]
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        with tmp_path.open("w", encoding="utf-8-sig", newline="") as f:
+        with open_private_text(tmp_path, encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for row in rows:
                 writer.writerow(sanitize_csv_row(row))
         os.replace(tmp_path, path)
+        secure_private_file(path)
     finally:
         try:
             tmp_path.unlink()
@@ -2039,6 +2555,21 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], *, schema: str | None = N
 
 def _pct(value: float) -> str:
     return f"{value * 100:.1f}%"
+
+
+def _metric_text(value: Any) -> str:
+    if value in (None, ""):
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return table_cell(value)
+
+
+def _ratio_text(value: Any) -> str:
+    if value in (None, ""):
+        return "N/A"
+    ratio = as_ratio(value)
+    return f"{ratio * 100:.1f}%" if ratio is not None else table_cell(value)
 
 
 def _pct_points(value: float) -> str:
@@ -2072,12 +2603,51 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
+def _normalized_recommendation_type(row: dict[str, Any]) -> str:
+    explicit = str(row.get("recommendation_type") or "").strip().lower()
+    if explicit in RECOMMENDATION_STRENGTH:
+        return "mentioned_only" if explicit == "not_mentioned" else explicit
+    role = str(row.get("role") or "").strip().lower()
+    role_mapping = {
+        "discouraged": "discouraged",
+        "avoid": "discouraged",
+        "warning": "warning",
+        "conditional": "conditional",
+        "strong_alternative": "strong_alternative",
+        "alternative": "strong_alternative",
+        "budget_pick": "budget_pick",
+        "premium_pick": "premium_pick",
+        "best_for_use_case": "best_for_use_case",
+        "top_pick": "top_pick",
+        "recommended": "recommended",
+    }
+    if role in role_mapping:
+        return role_mapping[role]
+    if row.get("is_recommended") not in (None, ""):
+        return "recommended" if _as_bool(row.get("is_recommended")) else "mentioned_only"
+    if _as_positive_int(row.get("rank_position")) is not None:
+        return "recommended"
+    return "mentioned_only"
+
+
+def _add_nonempty(target: set[str], value: Any) -> None:
+    text = str(value or "").strip()
+    if text:
+        target.add(text)
+
+
 def _as_positive_int(value: Any) -> int | None:
-    if value in {None, ""}:
+    if value in {None, ""} or isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
         parsed = int(value)
-    except Exception:
+    elif isinstance(value, str) and value.strip().lstrip("+").isdigit():
+        parsed = int(value.strip())
+    else:
         return None
     return parsed if parsed > 0 else None
 
@@ -2085,7 +2655,8 @@ def _as_positive_int(value: Any) -> int | None:
 def _dominant_sentiment(counter: Counter) -> str:
     if not counter:
         return "unknown"
-    priority = {"positive": 0, "neutral": 1, "negative": 2, "unknown": 3}
+    # Ties must not silently turn mixed evidence into a positive signal.
+    priority = {"negative": 0, "neutral": 1, "positive": 2, "unknown": 3}
     return sorted(counter.items(), key=lambda item: (-item[1], priority.get(item[0], 9)))[0][0]
 
 
@@ -2153,15 +2724,17 @@ def _build_target_diagnosis(
     for qid in query_ids:
         reps = mentions_by_query_brand.get((qid, canonical), set())
         recs = recommended_by_query_brand.get((qid, canonical), set())
-        query_details.append({
-            "query_id": qid,
-            "query": query_text.get(qid, ""),
-            "target_mentions": len(reps),
-            "target_mention_rate": _pct(len(reps) / expected_repeats) if expected_repeats else "0.0%",
-            "target_recommendations": len(recs),
-            "target_recommendation_rate": _pct(len(recs) / len(reps)) if reps else "0.0%",
-            "target_recommendation_rate_over_success": _pct(len(recs) / expected_repeats) if expected_repeats else "0.0%",
-        })
+        query_details.append(
+            {
+                "query_id": qid,
+                "query": query_text.get(qid, ""),
+                "target_mentions": len(reps),
+                "target_mention_rate": _pct(len(reps) / expected_repeats) if expected_repeats else "0.0%",
+                "target_recommendations": len(recs),
+                "target_recommendation_rate": _pct(len(recs) / len(reps)) if reps else "0.0%",
+                "target_recommendation_rate_over_success": _pct(len(recs) / expected_repeats) if expected_repeats else "0.0%",
+            }
+        )
     return {
         "target_brand": manifest["target_brand"],
         "target_detected": True,
@@ -2357,11 +2930,7 @@ def _upsert_jsonl(path: Path, row: dict[str, Any], *, key: str) -> None:
 def _upsert_csv_rows(path: Path, rows: list[dict[str, Any]], *, key_fields: list[str], replace_fields: dict[str, Any] | None = None) -> None:
     existing = _read_csv_rows(path) if path.exists() else []
     if replace_fields:
-        existing = [
-            row
-            for row in existing
-            if not all(str(row.get(field, "")) == str(value) for field, value in replace_fields.items())
-        ]
+        existing = [row for row in existing if not all(str(row.get(field, "")) == str(value) for field, value in replace_fields.items())]
     merged = {tuple(str(row.get(field, "")) for field in key_fields): row for row in existing}
     for row in rows:
         merged[tuple(str(row.get(field, "")) for field in key_fields)] = row
@@ -2383,10 +2952,15 @@ class _file_lock:
         self.fd: int | None = None
 
     def __enter__(self) -> "_file_lock":
+        ensure_private_directory(self.path.parent)
         deadline = time.monotonic() + self.timeout_seconds
         while True:
             try:
-                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                self.fd = os.open(
+                    self.path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
                 os.write(self.fd, str(os.getpid()).encode("utf-8"))
                 return self
             except FileExistsError:
@@ -2416,16 +2990,89 @@ class _file_lock:
 
 
 def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         write_jsonl(tmp_path, rows)
         os.replace(tmp_path, path)
+        secure_private_file(path)
     finally:
         try:
             tmp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    _write_text_atomic(path, json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _write_text_atomic(path: Path, value: str) -> None:
+    ensure_private_directory(path.parent)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with open_private_text(tmp_path) as handle:
+            handle.write(value)
+        os.replace(tmp_path, path)
+        secure_private_file(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _build_analysis_artifact_manifest(
+    *,
+    root: Path,
+    manifest: dict[str, Any],
+    analysis_summary: Path,
+    analysis_files: dict[str, Path],
+    report_files: dict[str, Path],
+) -> dict[str, Any]:
+    artifact_paths = {**analysis_files, **{f"report_{key}": value for key, value in report_files.items()}}
+    artifact_paths["analysis_summary"] = analysis_summary
+    inputs = {
+        "raw_attempts": raw_attempts_path(root),
+        "query_manifest": root / "work" / "query_manifest.csv",
+    }
+    return {
+        "schema_version": "analysis-artifacts-v1",
+        "job_id": manifest.get("job_id"),
+        "run_generation": int(manifest.get("run_generation") or 0),
+        "extraction_schema_version": EXTRACTION_SCHEMA_VERSION,
+        "intelligence_schema_version": INTELLIGENCE_SCHEMA_VERSION,
+        "created_at": utc_now_iso(),
+        "inputs": {
+            key: _artifact_input_record(root, path, append_only=(key == "raw_attempts"), required=(key != "query_manifest"))
+            for key, path in inputs.items()
+            if path.is_file() and not path.is_symlink()
+        },
+        "artifacts": {
+            key: {"path": _rel(root, path), "sha256": _file_sha256(path), "size_bytes": path.stat().st_size}
+            for key, path in sorted(artifact_paths.items())
+            if path.is_file() and not path.is_symlink()
+        },
+    }
+
+
+def _artifact_input_record(root: Path, path: Path, *, append_only: bool, required: bool) -> dict[str, Any]:
+    record = {
+        "path": _rel(root, path),
+        "sha256": _file_sha256(path),
+        "size_bytes": path.stat().st_size,
+        "required_after_cleanup": required,
+        "validation_mode": "append_only_prefix" if append_only else "exact",
+    }
+    return record
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _rel(root: Path, path: Path) -> str:

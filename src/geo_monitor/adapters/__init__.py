@@ -17,4 +17,3 @@ __all__ = [
     "get_adapter",
     "get_capabilities",
 ]
-

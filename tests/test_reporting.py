@@ -58,16 +58,18 @@ def test_build_job_markdown_escapes_dynamic_raw_html():
 
 
 def test_build_html_renders_markdown_table_and_inline_formatting():
-    markdown = "\n".join([
-        "# Test Report",
-        "",
-        "| Col | Value |",
-        "|---|---|",
-        "| A | **B** |",
-        "",
-        "- item",
-        "> note",
-    ])
+    markdown = "\n".join(
+        [
+            "# Test Report",
+            "",
+            "| Col | Value |",
+            "|---|---|",
+            "| A | **B** |",
+            "",
+            "- item",
+            "> note",
+        ]
+    )
 
     html = build_html(markdown, {"title": "Test Report"})
 
