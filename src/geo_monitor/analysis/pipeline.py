@@ -23,7 +23,6 @@ from ..brand_extraction import (
     normalize_brand_name,
 )
 from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings, workspace_root
-from ..db import validate_analysis_commit
 from ..exporters import (
     canonical_request_hash,
     latest_live_terminal_records,
@@ -52,7 +51,7 @@ from ..job import (
     work_dir,
 )
 from ..query_meta import query_metadata_json, tags_text
-from ..reporting import build_html, markdown_text, table_cell, try_generate_pdf
+from ..reporting import render_report_bundle
 from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, base_url_fingerprint, legacy_payload_hash, request_fingerprint
 from ..schemas import utc_now_iso
 from .cache import (
@@ -64,227 +63,9 @@ from .cache import (
     raw_names_hash,
     response_text_hash,
 )
-from .intelligence import INTELLIGENCE_BASE_FIELDS, INTELLIGENCE_SCHEMA_VERSION, INTELLIGENCE_TABLE_NAMES, build_intelligence_outputs
-from .intelligence.common import as_ratio
-
-EXTRACTION_SCHEMA_VERSION = "brand-extraction-v4"
-
-
-CSV_FIELD_SCHEMAS = {
-    "brand_mentions_extracted": [
-        "query_id",
-        "repeat_index",
-        "input_query",
-        "brand_name_raw",
-        "brand_name_canonical",
-        "brand_type",
-        "sov_eligible",
-        "role",
-        "is_recommended",
-        "rank_position",
-        "sentiment",
-        "mention_context",
-        "confidence",
-        "evidence",
-        "canonical_hint",
-    ],
-    "brand_canonical_map": ["brand_name_raw", "brand_name_canonical"],
-    "brand_summary": [
-        "sov_rank",
-        "brand_name_canonical",
-        "raw_names",
-        "responses_mentioned",
-        "response_mention_count",
-        "mention_rate",
-        "response_mention_rate",
-        "query_coverage",
-        "query_coverage_count",
-        "query_coverage_rate",
-        "query_macro_mention_rate",
-        "sov_event_share",
-        "sov_response_share",
-        "recommended_count",
-        "recommended_rate",
-        "recommended_rate_when_mentioned",
-        "recommended_rate_over_success",
-        "rank_observed_count",
-        "rank_observed_rate",
-        "avg_rank_position",
-        "top3_rate",
-        "positive_rate",
-        "neutral_rate",
-        "negative_rate",
-        "sentiment_unknown_rate",
-        "sentiment_observed_rate",
-        "avg_confidence",
-        "is_target_brand",
-        "target_brand_detected",
-        "target_rank_by_sov",
-        "target_sov_gap_to_leader",
-        "target_sov_gap_to_top3_avg",
-    ],
-    "brand_by_query": [
-        "query_id",
-        "query",
-        "brand_name_canonical",
-        "responses_mentioned",
-        "mention_rate_within_query",
-        "recommended_responses",
-        "recommended_rate_within_query",
-        "recommended_rate_when_mentioned_within_query",
-        "recommended_rate_over_success_within_query",
-    ],
-    "query_stability": [
-        "query_id",
-        "query",
-        "successful_repeats",
-        "expected_repeats",
-        "sample_sufficient",
-        "brand_set_jaccard_avg",
-        "unique_brand_sets",
-        "top_brands",
-    ],
-    "source_entity_mentions": [
-        "query_id",
-        "repeat_index",
-        "input_query",
-        "brand_name_raw",
-        "brand_name_canonical",
-        "brand_type",
-        "sov_eligible",
-        "role",
-        "mention_context",
-        "evidence",
-    ],
-    "source_domains": [
-        "domain",
-        "parsed_source_occurrences",
-        "distinct_source_url_count",
-        "response_coverage",
-        "response_coverage_rate",
-        "query_coverage",
-        "query_coverage_rate",
-        "avg_source_order",
-        "best_source_order",
-        "top_urls",
-    ],
-    "source_urls": ["url", "domain", "title", "parsed_source_occurrences"],
-    "source_by_query": [
-        "query_id",
-        "domain",
-        "repeat_coverage",
-        "repeat_coverage_rate",
-        "parsed_source_occurrences",
-        "distinct_source_url_count",
-        "avg_source_order",
-        "top_urls",
-    ],
-    "quality_summary": [
-        "job_id",
-        "sample_mode",
-        "conclusion_strength",
-        "partial_sample",
-        "planned_units",
-        "analysis_record_count",
-        "stats_record_count",
-        "missing_unit_count",
-        "latest_failed_unit_count",
-        "web_search_quality_flag_count",
-        "source_quality_flag_count",
-        "extraction_error_record_count",
-        "extraction_error_rate",
-    ],
-    "attempt_facts": [
-        "job_id",
-        "query_id",
-        "repeat_index",
-        "latest_status",
-        "completed_at",
-        "valid_attempt",
-        "stats_included",
-        "web_search_requirement_status",
-        "web_search_evidence",
-        "source_parse_status",
-        "request_hash",
-        "attempt_id",
-    ],
-    "query_facts": [
-        "job_id",
-        "query_id",
-        "query",
-        "planned_attempts",
-        "latest_terminal_attempts",
-        "completed_attempts",
-        "valid_attempts",
-        "stats_included_attempts",
-        "latest_failed_attempts",
-        "sample_completeness",
-        "usable_sample_rate",
-        "query_metadata_json",
-    ],
-    "brand_attempt_facts": [
-        "job_id",
-        "query_id",
-        "repeat_index",
-        "attempt_id",
-        "brand_name_canonical",
-        "brand_name_raw",
-        "is_target_brand",
-        "sov_eligible",
-        "is_recommended",
-        "recommendation_type",
-        "recommendation_strength",
-        "rank_position",
-        "sentiment",
-        "confidence",
-        "evidence",
-        "role",
-        "condition",
-        "audience",
-        "use_case",
-        "budget_level",
-        "tradeoff",
-        "traceability_status",
-        "stats_included",
-    ],
-    "brand_trends": [
-        "job_id",
-        "target_brand",
-        "industry",
-        "market",
-        "model",
-        "web_search_limit",
-        "extraction_schema_version",
-        "expected_queries",
-        "expected_repeats",
-        "sample_mode",
-        "query_set_hash",
-        "conclusion_strength",
-        "extraction_error_rate",
-        "comparability_key",
-        "partial_sample",
-        "brand_name_canonical",
-        "is_target_brand",
-        "sov_rank",
-        "sov_event_share",
-        "sov_response_share",
-        "response_mention_rate",
-        "query_coverage_rate",
-        "recommended_rate",
-        "recommended_rate_when_mentioned",
-        "recommended_rate_over_success",
-        "rank_observed_rate",
-        "sentiment_unknown_rate",
-        "avg_rank_position",
-        "positive_rate",
-        "neutral_rate",
-        "negative_rate",
-        "target_sov_gap_to_leader",
-        "target_sov_gap_to_top3_avg",
-        "success_record_count",
-    ],
-}
-CSV_FIELD_SCHEMAS.update(INTELLIGENCE_BASE_FIELDS)
+from .contracts import CSV_FIELD_SCHEMAS, EXTRACTION_SCHEMA_VERSION
+from .history import load_intelligence_history
+from .intelligence import INTELLIGENCE_SCHEMA_VERSION, INTELLIGENCE_TABLE_NAMES, build_intelligence_outputs
 
 
 def _analysis_terminal_records(raw_records: list[dict[str, Any]], *, include_mock: bool) -> list[dict[str, Any]]:
@@ -359,7 +140,8 @@ def analyze_job_bundle(
     include_mock: bool = False,
     confirm_cost: bool = False,
     refresh_extraction_cache: bool = False,
-    write_aggregates: bool = True,
+    write_aggregates: bool = False,
+    report_formats: tuple[str, ...] = ("markdown", "pdf"),
 ) -> dict[str, Any]:
     root = Path(bundle_dir)
     with job_bundle_lock(root):
@@ -375,6 +157,7 @@ def analyze_job_bundle(
                 confirm_cost=confirm_cost,
                 refresh_extraction_cache=refresh_extraction_cache,
                 write_aggregates=write_aggregates,
+                report_formats=report_formats,
             )
         except Exception:
             try:
@@ -394,7 +177,8 @@ def _analyze_job_bundle_unlocked(
     include_mock: bool = False,
     confirm_cost: bool = False,
     refresh_extraction_cache: bool = False,
-    write_aggregates: bool = True,
+    write_aggregates: bool = False,
+    report_formats: tuple[str, ...] = ("markdown", "pdf"),
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     root = Path(bundle_dir)
@@ -536,7 +320,7 @@ def _analyze_job_bundle_unlocked(
         data_quality=data_quality,
         sample_mode=sample_mode,
     )
-    history_overview, history_visibility = _load_intelligence_history(root, manifest, sample_mode)
+    history_overview, history_visibility = load_intelligence_history(root, manifest, sample_mode)
     intelligence = build_intelligence_outputs(
         manifest=manifest,
         mentions=enriched_mentions,
@@ -614,13 +398,15 @@ def _analyze_job_bundle_unlocked(
         "intelligence": intelligence,
         "target_diagnosis": stats["target_diagnosis"],
         "analysis_files": {key: _rel(root, value) for key, value in files.items()},
+        "generated_at": utc_now_iso(),
         "method_note": "本报告基于 query 文本采样后的 LLM 开放式品牌抽取；SOV 主口径为品牌命中事件份额，不等同于市场份额。",
     }
     summary_path = logs / "analysis_summary.json"
     aggregate_files = _cross_job_aggregate_paths(root) if write_aggregates else {}
     summary["aggregate_targets"] = {key: _display_path(root, value) for key, value in aggregate_files.items()}
     summary["aggregate_files"] = {}
-    report_files = generate_job_report(summary, result)
+    report_model, report_files = render_report_bundle(summary, result, formats=report_formats)
+    summary["report_model_schema_version"] = report_model.schema_version
     summary["report_files"] = {key: _rel(root, value) for key, value in report_files.items()}
     artifact_manifest_path = logs / "analysis_artifacts.json"
     summary["analysis_artifact_manifest"] = _rel(root, artifact_manifest_path)
@@ -1237,302 +1023,6 @@ def write_job_analysis_files(
     return files
 
 
-def generate_job_report(summary: dict[str, Any], report_dir: Path) -> dict[str, Path]:
-    ensure_private_directory(report_dir)
-    md_path = report_dir / "report.md"
-    html_path = report_dir / "report.html"
-    pdf_path = report_dir / "report.pdf"
-    markdown = build_job_markdown(summary)
-    _write_text_atomic(md_path, markdown)
-    _write_text_atomic(html_path, build_html(markdown, summary))
-    files = {"markdown": md_path, "html": html_path}
-    if try_generate_pdf(html_path, pdf_path):
-        secure_private_file(pdf_path)
-        files["pdf"] = pdf_path
-    return files
-
-
-def build_job_markdown(summary: dict[str, Any]) -> str:
-    lines = [f"# {markdown_text(summary['title'])}", "", "## 1. Executive Summary", ""]
-    data_quality = summary.get("data_quality") or {}
-    if summary.get("sample_mode") == "mock":
-        lines.append("- 当前报告基于 mock 样本，只用于验收交付链路，不构成业务结论。")
-    if data_quality.get("conclusion_strength") == "observational":
-        lines.append("- 当前样本完整性或抽取质量不足，以下结果应作为观察线索，不建议作为强排名结论。")
-    if int(summary.get("success_record_count") or 0) == 0:
-        lines.append("- 当前没有 live success 样本，不输出品牌发现结论。")
-    elif not summary.get("brand_summary"):
-        lines.append("- 当前成功样本中未抽取到明确品牌、公司或机构名称。")
-    else:
-        top = summary["brand_summary"][0]
-        diagnosis = summary.get("target_diagnosis") or {}
-        lines.append(
-            f"- 当前品牌命中事件份额最高的是 {markdown_text(top['brand_name_canonical'])}，"
-            f"份额为 {top['sov_event_share']}，覆盖 {top['query_coverage_rate']} 的 query。"
-        )
-        if diagnosis.get("target_detected"):
-            target_share = diagnosis.get("target_sov_event_share", diagnosis.get("target_sov_response_share"))
-            lines.append(
-                f"- 目标品牌 {markdown_text(summary['target_brand'])} 的品牌命中事件份额为 {target_share}，"
-                f"样本内份额排序第 {diagnosis.get('target_rank_by_sov')}，与第一名差距 {diagnosis.get('target_sov_gap_to_leader')}。"
-            )
-        else:
-            lines.append(f"- 目标品牌 {markdown_text(summary['target_brand'])} 在当前抽取口径下未命中，需结合别名和 raw response 复核。")
-        unstable = [row for row in summary.get("query_stability", []) if row.get("brand_set_jaccard_avg") not in {"", 1, 1.0}]
-        if unstable:
-            lines.append(f"- 有 {len(unstable)} 个 query 的品牌集合在重复采样中存在波动，建议优先人工复核这些 query 的 raw response。")
-    lines.extend(
-        [
-            "",
-            "## 2. 任务配置",
-            "",
-            "| 项目 | 值 |",
-            "|---|---|",
-            f"| 目标品牌 | {table_cell(summary['target_brand'])} |",
-            f"| 行业 | {table_cell(summary['industry'])} |",
-            f"| 市场 | {table_cell(summary['market'])} |",
-            f"| Query 数 | {summary['expected_queries']} |",
-            f"| 每 query 重复次数 | {summary['expected_repeats']} |",
-            f"| 成功回答数 | {summary['success_record_count']} |",
-            f"| 抽取品牌提及数 | {summary['extracted_mention_count']} |",
-            f"| 抽取错误数 | {summary['extraction_error_count']} |",
-            f"| 样本模式 | {summary.get('sample_mode', 'live')} |",
-            "| SOV 主口径 | 品牌命中事件份额 |",
-            "",
-            "## 3. Data Quality",
-            "",
-            "| 项目 | 值 |",
-            "|---|---:|",
-            f"| 计划采样单元 | {data_quality.get('planned_units', summary.get('expected_units'))} |",
-            f"| 可分析样本数 | {data_quality.get('analysis_record_count', summary.get('success_record_count'))} |",
-            f"| 缺失采样单元 | {len(data_quality.get('missing_units', []))} |",
-            f"| 额外采样单元 | {len(data_quality.get('extra_units', []))} |",
-            f"| 重复采样单元 | {len(data_quality.get('duplicate_units', []))} |",
-            f"| 请求契约不一致 | {len(data_quality.get('contract_mismatches', []))} |",
-            f"| raw 读取错误 | {len(data_quality.get('raw_read_errors', []))} |",
-            f"| 抽取异常回答数 | {data_quality.get('extraction_error_record_count', summary.get('extraction_error_count', 0))} |",
-            f"| 抽取异常明细行数 | {data_quality.get('extraction_error_row_count', summary.get('extraction_error_row_count', 0))} |",
-            f"| 追溯隔离项数 | {data_quality.get('traceability_quarantine_count', summary.get('traceability_quarantine_count', 0))} |",
-            f"| 抽取错误率 | {data_quality.get('extraction_error_rate', summary.get('extraction_error_rate', '0.0%'))} |",
-            f"| 结论强度 | {data_quality.get('conclusion_strength', 'strong')} |",
-            "",
-            "## 4. Brand Visibility / SOV",
-            "",
-        ]
-    )
-    if summary.get("brand_summary"):
-        lines.extend(
-            [
-                "| 排名 | 品牌/机构 | 命中事件份额 | 回答提及率 | Query 覆盖率 | 提及后推荐率 | "
-                "全样本推荐率 | 平均排名 | 排名观测率 | 正向率 | 未知情感率 | 目标品牌 |",
-                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-            ]
-        )
-        for row in summary["brand_summary"][:20]:
-            lines.append(
-                f"| {row['sov_rank']} | {table_cell(row['brand_name_canonical'])} | {row['sov_event_share']} | "
-                f"{row['response_mention_rate']} | {row['query_coverage_rate']} | {row['recommended_rate_when_mentioned']} | "
-                f"{row['recommended_rate_over_success']} | {row['avg_rank_position']} | {row['rank_observed_rate']} | "
-                f"{row['positive_rate']} | {row['sentiment_unknown_rate']} | {row['is_target_brand']} |"
-            )
-    else:
-        lines.append("暂无可展示的品牌发现结果。")
-
-    diagnosis = summary.get("target_diagnosis") or {}
-    lines.extend(["", "## 5. Target Brand Diagnosis", ""])
-    if int(summary.get("success_record_count") or 0) == 0:
-        lines.append("当前没有 live success 样本，不能判断目标品牌是否缺失或弱势。")
-    elif diagnosis.get("target_detected"):
-        lines.extend(
-            [
-                "| 指标 | 值 |",
-                "|---|---:|",
-                f"| 目标品牌命中事件份额 | {diagnosis.get('target_sov_event_share', diagnosis.get('target_sov_response_share'))} |",
-                f"| 样本内份额排序 | {diagnosis.get('target_rank_by_sov')} |",
-                f"| 与第一名差距 | {diagnosis.get('target_sov_gap_to_leader')} |",
-                f"| 与 Top3 平均差距 | {diagnosis.get('target_sov_gap_to_top3_avg')} |",
-                f"| 回答提及率 | {diagnosis.get('target_response_mention_rate')} |",
-                f"| 提及后推荐率 | {diagnosis.get('target_recommended_rate_when_mentioned', diagnosis.get('target_recommended_rate'))} |",
-                f"| 全样本推荐率 | {diagnosis.get('target_recommended_rate_over_success', '0.0%')} |",
-                f"| 排名观测率 | {diagnosis.get('target_rank_observed_rate', '0.0%')} |",
-                f"| 情感未知率 | {diagnosis.get('target_sentiment_unknown_rate', '0.0%')} |",
-                f"| Query 覆盖率 | {diagnosis.get('target_query_coverage_rate')} |",
-                "",
-            ]
-        )
-    else:
-        lines.append(
-            "目标品牌在当前抽取口径下未命中。建议优先检查 query 是否覆盖真实用户会触发该品牌的使用场景、"
-            "target_aliases 是否完整，以及 raw response 中是否存在未被识别的别名。"
-        )
-    missing = diagnosis.get("missing_queries") or []
-    if missing and int(summary.get("success_record_count") or 0) > 0:
-        lines.extend(["", "目标品牌缺失的 query：", ""])
-        for item in missing[:10]:
-            lines.append(f"- `{markdown_text(item['query_id'])}` {table_cell(item['query'])}")
-
-    lines.extend(["", "## 6. Source & Citation Opportunities", ""])
-    if summary.get("source_domains"):
-        lines.extend(
-            ["| 来源域名 | 解析来源数 | 去重 URL 数 | 回答覆盖率 | Query 覆盖率 | 平均来源解析序号 | Top URLs |", "|---|---:|---:|---:|---:|---:|---|"]
-        )
-        for row in summary["source_domains"][:15]:
-            lines.append(
-                f"| {table_cell(row['domain'])} | {row.get('parsed_source_occurrences', row.get('citation_occurrences'))} | "
-                f"{row.get('distinct_source_url_count', '')} | {row['response_coverage_rate']} | {row['query_coverage_rate']} | "
-                f"{row.get('avg_source_order', row.get('avg_rank'))} | {table_cell(row['top_urls'])} |"
-            )
-    else:
-        lines.append("当前样本没有解析到来源引用。")
-
-    intelligence = summary.get("intelligence") or {}
-    lines.extend(["", "## 7. GEO Intelligence Layer", ""])
-    overview = intelligence.get("geo_overview_scores") or []
-    if overview:
-        lines.extend(
-            [
-                "质量分独立于业务分；无可观测来源时 Source Score 为 N/A，不按 0 分处理。所有 breakdown 与分母保存在 CSV/DuckDB。",
-                "",
-                "| 品牌 | Visibility | Recommendation | Competitor | Source | Quality |",
-                "|---|---:|---:|---:|---:|---:|",
-            ]
-        )
-        for row in overview[:15]:
-            lines.append(
-                f"| {table_cell(row.get('brand_name_canonical'))} | {_metric_text(row.get('visibility_score'))} | "
-                f"{_metric_text(row.get('recommendation_score'))} | {_metric_text(row.get('competitor_score'))} | "
-                f"{_metric_text(row.get('source_score'))} | {_metric_text(row.get('quality_score'))} |"
-            )
-    else:
-        lines.append("当前没有足够的可追溯品牌事实用于计算 Intelligence Score。")
-
-    recommendation_rows = intelligence.get("recommendation_summary") or []
-    if recommendation_rows:
-        lines.extend(["", "推荐情报：", "", "| 品牌 | 观测回答 | 推荐转化率 | Top Pick 率 | 加权推荐分 |", "|---|---:|---:|---:|---:|"])
-        for row in recommendation_rows[:15]:
-            lines.append(
-                f"| {table_cell(row.get('brand_name_canonical'))} | {row.get('recommendation_denominator', 0)} | "
-                f"{_ratio_text(row.get('recommendation_conversion'))} | {_ratio_text(row.get('top_pick_rate'))} | "
-                f"{_metric_text(row.get('weighted_recommendation_score'))} |"
-            )
-
-    competitor_rows = intelligence.get("competitor_edges") or []
-    if competitor_rows:
-        lines.extend(["", "目标品牌与竞品：", "", "| 竞品 | 共现 | 目标胜 | 竞品胜 | Tie | 目标胜率 | 替代风险 |", "|---|---:|---:|---:|---:|---:|---:|"])
-        for row in competitor_rows[:15]:
-            lines.append(
-                f"| {table_cell(row.get('competitor_brand'))} | {row.get('co_occurrence_count', 0)} | "
-                f"{row.get('target_wins', 0)} | {row.get('competitor_wins', 0)} | {row.get('ties', 0)} | "
-                f"{_ratio_text(row.get('target_win_rate'))} | {_ratio_text(row.get('replacement_risk'))} |"
-            )
-
-    persona_rows = intelligence.get("visibility_by_persona") or []
-    if persona_rows:
-        lines.extend(
-            [
-                "",
-                "Persona（主口径为 query 等权宏平均）：",
-                "",
-                "| Persona | Query 数 | Macro Visibility | Micro Visibility | Persona Gap | Quality |",
-                "|---|---:|---:|---:|---:|---:|",
-            ]
-        )
-        for row in persona_rows[:15]:
-            lines.append(
-                f"| {table_cell(row.get('segment_value') or '(未标注)')} | {row.get('query_count', 0)} | "
-                f"{_ratio_text(row.get('visibility_rate_macro_by_query'))} | {_ratio_text(row.get('visibility_rate_micro'))} | "
-                f"{_ratio_text(row.get('persona_gap'))} | {_metric_text(row.get('quality_score'))} |"
-            )
-
-    perception_rows = [
-        *intelligence.get("perception_strengths", []),
-        *intelligence.get("perception_weaknesses", []),
-        *intelligence.get("perception_pricing", []),
-        *intelligence.get("perception_audience_fit", []),
-    ]
-    if perception_rows:
-        lines.extend(["", "可追溯感知事实：", "", "| 品牌 | 类型 | 事实 | 回答率 | 平均置信度 |", "|---|---|---|---:|---:|"])
-        for row in perception_rows[:15]:
-            lines.append(
-                f"| {table_cell(row.get('brand_name_canonical'))} | {table_cell(row.get('claim_type'))} | "
-                f"{table_cell(row.get('representative_claim_text'))} | {_ratio_text(row.get('response_rate'))} | "
-                f"{_metric_text(row.get('avg_confidence'))} |"
-            )
-
-    opportunities = [
-        *intelligence.get("opportunity_query_gaps", []),
-        *intelligence.get("opportunity_persona_gaps", []),
-        *intelligence.get("opportunity_source_gaps", []),
-        *intelligence.get("opportunity_messaging_gaps", []),
-    ]
-    if opportunities:
-        lines.extend(["", "规则化机会（非生成式建议）：", "", "| 类型 | 对象 | 得分 |", "|---|---|---:|"])
-        for row in sorted(opportunities, key=lambda item: -float(item.get("opportunity_score") or 0))[:20]:
-            subject = row.get("query_id") or row.get("persona") or row.get("domain") or row.get("claim_canonical") or row.get("competitor_brand")
-            lines.append(f"| {table_cell(row.get('opportunity_type'))} | {table_cell(subject)} | {_metric_text(row.get('opportunity_score'))} |")
-
-    trend_rows = intelligence.get("trend_deltas") or []
-    if trend_rows:
-        lines.extend(["", "与最近可比 run 的变化：", "", "| 品牌 | 指标 | 基线 | 当前 | Delta |", "|---|---|---:|---:|---:|"])
-        for row in trend_rows[:20]:
-            lines.append(
-                f"| {table_cell(row.get('brand_name_canonical'))} | {table_cell(row.get('metric'))} | "
-                f"{_metric_text(row.get('baseline_value'))} | {_metric_text(row.get('current_value'))} | {_metric_text(row.get('absolute_delta'))} |"
-            )
-
-    lines.extend(["", "## 8. Query-Level Findings", ""])
-    if summary.get("brand_by_query"):
-        lines.extend(
-            [
-                "| Query ID | 品牌/机构 | 提及回答数 | Query 内提及率 | 推荐回答数 | 提及后推荐率 |",
-                "|---|---|---:|---:|---:|---:|",
-            ]
-        )
-        for row in summary["brand_by_query"][:30]:
-            lines.append(
-                f"| {table_cell(row['query_id'])} | {table_cell(row['brand_name_canonical'])} | "
-                f"{row['responses_mentioned']} | {row['mention_rate_within_query']} | "
-                f"{row['recommended_responses']} | {row.get('recommended_rate_when_mentioned_within_query', row['recommended_rate_within_query'])} |"
-            )
-    else:
-        lines.append("暂无 query 级品牌命中数据。")
-
-    if summary.get("query_stability"):
-        lines.extend(["", "采样稳定性：", "", "| Query ID | 成功重复数 | 样本充足 | 品牌集合 Jaccard | Top Brands |", "|---|---:|---:|---:|---|"])
-        for row in summary["query_stability"]:
-            lines.append(
-                f"| {table_cell(row['query_id'])} | {row['successful_repeats']} | {row['sample_sufficient']} | "
-                f"{row['brand_set_jaccard_avg']} | {table_cell(row['top_brands'])} |"
-            )
-
-    lines.extend(
-        [
-            "",
-            "## 9. Methodology & Caveats",
-            "",
-            "- Runner 真实请求只发送 query 文本；目标品牌、行业和市场只用于任务记录与后处理。",
-            "- 品牌发现来自 LLM 对 response_text 的开放式实体抽取，不依赖预置竞品 alias。",
-            "- SOV 表示当前 LLM 回答样本内的品牌命中事件份额，不等同于真实市场份额或 App 端真实排名。",
-            "- 来源表基于响应结构中的 source URL 解析，来源序号不等同于页面真实排名。",
-            "- 推荐率、排名和情感来自回答文本语义抽取，低样本量或 partial sample 下应降低结论强度。",
-            "- 目标品牌是否出现基于抽取与归一化结果，仍建议对关键样本人工复核。",
-            "",
-            "## 10. Output Files",
-            "",
-        ]
-    )
-    for key, value in (summary.get("analysis_files") or {}).items():
-        lines.append(f"- `{key}`: `{table_cell(value)}`")
-    for key, value in (summary.get("report_files") or {}).items():
-        lines.append(f"- 报告文件 `{key}`: `{table_cell(value)}`")
-    for key, value in (summary.get("aggregate_files") or {}).items():
-        lines.append(f"- 跨 job 聚合 `{key}`: `{table_cell(value)}`")
-    for key, value in (summary.get("aggregate_targets") or {}).items():
-        lines.append(f"- 跨 job 聚合目标 `{key}`（以 aggregate manifest 为提交依据）: `{table_cell(value)}`")
-    lines.append("")
-    return "\n".join(lines)
-
-
 def update_cross_job_aggregates(bundle_dir: Path, summary: dict[str, Any]) -> dict[str, Path]:
     paths = _cross_job_aggregate_paths(bundle_dir)
     runs_root = paths["runs_index"].parent
@@ -1584,70 +1074,6 @@ def _cross_job_aggregate_paths(bundle_dir: Path) -> dict[str, Path]:
         "target_brand_trends": aggregate_dir / "target_brand_trends.csv",
         "aggregate_manifest": aggregate_dir / "aggregate_manifest.json",
     }
-
-
-def _load_intelligence_history(
-    bundle_dir: Path,
-    manifest: dict[str, Any],
-    sample_mode: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Load only current, comparable sibling analyses for trend calculations."""
-
-    runs_root = _runs_root_for_bundle(bundle_dir)
-    overview_rows: list[dict[str, Any]] = []
-    visibility_rows: list[dict[str, Any]] = []
-    if not runs_root.exists():
-        return overview_rows, visibility_rows
-    bundle_resolved = bundle_dir.resolve()
-    for sibling in sorted(runs_root.iterdir(), key=lambda path: path.name):
-        if not sibling.is_dir() or sibling.is_symlink() or sibling.resolve() == bundle_resolved:
-            continue
-        summary_path = sibling / "logs" / "analysis_summary.json"
-        manifest_path = sibling / "job_manifest.json"
-        if not summary_path.is_file() or not manifest_path.is_file():
-            continue
-        try:
-            sibling_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            sibling_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not str(sibling_manifest.get("status") or "").startswith("analyzed"):
-            continue
-        commit_valid, _ = validate_analysis_commit(sibling, sibling_manifest, sibling_summary)
-        if not commit_valid:
-            continue
-        if not _comparable_history_run(manifest, sample_mode, sibling_manifest, sibling_summary):
-            continue
-        overview_path = sibling / "result" / "geo_overview_scores.csv"
-        visibility_path = sibling / "result" / "visibility_summary.csv"
-        if overview_path.is_file() and not overview_path.is_symlink():
-            overview_rows.extend(_read_csv_rows(overview_path))
-        if visibility_path.is_file() and not visibility_path.is_symlink():
-            visibility_rows.extend(_read_csv_rows(visibility_path))
-    return overview_rows, visibility_rows
-
-
-def _comparable_history_run(
-    manifest: dict[str, Any],
-    sample_mode: str,
-    sibling_manifest: dict[str, Any],
-    sibling_summary: dict[str, Any],
-) -> bool:
-    if str(sibling_summary.get("sample_mode") or "") != sample_mode:
-        return False
-    if str(sibling_summary.get("target_brand") or "") != str(manifest.get("target_brand") or ""):
-        return False
-    if int(sibling_summary.get("run_generation") or 0) != int(sibling_manifest.get("run_generation") or 0):
-        return False
-    current_profile = manifest.get("comparability_profile") or {}
-    sibling_profile = sibling_summary.get("comparability_profile") or sibling_manifest.get("comparability_profile") or {}
-    keys = ("study_fingerprint", "sampling_fingerprint", "analysis_fingerprint")
-    for key in keys:
-        current = str(current_profile.get(key) or "")
-        previous = str(sibling_profile.get(key) or "")
-        if current != previous:
-            return False
-    return True
 
 
 def evaluate_data_quality(
@@ -2555,21 +1981,6 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], *, schema: str | None = N
 
 def _pct(value: float) -> str:
     return f"{value * 100:.1f}%"
-
-
-def _metric_text(value: Any) -> str:
-    if value in (None, ""):
-        return "N/A"
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    return table_cell(value)
-
-
-def _ratio_text(value: Any) -> str:
-    if value in (None, ""):
-        return "N/A"
-    ratio = as_ratio(value)
-    return f"{ratio * 100:.1f}%" if ratio is not None else table_cell(value)
 
 
 def _pct_points(value: float) -> str:

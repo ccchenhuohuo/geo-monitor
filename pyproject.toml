@@ -27,6 +27,7 @@ dependencies = [
   "tenacity>=8.2.0",
   "PyYAML>=6.0.0",
   "duckdb>=1.0.0,<2",
+  "reportlab>=4.2.0,<5",
 ]
 
 [project.urls]
@@ -42,10 +43,6 @@ dev = [
   "pip-audit>=2.7.0,<3",
   "ruff>=0.9.0,<1",
 ]
-pdf = [
-  "reportlab>=4.2.0,<5",
-]
-
 [project.scripts]
 geo-monitor = "geo_monitor.cli:app"
 

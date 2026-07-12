@@ -115,7 +115,10 @@ def test_raw_attempts_have_query_meta_and_analyze_does_not_need_work(tmp_path):
         assert row["query_meta"]["seed_id"] == "sample_beginner"
         assert row["query_meta"]["persona"] in {"beginner", "budget_sensitive"}
     assert analysis["report_files"]["markdown"] == "result/report.md"
-    assert (bundle.parent / "aggregate" / "brand_trends.csv").exists()
+    assert analysis["report_files"]["pdf"] == "result/report.pdf"
+    assert analysis["report_files"]["model"] == "result/report.json"
+    assert not (bundle / "result" / "report.html").exists()
+    assert not (bundle.parent / "aggregate").exists()
     assert not (bundle.parent / ".runs").exists()
 
 
@@ -361,7 +364,14 @@ def test_tool_api_build_dashboard_true_and_seed_requires_manifest(tmp_path):
     pytest.importorskip("duckdb")
     study, _, manifest, config, _ = _build_external_job(tmp_path)
 
-    result = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_dashboard=True)
+    result = run_geo_monitor(
+        config_path=config,
+        study_dir=study,
+        query_manifest_path=manifest,
+        mock=True,
+        build_db=True,
+        build_dashboard=True,
+    )
 
     assert result.dashboard_path
     assert Path(result.dashboard_path).exists()
