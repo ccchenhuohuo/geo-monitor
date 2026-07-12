@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import DuckDBError, connect_readonly, validate_schema
+from .filesystem import UnsafeOutputPathError, ensure_private_directory, open_private_text, prepare_private_output, secure_private_file
 
 
 class DashboardError(ValueError):
@@ -15,18 +16,30 @@ class DashboardError(ValueError):
 def build_dashboard(db_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
     db = Path(db_path)
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    index = out / "index.html"
     data = _load_dashboard_data(db)
+    out_existed = out.exists()
+    index = out / "index.html"
+    try:
+        ensure_private_directory(out)
+        prepare_private_output(index)
+    except UnsafeOutputPathError as exc:
+        raise DashboardError(str(exc)) from exc
     tmp = index.with_name(f".{index.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(_render_html(data), encoding="utf-8")
+        with open_private_text(tmp) as handle:
+            handle.write(_render_html(data))
         os.replace(tmp, index)
+        secure_private_file(index)
     except Exception:
         try:
             tmp.unlink()
         except FileNotFoundError:
             pass
+        if not out_existed:
+            try:
+                out.rmdir()
+            except OSError:
+                pass
         raise
     return {"dashboard_path": str(index), "out_dir": str(out)}
 
@@ -56,8 +69,18 @@ def _load_dashboard_data(db: Path) -> dict[str, Any]:
             ),
             "persona": _rows(con, "select persona, count(distinct query_id) queries from queries group by 1 order by 1"),
             "seed": _rows(con, "select seed_id, count(distinct query_id) queries from queries group by 1 order by 1"),
-            "runs": _rows(con, "select job_id, status, sample_mode, partial_sample, sample_count, target_brand, model, provider, adapter, api_family, job_conclusion_strength from runs order by created_at desc nulls last"),
-            "comparison": _rows(con, "select query_manifest_sha256, repeats, execution_window_bucket, job_count, comparison_group_count, analysis_fingerprint_count, study_fingerprint_count, sampling_fingerprint_count, comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts order by execution_window_bucket desc nulls last"),
+            "runs": _rows(
+                con,
+                "select job_id, status, sample_mode, partial_sample, sample_count, target_brand, model, provider, "
+                "adapter, api_family, job_conclusion_strength from runs order by created_at desc nulls last",
+            ),
+            "comparison": _rows(
+                con,
+                "select query_manifest_sha256, repeats, execution_window_bucket, job_count, comparison_group_count, "
+                "analysis_fingerprint_count, study_fingerprint_count, sampling_fingerprint_count, "
+                "comparison_conclusion_strength, source_metrics_comparable from comparison_cohorts "
+                "order by execution_window_bucket desc nulls last",
+            ),
             "quality_summary": _rows(
                 con,
                 "select job_id, sample_mode, conclusion_strength, partial_sample, planned_units, stats_record_count, "

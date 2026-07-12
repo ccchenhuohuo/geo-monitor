@@ -10,7 +10,6 @@ from .openai_responses import OpenAIResponsesTextAdapter, OpenAIResponsesWebSear
 from .qwen_chat import QwenChatEnableSearchAdapter
 from .qwen_responses import QwenResponsesWebSearchBasicAdapter
 
-
 _ADAPTERS: dict[str, ProviderAdapter] = {
     "openai_responses_web_search": OpenAIResponsesWebSearchAdapter(),
     "openai_responses_text": OpenAIResponsesTextAdapter(),
@@ -57,6 +56,11 @@ def build_sampling_profile(
         "request_fingerprint_version": REQUEST_FINGERPRINT_VERSION,
         "web_search_required": bool(web_search_required),
         "source_grain": adapter.capabilities.source_grain,
+        # Retained for manifest compatibility. No current provider adapter exposes
+        # a semantically equivalent hard result-count parameter, so it must not be
+        # treated as an effective request condition.
         "web_search_limit": web_search_limit if web_search_limit is not None else settings.web_search_limit,
+        "web_search_limit_effective": False,
+        "max_tool_calls": settings.max_tool_calls,
+        "max_output_tokens": (settings.analysis_max_output_tokens if adapter.name == "openai_responses_text" else settings.max_output_tokens),
     }
-

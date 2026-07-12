@@ -20,6 +20,8 @@ Early engine. The core workflow is usable locally:
 - job-based sampling with raw JSONL audit logs;
 - brand/entity extraction and canonicalization;
 - visibility, SOV, recommendation, rank, sentiment, source, and stability CSVs;
+- an explainable intelligence layer for overview, competitor, citation,
+  situation, perception, trends, and rule-based opportunities;
 - rebuildable DuckDB analysis cache;
 - static local dashboard;
 - embeddable Python API for Plugin / Skill / Agent workflows.
@@ -55,6 +57,8 @@ Responses API under a controlled query manifest.
 - **Brand extraction**: discover brands/entities from answers without a bundled
   competitor list.
 - **Metrics and reports**: CSV, Markdown, HTML, and best-effort optional PDF outputs.
+- **Explainable intelligence**: five independent overview scores, explicit
+  denominators/N-A semantics, macro-by-query segments, and traceable gap tables.
 - **DuckDB analysis layer**: rebuildable local cache for cross-run analysis.
 - **Static dashboard**: local HTML dashboard without a backend service.
 - **Python API**: structured result object for external agents and workflows.
@@ -152,10 +156,12 @@ Example live request shape:
   "input": "<QUERY_TEXT>",
   "tools": [{"type": "web_search"}],
   "tool_choice": "required",
-  "include": ["web_search_call.action.sources"],
   "max_tool_calls": 2
 }
 ```
+
+Provider-specific optional fields such as `include` are sent only when they are
+explicitly configured and validated for that endpoint.
 
 The request does not include `target_brand`, `industry`, `market`, or competitor
 names.
@@ -212,9 +218,12 @@ Open:
 
 ## Live API Configuration
 
-Configure an OpenAI-compatible Responses API provider through environment
-variables, or opt in to an explicit env file. The CLI no longer trusts a `.env`
-file from the current working directory by default.
+Configure an OpenAI-compatible Responses API through environment variables, or
+opt in to an explicit env file. The CLI does not trust a `.env` file from the
+current working directory by default. `openai_responses_web_search` is the
+generic adapter; `doubao_responses_web_search` preserves Doubao/Volcengine Ark
+web-search request and trace semantics while using the same compatible SDK
+transport.
 
 ```bash
 cp .env.example /tmp/geo-monitor.env
@@ -227,15 +236,46 @@ LLM_BASE_URL=https://api.example.com/v1
 LLM_MODEL=provider-model
 WEB_SEARCH_LIMIT=5
 MAX_TOOL_CALLS=2
+MAX_OUTPUT_TOKENS=2000
+ANALYSIS_MAX_OUTPUT_TOKENS=4000
 REQUEST_TIMEOUT_SECONDS=90
 RETRY_MAX_ATTEMPTS=3
 CONCURRENCY=1
+MAX_JOB_UNITS=10000
+MAX_CONSECUTIVE_ERRORS=5
+MAX_ERROR_RATE=0.5
 ```
 
 `https://api.example.com/v1` is a placeholder endpoint. Live commands refuse to
 run until `LLM_BASE_URL` points at a real `http(s)` endpoint and `LLM_API_KEY` is
 configured. Run `geo-monitor doctor` to inspect the active endpoint, API key
 status, and env-file source.
+
+For Doubao Ark, use key/model placeholders rather than putting secrets in a
+config file:
+
+```bash
+export LLM_API_KEY='<ARK_API_KEY>'
+export LLM_BASE_URL='https://ark.cn-beijing.volces.com/api/v3'
+export LLM_MODEL='<ARK_MODEL_OR_ENDPOINT_ID>'
+```
+
+Select one adapter in the job config:
+
+```json
+{
+  "model": "<ARK_MODEL_OR_ENDPOINT_ID>",
+  "adapter": "doubao_responses_web_search",
+  "analysis_model": "<ARK_MODEL_OR_ENDPOINT_ID>",
+  "analysis_adapter": "openai_responses_text"
+}
+```
+
+`WEB_SEARCH_LIMIT` remains a validated compatibility field but no current
+adapter can enforce it as a provider-independent result count; manifests record
+`web_search_limit_effective=false`. `MAX_TOOL_CALLS`, output-token limits, and
+adapter options are effective request conditions and are frozen into audit and
+comparability fingerprints.
 
 Live sampling and live LLM extraction may incur provider costs. Commands that
 can produce live costs require explicit `--confirm-cost`.
@@ -244,6 +284,18 @@ can produce live costs require explicit `--confirm-cost`.
 geo-monitor run-job "$JOB_DIR" --confirm-cost
 geo-monitor analyze-job "$JOB_DIR" --confirm-cost
 ```
+
+The SDK's own retries are disabled. The application retries only transient
+transport/rate-limit/5xx failures, then stops a live run when its consecutive-
+error or sampled error-rate circuit threshold is reached. Resume uses the latest
+terminal attempt: a newer error/interruption supersedes an older success and is
+retried. `run_execution_id`, `run_generation`, `diagnostic_generation`,
+`logical_unit_id`, and unique `attempt_id` keep physical executions distinct;
+dry/mock diagnostics do not invalidate an analyzed live generation.
+
+See [docs/providers.md](docs/providers.md) for adapter options, effective versus
+compatibility settings, retry/circuit behavior, endpoint safety, and the full
+resume identity contract.
 
 ## Persona Fan-out
 
@@ -353,6 +405,35 @@ runs/{job_id}/
     attempt_facts.csv
     query_facts.csv
     brand_attempt_facts.csv
+    geo_overview_scores.csv
+    visibility_summary.csv
+    recommendations.csv
+    recommendation_summary.csv
+    recommendation_by_persona.csv
+    competitor_edges.csv
+    competitor_win_loss.csv
+    competitor_replacements.csv
+    rank_gap.csv
+    source_types.csv
+    brand_source_domains.csv
+    brand_source_urls.csv
+    source_gaps.csv
+    visibility_by_seed.csv
+    visibility_by_persona.csv
+    visibility_by_intent.csv
+    visibility_by_scenario.csv
+    perception_claims.csv
+    perception_strengths.csv
+    perception_weaknesses.csv
+    perception_pricing.csv
+    perception_audience_fit.csv
+    trend_deltas.csv
+    trend_drift.csv
+    trend_volatility.csv
+    opportunity_query_gaps.csv
+    opportunity_persona_gaps.csv
+    opportunity_source_gaps.csv
+    opportunity_messaging_gaps.csv
     report.md
     report.html
     report.pdf              # optional, best-effort
@@ -407,6 +488,18 @@ Current metrics include:
 - **Source coverage**: source domain and URL occurrence / coverage.
 - **Data quality**: partial samples, malformed raw lines, duplicate units,
   contract mismatches, and extraction errors.
+- **Overview scores**: independent `0..100` visibility, recommendation,
+  competitor, source, and quality scores with component breakdowns. Missing
+  source evidence is N/A rather than zero.
+- **Intelligence**: recommendation types, target/competitor win-loss and
+  replacement risk, citation attribution/gaps, evidence-gated perception,
+  run deltas/drift/volatility, and traceable rule-based opportunities.
+
+Situation tables use equal-weight macro-by-query as their primary business
+rate and retain micro-by-attempt as a diagnostic. Every intelligence family
+carries its eligible/planned denominator and trace IDs. See
+[docs/intelligence.md](docs/intelligence.md) for formulas, all stable CSV names,
+eligibility gates, N/A rules, and interpretation limits.
 
 ## DuckDB And Dashboard
 
@@ -417,6 +510,8 @@ geo-monitor db build --runs ./study/runs --output ./study/geo.duckdb
 geo-monitor db inspect --db ./study/geo.duckdb
 geo-monitor db query --db ./study/geo.duckdb \
   "select seed_id, persona, count(*) from queries group by 1,2"
+geo-monitor db query --db ./study/geo.duckdb \
+  "select * from geo_overview_scores order by visibility_score desc nulls last"
 ```
 
 `db query` is a restricted local read-only analysis helper. It rejects multi-
@@ -424,6 +519,12 @@ statement SQL, write/admin statements, and DuckDB external file-reading
 functions. Advanced admin SQL should be run with DuckDB's own tools by trusted
 operators. Agent-facing or embedded workflows should prefer typed Python API
 results instead of raw SQL.
+
+Current-generation intelligence CSVs are registered in
+`intelligence_artifacts`, retained losslessly in `intelligence_rows`, and
+exposed as read-only views named after each CSV stem (for example,
+`geo_overview_scores`, `visibility_by_persona`, and `competitor_edges`). The DB
+builder ignores stale or generation-mismatched analysis files.
 
 Build a static dashboard:
 
@@ -492,6 +593,7 @@ src/geo_monitor/
   job.py                 # build/run/cleanup job lifecycle
   runner.py              # repeated sampling, resume, concurrency
   analysis/              # extraction pipeline, metrics, reports, aggregates
+    intelligence/        # pure overview/recommendation/competitor/gap functions
   job_analysis.py        # compatibility facade for analysis imports
   brand_extraction.py    # LLM extraction schema and canonicalization
   response_parser.py     # response text/source parsing
@@ -528,7 +630,9 @@ tests/
 ## Development
 
 ```bash
-python -m pytest
+python -m ruff check .
+python -m pytest --cov=geo_monitor --cov-report=term-missing
+python -m build
 ```
 
 The repository intentionally excludes `.env`, `.runs/`, `.venv/`, local study

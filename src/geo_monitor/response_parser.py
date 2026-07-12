@@ -3,15 +3,25 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .schemas import SourceRecord
 
-
-URL_KEYS = {"url", "uri", "link"}
-TITLE_KEYS = {"title", "site_name", "name"}
-SNIPPET_KEYS = {"snippet", "summary", "text", "content"}
+URL_KEYS = ("url", "uri", "link")
+TITLE_KEYS = ("title", "site_name", "name")
+SNIPPET_KEYS = ("snippet", "summary", "text", "content")
 SOURCE_HINT_KEYS = {"citation", "annotations", "source", "sources", "web_search", "url_citation"}
+TRACKING_QUERY_KEYS = {
+    "_ga",
+    "_gl",
+    "dclid",
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "msclkid",
+    "yclid",
+}
 
 
 def response_to_dict(response: Any) -> dict[str, Any]:
@@ -109,11 +119,11 @@ def extract_sources(raw: dict[str, Any]) -> list[SourceRecord]:
 
     visit(raw)
 
-    seen: set[tuple[str | None, str | None]] = set()
+    seen: set[tuple[str, str]] = set()
     sources: list[SourceRecord] = []
     for idx, candidate in enumerate(candidates, start=1):
         source = _candidate_to_source(candidate, idx)
-        key = (source.url, source.title)
+        key = ("url", source.url) if source.url else ("title", source.title or "")
         if key in seen:
             continue
         seen.add(key)
@@ -144,13 +154,13 @@ def _walk(value: Any) -> list[Any]:
 
 def _looks_like_source(item: dict[str, Any], *, hinted: bool = False) -> bool:
     keys = set(item.keys())
-    has_url = any(k in keys and isinstance(item.get(k), str) and str(item.get(k)).startswith(("http://", "https://")) for k in URL_KEYS)
+    has_url = any(key in keys and isinstance(item.get(key), str) and canonicalize_source_url(str(item.get(key))) is not None for key in URL_KEYS)
     source_type = str(item.get("type", "")).lower()
     has_source_hint = bool(keys & SOURCE_HINT_KEYS) or "citation" in source_type or "search" in source_type
     return has_url and (hinted or has_source_hint)
 
 
-def _first_str(item: Mapping[str, Any], keys: set[str]) -> str | None:
+def _first_str(item: Mapping[str, Any], keys: Sequence[str]) -> str | None:
     for key in keys:
         value = item.get(key)
         if isinstance(value, str) and value.strip():
@@ -159,11 +169,14 @@ def _first_str(item: Mapping[str, Any], keys: set[str]) -> str | None:
 
 
 def _candidate_to_source(candidate: dict[str, Any], rank: int) -> SourceRecord:
-    url = _first_str(candidate, URL_KEYS)
+    url = next(
+        (canonical for key in URL_KEYS if isinstance(candidate.get(key), str) and (canonical := canonicalize_source_url(str(candidate.get(key)))) is not None),
+        None,
+    )
     title = _first_str(candidate, TITLE_KEYS)
     snippet = _first_str(candidate, SNIPPET_KEYS)
     source_type = str(candidate.get("type") or candidate.get("source_type") or "unknown")
-    domain = _normalize_domain(urlparse(url).netloc) if url else None
+    domain = _normalize_domain(urlsplit(url).hostname or "") if url else None
     return SourceRecord(
         title=title,
         url=url,
@@ -175,14 +188,42 @@ def _candidate_to_source(candidate: dict[str, Any], rank: int) -> SourceRecord:
     )
 
 
-def _normalize_domain(domain: str) -> str | None:
-    text = (domain or "").strip().lower()
+def canonicalize_source_url(value: str | None) -> str | None:
+    text = str(value or "").strip()
     if not text:
         return None
-    if ":" in text:
-        host, _, port = text.partition(":")
-        if port in {"80", "443"}:
-            text = host
+    try:
+        parsed = urlsplit(text)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    try:
+        host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError:
+        return None
+    if not host:
+        return None
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc += f":{port}"
+    query_pairs = [(key, item) for key, item in parse_qsl(parsed.query, keep_blank_values=True) if not _is_tracking_query_key(key)]
+    query_pairs.sort()
+    return urlunsplit((scheme, netloc, parsed.path or "/", urlencode(query_pairs, doseq=True), ""))
+
+
+def _is_tracking_query_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower()
+    return normalized.startswith("utm_") or normalized in TRACKING_QUERY_KEYS
+
+
+def _normalize_domain(domain: str) -> str | None:
+    text = (domain or "").strip().lower().rstrip(".")
+    if not text:
+        return None
     if text.startswith("www."):
         text = text[4:]
     return text

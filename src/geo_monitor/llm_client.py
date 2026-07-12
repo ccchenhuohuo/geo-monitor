@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .config import LiveSettingsError, Settings, validate_live_settings
 from .schemas import QueryRecord
@@ -14,6 +14,7 @@ class LLMClientError(RuntimeError):
 
 
 RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+T = TypeVar("T")
 
 
 def is_retryable_api_error(exc: BaseException) -> bool:
@@ -25,6 +26,21 @@ def is_retryable_api_error(exc: BaseException) -> bool:
     if isinstance(status_code, int):
         return status_code in RETRYABLE_STATUS_CODES
     return False
+
+
+def retry_api_call(operation: Callable[[], T], settings: Settings) -> T:
+    """Run one provider operation with the application's retry policy.
+
+    The OpenAI SDK retries are deliberately disabled so all adapters share one
+    visible and configurable retry boundary.
+    """
+    retrying = Retrying(
+        reraise=True,
+        stop=stop_after_attempt(settings.retry_max_attempts),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception(is_retryable_api_error),
+    )
+    return retrying(operation)
 
 
 def build_responses_payload(
@@ -64,15 +80,4 @@ class LLMResponsesClient:
         )
 
     def create_response(self, payload: dict[str, Any]) -> Any:
-        attempts = self.settings.retry_max_attempts
-
-        @retry(
-            reraise=True,
-            stop=stop_after_attempt(attempts),
-            wait=wait_exponential(multiplier=1, min=1, max=8),
-            retry=retry_if_exception(is_retryable_api_error),
-        )
-        def _call() -> Any:
-            return self.client.responses.create(**payload)
-
-        return _call()
+        return retry_api_call(lambda: self.client.responses.create(**payload), self.settings)

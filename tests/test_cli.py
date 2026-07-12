@@ -5,7 +5,6 @@ from typer.testing import CliRunner
 
 from geo_monitor.cli import app
 
-
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -191,8 +190,7 @@ def test_export_csv_cli_skips_bad_jsonl_lines(tmp_path):
     raw = tmp_path / "attempts.jsonl"
     out = tmp_path / "attempts.csv"
     raw.write_text(
-        json.dumps({"run_id": "r", "query_id": "q001", "status": "success", "input_query": "q"}, ensure_ascii=False)
-        + "\n{bad\n",
+        json.dumps({"run_id": "r", "query_id": "q001", "status": "success", "input_query": "q"}, ensure_ascii=False) + "\n{bad\n",
         encoding="utf-8",
     )
 
@@ -223,11 +221,11 @@ def test_run_job_cli_does_not_override_manifest_start_interval(tmp_path, monkeyp
         dry_run=False,
         mock=False,
         sleep_seconds=0.0,
-            start_interval_seconds=None,
-            limit=None,
-            only_query_ids=None,
-            confirm_cost=False,
-        ):
+        start_interval_seconds=None,
+        limit=None,
+        only_query_ids=None,
+        confirm_cost=False,
+    ):
         captured["bundle_dir"] = bundle_dir
         captured["start_interval_seconds"] = start_interval_seconds
         return {

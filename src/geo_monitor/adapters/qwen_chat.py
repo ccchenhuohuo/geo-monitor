@@ -53,6 +53,7 @@ class QwenChatEnableSearchAdapter(BaseAdapter):
             "model": sampling_profile["model"],
             "messages": [{"role": "user", "content": query_record.query}],
             "extra_body": extra_body,
+            "max_tokens": settings.max_output_tokens,
         }
         payload_basis = {
             "model": payload["model"],

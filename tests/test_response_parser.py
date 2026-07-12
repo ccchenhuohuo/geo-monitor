@@ -4,7 +4,18 @@ from geo_monitor.response_parser import extract_output_text, parse_response, res
 def test_parse_mock_response_fixture():
     payload = {
         "output_text": "hello",
-        "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello", "annotations": [{"type": "url_citation", "title": "Example", "url": "https://example.com", "snippet": "snippet"}]}]}],
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "hello",
+                        "annotations": [{"type": "url_citation", "title": "Example", "url": "https://example.com", "snippet": "snippet"}],
+                    }
+                ],
+            }
+        ],
         "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
     }
     text, sources, usage, raw = parse_response(payload)

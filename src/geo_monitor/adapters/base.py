@@ -144,16 +144,56 @@ class BaseAdapter:
             raise ValueError(f"{self.name} adapter_options.{key} 必须是布尔值")
         return value
 
-    def _positive_int_option(self, options: dict[str, Any], key: str, default: int) -> int:
+    def _string_list_option(
+        self,
+        options: dict[str, Any],
+        key: str,
+        *,
+        default: list[str] | None = None,
+    ) -> list[str] | None:
+        if key not in options:
+            return list(default) if default is not None else None
+        value = options[key]
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是字符串数组")
+        return list(value)
+
+    def _required_web_search_tool_choice(self, options: dict[str, Any], key: str = "tool_choice") -> str | dict[str, str] | None:
+        if key not in options:
+            return None
+        value = options[key]
+        if value == "required":
+            return "required"
+        if isinstance(value, dict) and set(value) == {"type"} and value.get("type") == "web_search":
+            return {"type": "web_search"}
+        raise ValueError(
+            f"{self.name} adapter_options.{key} 必须是 'required' 或严格对象 {{'type': 'web_search'}}；"
+            "联网搜索为必需语义，不接受 auto、none、拼写变体或额外字段"
+        )
+
+    def _positive_int_option(
+        self,
+        options: dict[str, Any],
+        key: str,
+        default: int,
+        *,
+        maximum: int | None = None,
+    ) -> int:
         value = options.get(key, default)
         if isinstance(value, bool):
             raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数")
-        try:
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, float) and value.is_integer():
             parsed = int(value)
-        except Exception as exc:
-            raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数") from exc
+        elif isinstance(value, str) and value.strip().isdigit():
+            parsed = int(value.strip())
+        else:
+            raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数")
         if parsed < 1:
             raise ValueError(f"{self.name} adapter_options.{key} 必须是正整数")
+        if maximum is not None and parsed > maximum:
+            raise ValueError(f"{self.name} adapter_options.{key} 不能大于 {maximum}")
         return parsed
 
     def _fingerprint_basis(self, query_record: QueryRecord, sampling_profile: dict[str, Any], payload_basis: dict[str, Any]) -> dict[str, Any]:

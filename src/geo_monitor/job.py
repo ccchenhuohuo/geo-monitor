@@ -13,12 +13,12 @@ from typing import Any
 
 from .adapters.registry import build_sampling_profile, get_adapter
 from .config import LiveSettingsError, Settings, get_settings, validate_live_settings, workspace_root
-from .dataset import load_queries, select_queries
-from .exporters import latest_records, read_jsonl, successful_result_hashes
+from .dataset import encode_manifest_csv_cell, load_queries, select_queries
+from .exporters import latest_live_terminal_records, latest_records, read_jsonl, successful_result_hashes
+from .filesystem import UnsafeOutputPathError, ensure_private_directory, open_private_text, prepare_private_output, secure_private_file
 from .request_fingerprint import REQUEST_FINGERPRINT_VERSION, analysis_fingerprint, base_url_fingerprint
-from .runner import MonitorRunner, compute_request_hash
-from .schemas import QueryRecord, utc_now_iso
-
+from .runner import MonitorRunner, compute_request_hash, make_run_id
+from .schemas import MAX_QUERY_CHARS, QueryRecord, utc_now_iso
 
 JOB_MANIFEST = "job_manifest.json"
 RUNS_DIR = ".runs"
@@ -34,11 +34,13 @@ GEO_JOB_V3 = "geo-job-v3"
 QUERY_MANIFEST_V1 = "query-manifest-v1"
 SLUG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 RUN_SUMMARY = "logs/run_summary.json"
+DIAGNOSTIC_RUN_SUMMARY = "logs/diagnostic_run_summary.json"
 CLEANUP_SUMMARY = "logs/cleanup_summary.json"
 BUNDLE_LOCK = "logs/bundle.lock"
 JOB_CONFIG_KEYS = {
     "target_brand",
     "target_aliases",
+    "owned_domains",
     "industry",
     "market",
     "queries",
@@ -58,6 +60,7 @@ ALLOWED_STATUSES = {
     "ran",
     "ran_partial",
     "run_failed",
+    "interrupted",
     "analyzing",
     "analyzed",
     "analyzed_partial",
@@ -113,6 +116,7 @@ def build_job_bundle(
         }
     schema_version = GEO_JOB_V3
     repeats = _positive_int(config.get("repeats", 20), "repeats")
+    _ensure_unit_limit(len(queries) * repeats, settings, context="构建 job")
     web_search_limit = _bounded_int(config.get("web_search_limit", settings.web_search_limit), "web_search_limit", minimum=1, maximum=20)
     concurrency = _positive_int(config.get("concurrency", settings.concurrency), "concurrency")
     if concurrency > 8:
@@ -133,6 +137,7 @@ def build_job_bundle(
             web_search_limit=web_search_limit,
             web_search_required=True,
         )
+        sampling_profile = _freeze_sampling_profile(sampling_profile, settings, adapter_options)
     except ValueError as exc:
         raise JobError(str(exc)) from exc
     analysis_model = str(config.get("analysis_model") or model).strip()
@@ -147,6 +152,7 @@ def build_job_bundle(
     industry = _required_str(config, "industry")
     market = _optional_str(config, "market", default="未指定市场")
     target_aliases = _string_list(config.get("target_aliases"), "target_aliases")
+    owned_domains = _domain_list(config.get("owned_domains"), "owned_domains")
 
     manifest = {
         "schema_version": schema_version,
@@ -154,6 +160,7 @@ def build_job_bundle(
         "status": "built",
         "target_brand": target_brand,
         "target_aliases": target_aliases,
+        "owned_domains": owned_domains,
         "industry": industry,
         "market": market,
         "repeats": repeats,
@@ -177,6 +184,7 @@ def build_job_bundle(
             analysis_profile,
             target_brand=target_brand,
             target_aliases=target_aliases,
+            owned_domains=owned_domains,
             industry=industry,
             market=market,
         ),
@@ -198,20 +206,29 @@ def build_job_bundle(
 
 
 def _materialize_job_bundle(bundle_dir: Path, manifest: dict[str, Any], queries: list[dict[str, Any]]) -> dict[str, Any]:
-    for name in [WORK_DIR, RAW_DIR, RESULT_DIR, LOGS_DIR]:
-        (bundle_dir / name).mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_private_directory(bundle_dir)
+        for name in [WORK_DIR, RAW_DIR, RESULT_DIR, LOGS_DIR]:
+            ensure_private_directory(bundle_dir / name)
+    except UnsafeOutputPathError as exc:
+        raise JobError(str(exc)) from exc
     _write_json(bundle_dir / JOB_MANIFEST, manifest)
     query_manifest = bundle_dir / QUERY_MANIFEST
     source_path = _resolve_query_manifest_source(manifest, bundle_dir=bundle_dir)
     if source_path is not None and source_path.exists():
-        shutil.copyfile(source_path, query_manifest)
+        try:
+            prepare_private_output(query_manifest)
+            shutil.copyfile(source_path, query_manifest)
+            secure_private_file(query_manifest)
+        except UnsafeOutputPathError as exc:
+            raise JobError(str(exc)) from exc
     else:
         _write_query_manifest(query_manifest, queries)
     return {
+        **manifest,
         "bundle_dir": str(bundle_dir),
         "job_manifest": str(bundle_dir / JOB_MANIFEST),
         "query_manifest": str(query_manifest),
-        **manifest,
     }
 
 
@@ -233,6 +250,7 @@ def validate_job_config(
     else:
         queries = _normalize_queries(config.get("queries"))
     repeats = _positive_int(config.get("repeats", 20), "repeats")
+    _ensure_unit_limit(len(queries) * repeats, settings, context="校验 job")
     web_search_limit = _bounded_int(config.get("web_search_limit", settings.web_search_limit), "web_search_limit", minimum=1, maximum=20)
     concurrency = _positive_int(config.get("concurrency", settings.concurrency), "concurrency")
     if concurrency > 8:
@@ -253,6 +271,7 @@ def validate_job_config(
             web_search_limit=web_search_limit,
             web_search_required=True,
         )
+        sampling_profile = _freeze_sampling_profile(sampling_profile, settings, adapter_options)
         analysis_model = str(config.get("analysis_model") or model).strip()
         analysis_adapter = str(config.get("analysis_adapter") or "openai_responses_text").strip()
         analysis_profile = _build_analysis_profile(analysis_adapter, analysis_model, settings)
@@ -260,11 +279,13 @@ def validate_job_config(
         raise JobError(str(exc)) from exc
     target_brand = _required_str(config, "target_brand")
     target_aliases = _string_list(config.get("target_aliases"), "target_aliases")
+    owned_domains = _domain_list(config.get("owned_domains"), "owned_domains")
     industry = _required_str(config, "industry")
     market = _optional_str(config, "market", default="未指定市场")
     result = {
         "target_brand": target_brand,
         "target_aliases": target_aliases,
+        "owned_domains": owned_domains,
         "industry": industry,
         "market": market,
         "query_count": len(queries),
@@ -283,6 +304,7 @@ def validate_job_config(
             analysis_profile,
             target_brand=target_brand,
             target_aliases=target_aliases,
+            owned_domains=owned_domains,
             industry=industry,
             market=market,
         ),
@@ -313,6 +335,7 @@ def run_job_bundle(
     manifest = load_job_manifest(root)
     raw_path = root / RAW_ATTEMPTS
     started_at = utc_now_iso()
+    run_execution_id = make_run_id()
     with _job_lock(root / BUNDLE_LOCK):
         query_manifest = ensure_query_manifest(root, manifest, replacement_path=query_manifest_path)
         if not query_manifest.exists():
@@ -320,9 +343,17 @@ def run_job_bundle(
         all_queries = load_queries(query_manifest)
         queries = select_queries(all_queries, limit=limit, only_query_ids=only_query_ids)
         selected_units = _expected_units_for_queries(queries, int(manifest["repeats"]))
+        _ensure_unit_limit(len(selected_units), settings, context="运行 job")
         analysis_statuses = _run_completion_statuses(dry_run=dry_run, mock=mock)
         resume_matched_before = _resume_matched_unit_count(raw_path, queries, manifest, settings) if resume else 0
         live_remaining = 0 if dry_run or mock else max(0, len(selected_units) - resume_matched_before)
+        will_execute = bool(selected_units) and (not resume or resume_matched_before < len(selected_units))
+        _validate_runtime_profile(
+            manifest,
+            settings,
+            require_request_match=will_execute,
+            require_endpoint_match=live_remaining > 0,
+        )
         if live_remaining and not confirm_cost:
             raise JobError("真实 live 调用会产生 API 成本；请确认预算后显式传入 confirm_cost=True")
         if live_remaining:
@@ -331,22 +362,43 @@ def run_job_bundle(
             except LiveSettingsError as exc:
                 raise JobError(str(exc)) from exc
         runner = MonitorRunner(settings)
-        will_execute = bool(selected_units) and (dry_run or mock or not resume or resume_matched_before < len(selected_units))
+        diagnostic_mode = dry_run or mock
+        previous_status = str(manifest.get("status") or "")
         run_generation = int(manifest.get("run_generation") or 0)
+        diagnostic_generation = int(manifest.get("diagnostic_generation") or 0)
         if will_execute:
-            run_generation += 1
-            _invalidate_analysis_artifacts(root)
-            manifest = update_job_manifest(
-                root,
-                status="running",
-                extra={"run_generation": run_generation, "last_run_started_at": started_at},
-            )
+            if diagnostic_mode:
+                diagnostic_generation += 1
+                manifest = update_job_manifest(
+                    root,
+                    extra={
+                        "diagnostic_generation": diagnostic_generation,
+                        "last_diagnostic_execution_id": run_execution_id,
+                        "last_diagnostic_mode": "dry_run" if dry_run else "mock",
+                        "last_diagnostic_started_at": started_at,
+                    },
+                )
+            else:
+                run_generation += 1
+                _invalidate_analysis_artifacts(root)
+                manifest = update_job_manifest(
+                    root,
+                    status="running",
+                    extra={
+                        "run_generation": run_generation,
+                        "last_run_execution_id": run_execution_id,
+                        "last_run_started_at": started_at,
+                    },
+                )
             try:
                 results = runner.run(
                     queries,
                     output_path=raw_path,
                     job_id=str(manifest["job_id"]),
                     run_id=str(manifest["job_id"]),
+                    run_execution_id=run_execution_id,
+                    run_generation=run_generation,
+                    diagnostic_generation=diagnostic_generation if diagnostic_mode else None,
                     dry_run=dry_run,
                     mock=mock,
                     resume=resume,
@@ -360,20 +412,54 @@ def run_job_bundle(
                     start_interval_seconds=float(start_interval_seconds if start_interval_seconds is not None else manifest.get("start_interval_seconds", 0.0)),
                     concurrency=int(manifest["concurrency"]),
                 )
+            except KeyboardInterrupt:
+                if diagnostic_mode and previous_status.startswith("analyzed"):
+                    update_job_manifest(
+                        root,
+                        extra={
+                            "last_diagnostic_execution_id": run_execution_id,
+                            "last_diagnostic_interrupted_at": utc_now_iso(),
+                        },
+                    )
+                else:
+                    update_job_manifest(
+                        root,
+                        status="interrupted",
+                        extra={
+                            "run_generation": run_generation,
+                            "last_run_execution_id": run_execution_id,
+                            "last_run_interrupted_at": utc_now_iso(),
+                        },
+                    )
+                raise
             except Exception:
-                update_job_manifest(root, status="run_failed")
+                if diagnostic_mode and previous_status.startswith("analyzed"):
+                    update_job_manifest(
+                        root,
+                        extra={
+                            "last_diagnostic_execution_id": run_execution_id,
+                            "last_diagnostic_failed_at": utc_now_iso(),
+                        },
+                    )
+                else:
+                    update_job_manifest(
+                        root,
+                        status="run_failed",
+                        extra={"last_run_execution_id": run_execution_id, "last_run_failed_at": utc_now_iso()},
+                    )
                 raise
         else:
             results = []
+        runner_info = dict(runner.last_run_info)
         completed_at = utc_now_iso()
         all_units = _expected_units_for_queries(all_queries, int(manifest["repeats"]))
         planned_units = len(selected_units)
         completed_units = _completed_unit_count(raw_path, analysis_statuses, expected_units=selected_units)
         job_completed_units = _completed_unit_count(raw_path, analysis_statuses, expected_units=all_units)
-        executed_completed = sum(1 for item in results if item.status in analysis_statuses)
         summary = {
             "job_id": manifest.get("job_id"),
             "run_id": manifest.get("job_id"),
+            "run_execution_id": run_execution_id,
             "planned_units": planned_units,
             "job_planned_units": len(all_units),
             "completed_units": completed_units,
@@ -387,20 +473,59 @@ def run_job_bundle(
             "completed_at": completed_at,
             "mode": "dry_run" if dry_run else "mock" if mock else "live",
             "run_generation": run_generation,
+            "diagnostic_generation": diagnostic_generation if diagnostic_mode else None,
+            "affects_analysis_generation": not diagnostic_mode,
+            "circuit_breaker": bool(runner_info.get("circuit_breaker")),
+            "circuit_breaker_details": runner_info if runner_info.get("circuit_breaker") else None,
         }
-        _write_json(root / RUN_SUMMARY, summary)
-        status = "ran" if summary["errors"] == 0 and job_completed_units == len(all_units) else "ran_partial"
-        if will_execute or not str(manifest.get("status") or "").startswith("analyzed"):
-            update_job_manifest(root, status=status, extra={"run_generation": run_generation, "last_run_completed_at": completed_at})
+        if diagnostic_mode:
+            _write_json(root / DIAGNOSTIC_RUN_SUMMARY, summary)
+            if not previous_status.startswith("analyzed"):
+                _write_json(root / RUN_SUMMARY, summary)
+        else:
+            _write_json(root / RUN_SUMMARY, summary)
+        status = "ran" if not summary["circuit_breaker"] and summary["errors"] == 0 and job_completed_units == len(all_units) else "ran_partial"
+        if diagnostic_mode and previous_status.startswith("analyzed"):
+            update_job_manifest(
+                root,
+                extra={
+                    "diagnostic_generation": diagnostic_generation,
+                    "last_diagnostic_execution_id": run_execution_id,
+                    "last_diagnostic_completed_at": completed_at,
+                },
+            )
+        elif diagnostic_mode:
+            update_job_manifest(
+                root,
+                status=status,
+                extra={
+                    "diagnostic_generation": diagnostic_generation,
+                    "last_diagnostic_execution_id": run_execution_id,
+                    "last_diagnostic_completed_at": completed_at,
+                },
+            )
+        elif will_execute or not previous_status.startswith("analyzed"):
+            update_job_manifest(
+                root,
+                status=status,
+                extra={
+                    "run_generation": run_generation,
+                    "last_run_completed_at": completed_at,
+                    "last_run_circuit_breaker": runner_info if runner_info.get("circuit_breaker") else None,
+                },
+            )
     return {
         "bundle_dir": str(root),
         "raw_jsonl": str(raw_path),
         "run_id": str(manifest.get("job_id")),
+        "run_execution_id": run_execution_id,
         "executed": len(results),
         "errors": summary["errors"],
         "completed_units": summary["completed_units"],
         "job_completed_units": summary["job_completed_units"],
         "skipped": summary["skipped"],
+        "circuit_breaker": summary["circuit_breaker"],
+        "circuit_breaker_details": summary["circuit_breaker_details"],
     }
 
 
@@ -461,9 +586,11 @@ def estimate_job_run(
 
 
 def load_job_manifest(bundle_dir: str | Path) -> dict[str, Any]:
-    path = Path(bundle_dir) / JOB_MANIFEST
+    root = Path(bundle_dir)
+    path = root / JOB_MANIFEST
     if not path.exists():
         raise JobError(f"缺少 job_manifest.json：{path}")
+    _ensure_bundle_regular_file(root, path, "job_manifest.json")
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema_version") not in {GEO_JOB_V1, GEO_JOB_V2, GEO_JOB_V3}:
         raise JobError("job_manifest schema_version 必须是 geo-job-v1、geo-job-v2 或 geo-job-v3")
@@ -497,7 +624,10 @@ def resolve_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | No
     root = Path(bundle_dir)
     current = root / QUERY_MANIFEST
     manifest = manifest or load_job_manifest(root)
+    if current.is_symlink():
+        raise QueryManifestIntegrityError(f"bundle query manifest 不能是 symlink：{current}")
     if current.exists():
+        _ensure_bundle_regular_file(root, current, "query_manifest.csv")
         _ensure_query_manifest_matches(current, manifest)
         return current
     queries = manifest.get("queries")
@@ -506,8 +636,9 @@ def resolve_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | No
             source = _resolve_query_manifest_source(manifest, bundle_dir=root)
             if source is not None and source.exists():
                 _ensure_manifest_file_fingerprint(source, manifest)
-                current.parent.mkdir(parents=True, exist_ok=True)
+                prepare_private_output(current)
                 shutil.copyfile(source, current)
+                secure_private_file(current)
                 return current
         return current
     if materialize:
@@ -522,8 +653,9 @@ def ensure_query_manifest(bundle_dir: str | Path, manifest: dict[str, Any] | Non
     if replacement_path is not None:
         replacement = Path(replacement_path)
         _ensure_manifest_file_fingerprint(replacement, manifest)
-        current.parent.mkdir(parents=True, exist_ok=True)
+        prepare_private_output(current)
         shutil.copyfile(replacement, current)
+        secure_private_file(current)
     return resolve_query_manifest(root, manifest, materialize=True)
 
 
@@ -593,13 +725,21 @@ def update_job_manifest(bundle_dir: str | Path, *, status: str | None = None, ex
 
 def _invalidate_analysis_artifacts(bundle_dir: Path) -> None:
     result = result_dir(bundle_dir)
+    if result.is_symlink():
+        raise JobError(f"拒绝清理 symlink result 目录：{result}")
     if result.exists():
         shutil.rmtree(result)
-    result.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_private_directory(result)
+    except UnsafeOutputPathError as exc:
+        raise JobError(str(exc)) from exc
     logs = logs_dir(bundle_dir)
+    if logs.is_symlink():
+        raise JobError(f"拒绝写入 symlink logs 目录：{logs}")
     for name in [
         "analysis_summary.json",
         "analysis_summary.json.cache",
+        "analysis_artifacts.json",
         "data_quality.json",
         "extraction_errors.jsonl",
         "raw_read_errors.jsonl",
@@ -625,6 +765,10 @@ def _load_job_config(config_path: str | Path) -> dict[str, Any]:
     path = Path(config_path)
     if not path.exists():
         raise JobError(f"任务配置不存在：{path}")
+    if path.is_symlink() or not path.is_file():
+        raise JobError(f"任务配置必须是普通非 symlink 文件：{path}")
+    if path.stat().st_size > 5 * 1024 * 1024:
+        raise JobError(f"任务配置超过 5 MiB 上限：{path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -660,6 +804,8 @@ def _normalize_queries(value: Any) -> list[dict[str, Any]]:
             raise JobError("queries 只能包含字符串或对象")
         if not query:
             raise JobError(f"queries 第 {index} 项为空")
+        if len(query) > MAX_QUERY_CHARS:
+            raise JobError(f"queries 第 {index} 项超过 {MAX_QUERY_CHARS} 字符上限")
         if not query_id:
             raise JobError(f"queries 第 {index} 项 query_id 不能为空")
         if query_id in seen:
@@ -672,14 +818,23 @@ def _normalize_queries(value: Any) -> list[dict[str, Any]]:
 
 
 def _write_query_manifest(path: Path, queries: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     preferred = ["query_id", "query", "locale", "market", "category", "tags", "stage", "persona"]
     extra = sorted({key for row in queries for key in row.keys()} - set(preferred))
     fieldnames = [key for key in preferred if any(key in row for row in queries)] + extra
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(queries)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with open_private_text(tmp_path, encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows([{key: encode_manifest_csv_cell(value) if isinstance(value, str) else value for key, value in row.items()} for row in queries])
+        os.replace(tmp_path, path)
+        secure_private_file(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _query_rows_from_records(records: list[QueryRecord]) -> list[dict[str, Any]]:
@@ -756,9 +911,7 @@ def _ensure_trusted_query_manifest_source(path: Path, bundle_dir: Path) -> None:
     if any(_is_relative_to(resolved, root) for root in trusted_roots):
         return
     roots = ", ".join(str(root) for root in trusted_roots)
-    raise QueryManifestSourceError(
-        f"query_manifest.source_uri 不在可信目录内：{path}；可信目录：{roots}。如需使用该文件，请显式传入 --query-manifest。"
-    )
+    raise QueryManifestSourceError(f"query_manifest.source_uri 不在可信目录内：{path}；可信目录：{roots}。如需使用该文件，请显式传入 --query-manifest。")
 
 
 def _trusted_query_manifest_roots(bundle_dir: Path) -> list[Path]:
@@ -802,17 +955,28 @@ def _ensure_manifest_file_fingerprint(path: Path, manifest: dict[str, Any]) -> N
     _query_rows_from_records(records)
 
 
+def _ensure_bundle_regular_file(root: Path, path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise JobError(f"bundle {label} 必须是普通非 symlink 文件：{path}")
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise JobError(f"bundle {label} 逃逸任务目录：{path}") from exc
+
+
 def _validate_slug_id(value: str, field: str) -> None:
     if not SLUG_RE.fullmatch(value):
         raise JobError(f"{field} 只能包含 [a-zA-Z0-9_-]：{value}")
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with open_private_text(tmp_path) as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, indent=2))
         os.replace(tmp_path, path)
+        secure_private_file(path)
     finally:
         try:
             tmp_path.unlink()
@@ -828,6 +992,7 @@ def _manifest_paths() -> dict[str, str]:
         "result_dir": RESULT_DIR,
         "logs_dir": LOGS_DIR,
         "run_summary": RUN_SUMMARY,
+        "diagnostic_run_summary": DIAGNOSTIC_RUN_SUMMARY,
         "cleanup_summary": CLEANUP_SUMMARY,
     }
 
@@ -897,6 +1062,7 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
             normalized["analysis_profile"],
             target_brand=str(normalized.get("target_brand") or ""),
             target_aliases=_string_list(normalized.get("target_aliases"), "target_aliases") if isinstance(normalized.get("target_aliases"), list) else [],
+            owned_domains=_domain_list(normalized.get("owned_domains"), "owned_domains") if isinstance(normalized.get("owned_domains"), list) else [],
             industry=str(normalized.get("industry") or ""),
             market=str(normalized.get("market") or ""),
         )
@@ -910,7 +1076,20 @@ def _normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_job_manifest(data: dict[str, Any]) -> None:
-    required = ["schema_version", "job_id", "status", "target_brand", "industry", "market", "repeats", "model", "web_search_limit", "adapter", "concurrency", "query_count"]
+    required = [
+        "schema_version",
+        "job_id",
+        "status",
+        "target_brand",
+        "industry",
+        "market",
+        "repeats",
+        "model",
+        "web_search_limit",
+        "adapter",
+        "concurrency",
+        "query_count",
+    ]
     missing = [key for key in required if key not in data]
     if missing:
         raise JobError(f"job_manifest 缺少字段：{', '.join(missing)}")
@@ -945,11 +1124,33 @@ def _validate_job_manifest(data: dict[str, Any]) -> None:
     _non_negative_float(data.get("start_interval_seconds", 0.0), "start_interval_seconds")
     if not str(data.get("model") or "").strip():
         raise JobError("model 不能为空")
-    _validate_profile_object(data.get("sampling_profile"), "sampling_profile", ["provider", "adapter", "adapter_version", "api_family", "model", "base_url_fingerprint", "request_fingerprint_version", "web_search_required", "source_grain"])
-    _validate_profile_object(data.get("analysis_profile"), "analysis_profile", ["provider", "adapter", "adapter_version", "api_family", "model", "base_url_fingerprint", "analysis_fingerprint"])
-    _validate_profile_object(data.get("comparability_profile"), "comparability_profile", ["query_manifest_sha256", "repeats", "analysis_fingerprint", "source_grain"])
+    _validate_profile_object(
+        data.get("sampling_profile"),
+        "sampling_profile",
+        [
+            "provider",
+            "adapter",
+            "adapter_version",
+            "api_family",
+            "model",
+            "base_url_fingerprint",
+            "request_fingerprint_version",
+            "web_search_required",
+            "source_grain",
+        ],
+    )
+    _validate_profile_object(
+        data.get("analysis_profile"),
+        "analysis_profile",
+        ["provider", "adapter", "adapter_version", "api_family", "model", "base_url_fingerprint", "analysis_fingerprint"],
+    )
+    _validate_profile_object(
+        data.get("comparability_profile"), "comparability_profile", ["query_manifest_sha256", "repeats", "analysis_fingerprint", "source_grain"]
+    )
+    _validate_manifest_profile_consistency(data)
     _required_str(data, "target_brand")
     _string_list(data.get("target_aliases"), "target_aliases")
+    _domain_list(data.get("owned_domains"), "owned_domains")
     _required_str(data, "industry")
     _optional_str(data, "market", default="未指定市场")
     if schema_version == GEO_JOB_V1:
@@ -962,6 +1163,42 @@ def _validate_profile_object(value: Any, name: str, required: list[str]) -> None
     missing = [key for key in required if key not in value]
     if missing:
         raise JobError(f"{name} 缺少字段：{', '.join(missing)}")
+
+
+def _validate_manifest_profile_consistency(data: dict[str, Any]) -> None:
+    profile = data["sampling_profile"]
+    checks = {
+        "adapter": str(data.get("adapter") or ""),
+        "model": str(data.get("model") or ""),
+        "web_search_limit": int(data.get("web_search_limit") or 0),
+    }
+    for key, expected in checks.items():
+        if key in profile and profile.get(key) != expected:
+            raise JobError(f"sampling_profile.{key} 与 job_manifest.{key} 不一致")
+    effective = profile.get("effective_runtime")
+    if effective is None:
+        return
+    if not isinstance(effective, dict):
+        raise JobError("sampling_profile.effective_runtime 必须是对象")
+    if "max_tool_calls" in effective:
+        effective_max_tool_calls = _positive_int(
+            effective.get("max_tool_calls"),
+            "sampling_profile.effective_runtime.max_tool_calls",
+        )
+        if "max_tool_calls" in profile and profile.get("max_tool_calls") != effective_max_tool_calls:
+            raise JobError("sampling_profile.max_tool_calls 与 effective_runtime.max_tool_calls 不一致")
+    if "max_output_tokens" in effective:
+        effective_max_output_tokens = _positive_int(
+            effective.get("max_output_tokens"),
+            "sampling_profile.effective_runtime.max_output_tokens",
+        )
+        if "max_output_tokens" in profile and profile.get("max_output_tokens") != effective_max_output_tokens:
+            raise JobError("sampling_profile.max_output_tokens 与 effective_runtime.max_output_tokens 不一致")
+    frozen_options = effective.get("adapter_options")
+    if not isinstance(frozen_options, dict):
+        raise JobError("sampling_profile.effective_runtime.adapter_options 必须是对象")
+    if frozen_options != dict(data.get("adapter_options") or {}):
+        raise JobError("sampling_profile.effective_runtime.adapter_options 与 job_manifest.adapter_options 不一致")
 
 
 def _make_job_id() -> str:
@@ -992,6 +1229,27 @@ def _string_list(value: Any, key: str) -> list[str]:
     return out
 
 
+def _domain_list(value: Any, key: str) -> list[str]:
+    domains = _string_list(value, key)
+    output: list[str] = []
+    for domain in domains:
+        candidate = domain.lower().rstrip(".")
+        if candidate.startswith("www."):
+            candidate = candidate[4:]
+        if not candidate or any(token in candidate for token in ("://", "/", "@", "?", "#", ":")):
+            raise JobError(f"{key} 只能包含域名，不包含 scheme、端口、路径或凭据：{domain}")
+        try:
+            ascii_domain = candidate.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise JobError(f"{key} 包含无效域名：{domain}") from exc
+        labels = ascii_domain.split(".")
+        if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels):
+            raise JobError(f"{key} 包含无效域名：{domain}")
+        if ascii_domain not in output:
+            output.append(ascii_domain)
+    return output
+
+
 def _object_dict(value: Any, key: str) -> dict[str, Any]:
     if value in (None, ""):
         return {}
@@ -1017,9 +1275,67 @@ def _build_analysis_profile(adapter_name: str, model: str, settings: Settings) -
         "api_family": adapter.capabilities.api_family,
         "model": model_text,
         "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
+        "max_output_tokens": settings.analysis_max_output_tokens,
     }
     profile["analysis_fingerprint"] = analysis_fingerprint(profile)
     return profile
+
+
+def _freeze_sampling_profile(
+    profile: dict[str, Any],
+    settings: Settings,
+    adapter_options: dict[str, Any],
+) -> dict[str, Any]:
+    frozen = dict(profile)
+    effective_runtime: dict[str, Any] = {"adapter_options": dict(adapter_options)}
+    max_tool_calls = _effective_max_tool_calls(profile, settings, adapter_options)
+    if max_tool_calls is not None:
+        effective_runtime["max_tool_calls"] = max_tool_calls
+        frozen["max_tool_calls"] = max_tool_calls
+    effective_runtime["max_output_tokens"] = settings.max_output_tokens
+    frozen["max_output_tokens"] = settings.max_output_tokens
+    frozen["effective_runtime"] = effective_runtime
+    return frozen
+
+
+def _validate_runtime_profile(
+    manifest: dict[str, Any],
+    settings: Settings,
+    *,
+    require_request_match: bool,
+    require_endpoint_match: bool,
+) -> None:
+    profile = dict(manifest.get("sampling_profile") or {})
+    effective = profile.get("effective_runtime")
+    if require_request_match and isinstance(effective, dict):
+        expected_max_tool_calls = effective.get("max_tool_calls")
+        actual_max_tool_calls = _effective_max_tool_calls(
+            profile,
+            settings,
+            dict(manifest.get("adapter_options") or {}),
+        )
+        if expected_max_tool_calls is not None and int(expected_max_tool_calls) != actual_max_tool_calls:
+            raise JobError("运行时 MAX_TOOL_CALLS 与 sampling_profile.effective_runtime.max_tool_calls 不一致；请使用构建 job 时的配置")
+        expected_max_output_tokens = effective.get("max_output_tokens")
+        if expected_max_output_tokens is not None and int(expected_max_output_tokens) != settings.max_output_tokens:
+            raise JobError("运行时 MAX_OUTPUT_TOKENS 与 sampling_profile.effective_runtime.max_output_tokens 不一致；请使用构建 job 时的配置")
+        if dict(effective.get("adapter_options") or {}) != dict(manifest.get("adapter_options") or {}):
+            raise JobError("运行时 adapter_options 与 sampling_profile.effective_runtime.adapter_options 不一致")
+    if require_endpoint_match:
+        expected_endpoint = str(profile.get("base_url_fingerprint") or "")
+        actual_endpoint = base_url_fingerprint(settings.llm_base_url)
+        if expected_endpoint and expected_endpoint != actual_endpoint:
+            raise JobError("运行时 LLM_BASE_URL 与 sampling_profile.base_url_fingerprint 不一致；请使用构建 job 时的 endpoint 或重新构建 job")
+
+
+def _effective_max_tool_calls(
+    profile: dict[str, Any],
+    settings: Settings,
+    adapter_options: dict[str, Any],
+) -> int | None:
+    if str(profile.get("api_family") or "") != "responses":
+        return None
+    return int(adapter_options.get("max_tool_calls", settings.max_tool_calls))
 
 
 def _build_comparability_profile(
@@ -1031,6 +1347,7 @@ def _build_comparability_profile(
     *,
     target_brand: str = "",
     target_aliases: list[str] | None = None,
+    owned_domains: list[str] | None = None,
     industry: str = "",
     market: str = "",
 ) -> dict[str, Any]:
@@ -1044,21 +1361,16 @@ def _build_comparability_profile(
     study_basis = {
         "target_brand": target_brand,
         "target_aliases": sorted(str(alias) for alias in (target_aliases or [])),
+        "owned_domains": sorted(str(domain) for domain in (owned_domains or [])),
         "industry": industry,
         "market": market,
         "query_manifest_sha256": query_digest,
         "query_count": len(queries) or int(query_manifest_info.get("row_count") or 0),
         "repeats": repeats,
     }
-    sampling_basis = {
-        key: sampling_profile.get(key)
-        for key in [
-            "request_fingerprint_version",
-            "web_search_required",
-            "source_grain",
-            "web_search_limit",
-        ]
-    }
+    sampling_basis = {key: value for key, value in sampling_profile.items() if key not in {"inferred_from_legacy", "web_search_limit"}}
+    if bool(sampling_profile.get("web_search_limit_effective")):
+        sampling_basis["web_search_limit"] = sampling_profile.get("web_search_limit")
     profile["study_fingerprint"] = _stable_digest(study_basis)
     profile["sampling_fingerprint"] = _stable_digest(sampling_basis)
     return profile
@@ -1111,6 +1423,11 @@ def _positive_int(value: Any, key: str) -> int:
     if parsed < 1:
         raise JobError(f"{key} 必须是正整数")
     return parsed
+
+
+def _ensure_unit_limit(units: int, settings: Settings, *, context: str) -> None:
+    if units > settings.max_job_units:
+        raise JobError(f"{context}计划 {units} 个单元，超过 MAX_JOB_UNITS={settings.max_job_units}；请缩小 query/repeats 范围")
 
 
 def _validate_persisted_queries(value: Any) -> None:
@@ -1190,7 +1507,15 @@ def _expected_units_for_queries(queries: list[Any], repeats: int) -> set[tuple[s
 def _completed_unit_count(raw_path: Path, statuses: set[str], *, expected_units: set[tuple[str, int]] | None = None) -> int:
     if not raw_path.exists():
         return 0
-    records = latest_records(read_jsonl(raw_path, strict=False), statuses=statuses)
+    if statuses == {"success"}:
+        records = latest_live_terminal_records(read_jsonl(raw_path, strict=False))
+    elif statuses == {"mock"}:
+        records = latest_records(read_jsonl(raw_path, strict=False), statuses={"mock"})
+    elif statuses == {"dry_run"}:
+        records = latest_records(read_jsonl(raw_path, strict=False), statuses={"dry_run"})
+    else:
+        records = latest_records(read_jsonl(raw_path, strict=False), statuses=set(statuses))
+    records = [record for record in records if record.get("status") in statuses]
     if expected_units is None:
         return len(records)
     return sum(1 for record in records if (str(record.get("query_id")), int(record.get("repeat_index") or 1)) in expected_units)
@@ -1223,11 +1548,18 @@ class _job_lock:
         self.token: str | None = None
 
     def __enter__(self) -> "_job_lock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            ensure_private_directory(self.path.parent)
+        except UnsafeOutputPathError as exc:
+            raise JobError(str(exc)) from exc
         deadline = time.monotonic() + self.timeout_seconds
         while True:
             try:
-                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                self.fd = os.open(
+                    self.path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
                 self.token = f"{os.getpid()}-{time.time_ns()}"
                 os.write(self.fd, json.dumps({"pid": os.getpid(), "token": self.token, "created_at": utc_now_iso()}).encode("utf-8"))
                 return self
@@ -1255,7 +1587,7 @@ class _job_lock:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             pid = int(data.get("pid") or 0)
             if pid > 0 and _pid_exists(pid):
-                return stat if time.time() - stat.st_mtime > self.stale_seconds else None
+                return None
             if pid > 0:
                 return stat
             return stat if time.time() - stat.st_mtime > self.stale_seconds else None

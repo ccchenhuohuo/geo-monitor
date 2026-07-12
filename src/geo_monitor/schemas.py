@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .query_meta import ensure_query_meta_defaults
 
-
-Status = Literal["success", "error", "dry_run", "mock"]
+Status = Literal["success", "error", "dry_run", "mock", "interrupted"]
+MAX_QUERY_CHARS = 10_000
 
 
 def utc_now_iso() -> str:
@@ -30,6 +30,8 @@ class QueryRecord(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("字段不能为空")
+        if len(value) > MAX_QUERY_CHARS:
+            raise ValueError(f"字段超过最大长度 {MAX_QUERY_CHARS} 字符")
         return value
 
     def metadata_with_tags(self) -> dict[str, Any]:
@@ -65,7 +67,12 @@ class MonitorResult(BaseModel):
     schema_version: str = "attempts-v2"
     job_id: str | None = None
     attempt_id: str | None = None
+    logical_unit_id: str | None = None
     run_id: str
+    run_execution_id: str | None = None
+    run_generation: int | None = None
+    diagnostic_generation: int | None = None
+    execution_mode: Literal["live", "mock", "dry_run"] | None = None
     query_id: str
     repeat_index: int = 1
     repeat_total: int = 1

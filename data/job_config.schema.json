@@ -18,6 +18,16 @@
       },
       "default": []
     },
+    "owned_domains": {
+      "description": "Optional canonical domains owned by the target brand, without scheme, port, path, query, or credentials.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^(?!.*://)(?!.*[/@?#:])[^\\s]+$"
+      },
+      "default": []
+    },
     "industry": {
       "type": "string",
       "minLength": 1

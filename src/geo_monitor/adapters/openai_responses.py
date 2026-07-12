@@ -17,6 +17,7 @@ class OpenAIResponsesWebSearchAdapter(BaseAdapter):
         "external_web_access",
         "filters",
         "include",
+        "max_tool_calls",
         "return_token_budget",
         "search_context_size",
         "tool_choice",
@@ -25,11 +26,10 @@ class OpenAIResponsesWebSearchAdapter(BaseAdapter):
 
     def validate_options(self, options: dict[str, Any]) -> None:
         super().validate_options(options)
-        tool_choice = options.get("tool_choice")
-        if isinstance(tool_choice, str) and tool_choice in {"auto", "none"}:
-            raise ValueError("openai_responses_web_search 要求联网搜索，tool_choice 不能是 auto 或 none")
-        if isinstance(tool_choice, dict) and str(tool_choice.get("type") or "") != "web_search":
-            raise ValueError("openai_responses_web_search tool_choice 必须指向 web_search")
+        self._required_web_search_tool_choice(options)
+        self._string_list_option(options, "include")
+        if "max_tool_calls" in options:
+            self._positive_int_option(options, "max_tool_calls", 1, maximum=10)
 
     def build_request(
         self,
@@ -46,19 +46,23 @@ class OpenAIResponsesWebSearchAdapter(BaseAdapter):
         for key in ["external_web_access", "filters", "return_token_budget", "search_context_size", "user_location"]:
             if key in adapter_options:
                 tool[key] = adapter_options[key]
-        payload = {
+        tool_choice = self._required_web_search_tool_choice(adapter_options) or ("required" if sampling_profile.get("web_search_required", True) else "auto")
+        include = self._string_list_option(adapter_options, "include")
+        payload: dict[str, Any] = {
             "model": sampling_profile["model"],
             "input": query_record.query,
             "tools": [tool],
-            "tool_choice": adapter_options.get("tool_choice") or ("required" if sampling_profile.get("web_search_required", True) else "auto"),
-            "include": adapter_options.get("include", ["web_search_call.action.sources"]),
-            "max_tool_calls": settings.max_tool_calls,
+            "tool_choice": tool_choice,
+            "max_tool_calls": self._positive_int_option(adapter_options, "max_tool_calls", settings.max_tool_calls, maximum=10),
+            "max_output_tokens": settings.max_output_tokens,
         }
+        if include is not None:
+            payload["include"] = include
         legacy_payload = {
             "model": sampling_profile["model"],
             "input": query_record.query,
             "tools": [{"type": "web_search", "limit": limit_value}],
-            "max_tool_calls": settings.max_tool_calls,
+            "max_tool_calls": payload["max_tool_calls"],
         }
         return ProviderRequest(
             sampling_profile=sampling_profile,
@@ -88,7 +92,11 @@ class OpenAIResponsesTextAdapter(BaseAdapter):
         adapter_options: dict[str, Any],
     ) -> ProviderRequest:
         self.validate_options(adapter_options)
-        payload = {"model": sampling_profile["model"], "input": query_record.query}
+        payload = {
+            "model": sampling_profile["model"],
+            "input": query_record.query,
+            "max_output_tokens": settings.analysis_max_output_tokens,
+        }
         return ProviderRequest(
             sampling_profile=sampling_profile,
             payload=payload,

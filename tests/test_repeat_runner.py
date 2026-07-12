@@ -2,14 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from geo_monitor.config import Settings
 from geo_monitor.adapters import build_sampling_profile, get_adapter
+from geo_monitor.config import Settings
 from geo_monitor.dataset import load_queries
 from geo_monitor.exporters import append_jsonl, read_jsonl
 from geo_monitor.request_fingerprint import REQUEST_FINGERPRINT_VERSION
 from geo_monitor.runner import MonitorRunner, compute_request_hash
 from geo_monitor.schemas import MonitorResult
-
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

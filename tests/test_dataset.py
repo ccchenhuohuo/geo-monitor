@@ -4,7 +4,6 @@ import pytest
 
 from geo_monitor.dataset import DatasetError, load_queries, select_queries
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 

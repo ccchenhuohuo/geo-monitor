@@ -19,7 +19,7 @@ seeds:
 
 
 def _write_registry(path, *, template="请以专业买手视角回答：{seed_query}", fallback=False):
-    fallback_text = "\nfallback:\n  template_id: default\n  template: \"兜底回答：{seed_query}\"" if fallback else ""
+    fallback_text = '\nfallback:\n  template_id: default\n  template: "兜底回答：{seed_query}"' if fallback else ""
     path.write_text(
         f"""
 schema_version: persona-template-registry-v1
