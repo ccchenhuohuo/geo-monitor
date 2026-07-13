@@ -1,34 +1,25 @@
-import json
 from importlib.resources import files
 from pathlib import Path
 
 
-def test_packaged_schema_and_top_level_schema_match():
-    packaged = files("geo_monitor").joinpath("data/job_config.schema.json").read_text(encoding="utf-8")
-    top_level = Path("data/job_config.schema.json").read_text(encoding="utf-8")
+def test_source_only_resources_are_present_and_nonempty():
+    resources = [
+        Path("data/job_config.schema.json"),
+        Path("examples/job_config.example.json"),
+        Path("examples/persona_templates.example.yaml"),
+        Path("examples/seed_prompts.example.yaml"),
+        Path("docs/intelligence.md"),
+        Path("docs/metrics.md"),
+        Path("docs/providers.md"),
+    ]
 
-    assert json.loads(packaged)["title"] == "GEO Monitor Job Config"
-    assert json.loads(packaged) == json.loads(top_level)
+    assert all(path.is_file() and path.read_text(encoding="utf-8").strip() for path in resources)
 
 
-def test_packaged_examples_are_available():
+def test_wheel_package_has_no_duplicated_docs_examples_or_schema():
     root = files("geo_monitor")
 
-    assert root.joinpath("examples/job_config.example.json").is_file()
-    assert root.joinpath("examples/seed_prompts.example.yaml").is_file()
-    packaged_registry = root.joinpath("examples/persona_templates.example.yaml").read_text(encoding="utf-8")
-    top_level_registry = Path("examples/persona_templates.example.yaml").read_text(encoding="utf-8")
-    assert packaged_registry == top_level_registry
-    assert "persona-template-registry-v1" in packaged_registry
-
-
-def test_packaged_docs_are_available():
-    root = files("geo_monitor")
-
-    assert "Metrics Reference" in root.joinpath("docs/metrics.md").read_text(encoding="utf-8")
-    assert root.joinpath("docs/README.zh-CN.md").read_text(encoding="utf-8") == Path("README.zh-CN.md").read_text(encoding="utf-8")
-    for name in ("intelligence.md", "metrics.md", "providers.md"):
-        assert root.joinpath(f"docs/{name}").read_text(encoding="utf-8") == Path(f"docs/{name}").read_text(encoding="utf-8")
+    assert not any(root.joinpath(name).is_dir() for name in ("data", "docs", "examples"))
 
 
 def test_intelligence_subpackage_is_part_of_the_distribution():
@@ -54,5 +45,33 @@ def test_report_renderers_are_part_of_the_distribution():
     root = files("geo_monitor.renderers")
 
     assert {"__init__.py", "html.py", "markdown.py", "pdf.py"} <= {
+        item.name for item in root.iterdir() if item.is_file()
+    }
+
+
+def test_job_domain_modules_are_part_of_the_distribution():
+    root = files("geo_monitor.jobs")
+
+    assert {
+        "__init__.py",
+        "bundle_files.py",
+        "cleanup.py",
+        "config.py",
+        "contracts.py",
+        "layout.py",
+        "locking.py",
+        "manifest.py",
+        "profiles.py",
+        "query_manifest.py",
+        "runtime.py",
+    } <= {
+        item.name for item in root.iterdir() if item.is_file()
+    }
+
+
+def test_duckdb_store_modules_are_part_of_the_distribution():
+    root = files("geo_monitor.duckdb_store")
+
+    assert {"__init__.py", "attempts.py", "contracts.py", "ingest.py", "query.py", "results.py", "schema.py"} <= {
         item.name for item in root.iterdir() if item.is_file()
     }

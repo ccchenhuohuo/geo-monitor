@@ -7,12 +7,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .analysis import analyze_job_bundle
 from .config import Settings
-from .dashboard import build_dashboard as build_static_dashboard
-from .db import build_duckdb
 from .fanout import build_query_manifest
 from .job import build_job_bundle, load_job_manifest, run_job_bundle
-from .job_analysis import analyze_job_bundle
 
 __all__ = ["GeoMonitorResult", "StudyPaths", "resolve_study_paths", "run_geo_monitor"]
 
@@ -21,8 +19,6 @@ __all__ = ["GeoMonitorResult", "StudyPaths", "resolve_study_paths", "run_geo_mon
 class StudyPaths:
     study_dir: str | None = None
     runs_dir: str | None = None
-    db_path: str | None = None
-    dashboard_out: str | None = None
     query_manifest_path: str | None = None
 
 
@@ -35,8 +31,6 @@ class GeoMonitorResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     artifact_paths: dict[str, str] = field(default_factory=dict)
     study_paths: dict[str, str | None] = field(default_factory=dict)
-    db_path: str | None = None
-    dashboard_path: str | None = None
     quality_flags: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -51,25 +45,13 @@ def resolve_study_paths(
     *,
     study_dir: str | Path | None = None,
     runs_dir: str | Path | None = None,
-    db_path: str | Path | None = None,
-    dashboard_out: str | Path | None = None,
     query_manifest_path: str | Path | None = None,
 ) -> StudyPaths:
     study = Path(study_dir) if study_dir is not None else None
     runs = Path(runs_dir) if runs_dir is not None else (study / "runs" if study is not None else None)
-    database = (
-        Path(db_path) if db_path is not None else (study / "geo.duckdb" if study is not None else runs.parent / "geo.duckdb" if runs is not None else None)
-    )
-    dashboard = (
-        Path(dashboard_out)
-        if dashboard_out is not None
-        else (study / "dashboard" if study is not None else runs.parent / "dashboard" if runs is not None else None)
-    )
     return StudyPaths(
         study_dir=str(study) if study is not None else None,
         runs_dir=str(runs) if runs is not None else None,
-        db_path=str(database) if database is not None else None,
-        dashboard_out=str(dashboard) if dashboard is not None else None,
         query_manifest_path=str(Path(query_manifest_path)) if query_manifest_path is not None else None,
     )
 
@@ -83,8 +65,6 @@ def run_geo_monitor(
     seed_prompts_path: str | Path | None = None,
     persona_template_registry_path: str | Path | None = None,
     query_manifest_path: str | Path | None = None,
-    db_path: str | Path | None = None,
-    dashboard_out: str | Path | None = None,
     mock: bool = False,
     dry_run: bool = False,
     include_mock: bool = False,
@@ -95,8 +75,6 @@ def run_geo_monitor(
     resume: bool = True,
     keep_work: bool = False,
     refresh_extraction_cache: bool = False,
-    build_db: bool = False,
-    build_dashboard: bool = False,
     write_aggregates: bool = False,
     report_formats: tuple[str, ...] = ("markdown", "pdf"),
     settings: Settings | None = None,
@@ -108,15 +86,13 @@ def run_geo_monitor(
     if bundle_dir is not None and seed_prompts_path is not None:
         raise ValueError("续跑已有 bundle 时不能重新 fanout；请使用 bundle 内冻结的 query manifest")
     if bundle_dir is not None and runs_dir is not None and Path(runs_dir).resolve() != Path(bundle_dir).parent.resolve():
-        raise ValueError("续跑已有 bundle 时 runs_dir 必须等于 bundle 的父目录，避免分析与 DuckDB 指向不同 study")
+        raise ValueError("续跑已有 bundle 时 runs_dir 必须等于 bundle 的父目录，避免跨 study 读取历史或写入聚合")
     inferred_runs = runs_dir
     if bundle_dir is not None and study_dir is None and runs_dir is None:
         inferred_runs = Path(bundle_dir).parent
     paths = resolve_study_paths(
         study_dir=study_dir,
         runs_dir=inferred_runs,
-        db_path=db_path,
-        dashboard_out=dashboard_out,
         query_manifest_path=query_manifest_path,
     )
     if bundle_dir is not None and (not paths.runs_dir or Path(paths.runs_dir).resolve() != Path(bundle_dir).parent.resolve()):
@@ -125,11 +101,6 @@ def run_geo_monitor(
         raise ValueError("run_geo_monitor 需要 study_dir 或 runs_dir")
     if seed_prompts_path and not paths.query_manifest_path:
         raise ValueError("使用 seed_prompts_path 时必须显式传入 query_manifest_path")
-    if build_dashboard and not paths.dashboard_out:
-        raise ValueError("build_dashboard=True 需要 study_dir 或 dashboard_out")
-    existing_db_available = bool(paths.db_path and Path(paths.db_path).exists())
-    if build_dashboard and not build_db and not existing_db_available:
-        raise ValueError("build_dashboard=True 且 build_db=False 需要已有 DuckDB；请提供 db_path 或启用 build_db=True")
     fanout_result: dict[str, Any] = {}
     if seed_prompts_path and paths.query_manifest_path:
         manifest_path = Path(paths.query_manifest_path)
@@ -184,43 +155,29 @@ def run_geo_monitor(
         )
     final_manifest = load_job_manifest(bundle["bundle_dir"])
     status = str(final_manifest.get("status") or ("dry_run" if dry_run else "ran"))
-    db_result = None
-    dashboard_result = None
-    db_available = existing_db_available
-    if build_db and not dry_run and status.startswith("analyzed") and paths.db_path:
-        db_result = build_duckdb(paths.runs_dir, paths.db_path)
-        db_available = True
-    if build_dashboard and db_available and paths.dashboard_out and paths.db_path:
-        dashboard_result = build_static_dashboard(paths.db_path, paths.dashboard_out)
-    report_md = Path(bundle["bundle_dir"]) / "result" / "report.md"
-    artifact_paths = {
-        "bundle_dir": str(bundle["bundle_dir"]),
-        "raw_attempts": str(Path(bundle["bundle_dir"]) / "raw" / "attempts.jsonl"),
-        "report_markdown": str(report_md),
-    }
     bundle_dir = Path(bundle["bundle_dir"])
-    artifact_paths.update(
-        {
-            key: str(Path(value) if Path(value).is_absolute() else bundle_dir / str(value))
-            for key, value in (analysis_result.get("analysis_files") or {}).items()
-        }
-    )
-    artifact_paths.update(
-        {
-            f"report_{key}": str(Path(value) if Path(value).is_absolute() else bundle_dir / str(value))
-            for key, value in (analysis_result.get("report_files") or {}).items()
-        }
-    )
+    artifact_paths = {"bundle_dir": str(bundle_dir)}
+    raw_attempts = bundle_dir / "raw" / "attempts.jsonl"
+    if raw_attempts.is_file():
+        artifact_paths["raw_attempts"] = str(raw_attempts)
+    for key, value in (analysis_result.get("analysis_files") or {}).items():
+        path = Path(value) if Path(value).is_absolute() else bundle_dir / str(value)
+        if path.exists():
+            artifact_paths[key] = str(path)
+    for key, value in (analysis_result.get("report_files") or {}).items():
+        path = Path(value) if Path(value).is_absolute() else bundle_dir / str(value)
+        if path.is_file():
+            artifact_paths[f"report_{key}"] = str(path)
+    report_md_value = artifact_paths.get("report_markdown")
+    report_md = Path(report_md_value) if report_md_value else None
     return GeoMonitorResult(
         status=status,
         job_id=str(bundle.get("job_id") or ""),
         run_id=str(run_result.get("run_id") or bundle.get("job_id") or ""),
-        summary_markdown=report_md.read_text(encoding="utf-8") if report_md.exists() else "",
-        metrics={"fanout": fanout_result, "run": run_result, "analysis": analysis_result, "db": db_result or {}},
+        summary_markdown=report_md.read_text(encoding="utf-8") if report_md and report_md.is_file() else "",
+        metrics={"fanout": fanout_result, "run": run_result, "analysis": analysis_result},
         artifact_paths=artifact_paths,
         study_paths=asdict(paths),
-        db_path=paths.db_path if db_available else None,
-        dashboard_path=dashboard_result["dashboard_path"] if dashboard_result else None,
         quality_flags=_quality_flags_from_analysis(analysis_result),
         errors=_errors_from_results(run_result, analysis_result),
     )
@@ -260,6 +217,6 @@ def _errors_from_results(run_result: dict[str, Any], analysis_result: dict[str, 
     errors: list[str] = []
     if int(run_result.get("errors") or 0):
         errors.append(f"run errors: {run_result['errors']}")
-    if int(analysis_result.get("extraction_error_count") or 0):
-        errors.append(f"extraction errors: {analysis_result['extraction_error_count']}")
+    if int(analysis_result.get("extraction_error_record_count") or 0):
+        errors.append(f"extraction errors: {analysis_result['extraction_error_record_count']}")
     return errors

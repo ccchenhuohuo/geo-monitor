@@ -57,14 +57,14 @@ def _executive_section(summary: dict[str, Any], quality: dict[str, Any]) -> Repo
     else:
         top = summary["brand_summary"][0]
         items.append(
-            f"品牌命中事件份额最高的是 {top.get('brand_name_canonical', '')}，"
-            f"份额 {top.get('sov_event_share', 'N/A')}，Query 覆盖率 {top.get('query_coverage_rate', 'N/A')}。"
+            f"品牌回答命中份额最高的是 {top.get('brand_name_canonical', '')}，"
+            f"份额 {top.get('sov_response_share', 'N/A')}，Query 覆盖率 {top.get('query_coverage_rate', 'N/A')}。"
         )
         diagnosis = summary.get("target_diagnosis") or {}
         if diagnosis.get("target_detected"):
-            target_share = diagnosis.get("target_sov_event_share", diagnosis.get("target_sov_response_share", "N/A"))
+            target_share = diagnosis.get("target_sov_response_share", "N/A")
             items.append(
-                f"目标品牌 {summary.get('target_brand', '')} 的品牌命中事件份额为 {target_share}，样本内排序第 {diagnosis.get('target_rank_by_sov', 'N/A')}。"
+                f"目标品牌 {summary.get('target_brand', '')} 的品牌回答命中份额为 {target_share}，样本内排序第 {diagnosis.get('target_rank_by_sov', 'N/A')}。"
             )
         else:
             items.append(f"目标品牌 {summary.get('target_brand', '')} 在当前抽取口径下未命中，需要复核别名与原始回答。")
@@ -83,7 +83,7 @@ def _configuration_section(summary: dict[str, Any]) -> ReportSection:
         ("每 Query 重复次数", summary.get("expected_repeats")),
         ("成功回答数", summary.get("success_record_count")),
         ("抽取品牌提及数", summary.get("extracted_mention_count")),
-        ("抽取异常回答数", summary.get("extraction_error_record_count", summary.get("extraction_error_count"))),
+        ("抽取异常回答数", summary.get("extraction_error_record_count")),
         ("样本模式", summary.get("sample_mode", "live")),
     ]
     return ReportSection(key="configuration", title="任务配置", blocks=(table("configuration", ["项目", "值"], rows),))
@@ -117,14 +117,14 @@ def _visibility_section(summary: dict[str, Any]) -> ReportSection:
         (
             row.get("sov_rank"),
             row.get("brand_name_canonical"),
-            row.get("sov_event_share"),
+            row.get("sov_response_share"),
             row.get("response_mention_rate"),
             row.get("query_coverage_rate"),
             "是" if row.get("is_target_brand") else "",
         )
         for row in summary.get("brand_summary", [])[:20]
     ]
-    blocks = [paragraph("SOV 是当前 LLM 回答样本内的品牌命中事件份额，不代表市场份额。")]
+    blocks = [paragraph("SOV 是当前 LLM 回答样本内的品牌回答命中份额，不代表市场份额。")]
     if rows:
         blocks.append(table("brand_visibility", ["排名", "品牌/机构", "SOV", "回答提及率", "Query 覆盖率", "目标品牌"], rows))
     else:
@@ -143,12 +143,12 @@ def _target_section(summary: dict[str, Any]) -> ReportSection:
                 "target_diagnosis",
                 ["指标", "值"],
                 [
-                    ("目标品牌命中事件份额", diagnosis.get("target_sov_event_share", diagnosis.get("target_sov_response_share"))),
+                    ("目标品牌回答份额", diagnosis.get("target_sov_response_share")),
                     ("样本内份额排序", diagnosis.get("target_rank_by_sov")),
                     ("与第一名差距", diagnosis.get("target_sov_gap_to_leader")),
                     ("与 Top3 平均差距", diagnosis.get("target_sov_gap_to_top3_avg")),
                     ("回答提及率", diagnosis.get("target_response_mention_rate")),
-                    ("提及后推荐率", diagnosis.get("target_recommended_rate_when_mentioned", diagnosis.get("target_recommended_rate"))),
+                    ("提及后推荐率", diagnosis.get("target_recommended_rate_when_mentioned")),
                     ("全样本推荐率", diagnosis.get("target_recommended_rate_over_success", "0.0%")),
                     ("Query 覆盖率", diagnosis.get("target_query_coverage_rate")),
                 ],
@@ -227,11 +227,11 @@ def _sources_section(summary: dict[str, Any], intelligence: dict[str, Any]) -> R
     rows = [
         (
             row.get("domain"),
-            row.get("parsed_source_occurrences", row.get("citation_occurrences")),
+            row.get("parsed_source_occurrences"),
             row.get("distinct_source_url_count", ""),
             row.get("response_coverage_rate"),
             row.get("query_coverage_rate"),
-            row.get("avg_source_order", row.get("avg_rank")),
+            row.get("avg_source_order"),
         )
         for row in summary.get("source_domains", [])[:15]
     ]
@@ -368,7 +368,7 @@ def _query_section(summary: dict[str, Any]) -> ReportSection:
                         row.get("brand_name_canonical"),
                         row.get("responses_mentioned"),
                         row.get("mention_rate_within_query"),
-                        row.get("recommended_rate_when_mentioned_within_query", row.get("recommended_rate_within_query")),
+                        row.get("recommended_rate_when_mentioned_within_query"),
                     )
                     for row in rows[:30]
                 ],
@@ -410,7 +410,7 @@ def _methodology_section(summary: dict[str, Any]) -> ReportSection:
             bullets(
                 "真实采样请求只发送 Query 文本；目标品牌、行业和市场仅用于任务记录与后处理。",
                 "品牌发现来自对 response_text 的开放式实体抽取，不依赖预置竞品列表。",
-                "SOV 只表示当前回答样本内的品牌命中事件份额，不等同于市场份额或产品真实排名。",
+                "SOV 只表示当前回答样本内的品牌回答命中份额，不等同于市场份额或产品真实排名。",
                 "推荐、排名、情感和品牌感知均受 evidence、confidence 与 traceability 门槛约束。",
                 "Raw attempts 是事实源；CSV、报告、DuckDB 和 HTML 都是可重建派生物。",
             ),

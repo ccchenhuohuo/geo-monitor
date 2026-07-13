@@ -41,11 +41,19 @@ def test_validate_job_config_cli_smoke(tmp_path):
     assert "任务配置有效" in result.output
 
 
-def test_doctor_live_is_not_reported_as_successful_smoke():
-    result = CliRunner().invoke(app, ["doctor", "--live"])
+def test_build_job_cli_requires_and_documents_explicit_output(tmp_path):
+    config = _write_job_config(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["build-job", str(config)])
+    help_result = runner.invoke(app, ["build-job", "--help"])
 
     assert result.exit_code != 0
-    assert "不执行真实 API smoke test" in result.output
+    assert "--out-dir" in _plain(result.output)
+    assert "--runs-dir" in _plain(result.output)
+    assert help_result.exit_code == 0
+    assert "显式任务交付目录" in _plain(help_result.output)
+    assert ".runs" not in _plain(help_result.output)
 
 
 def test_validate_job_config_cli_accepts_external_manifest_without_inline_queries(tmp_path):

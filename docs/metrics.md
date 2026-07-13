@@ -1,8 +1,8 @@
 # Metrics Reference
 
 This document defines the current CSV/report metric contract for GEO Brand
-Monitor. Raw attempts remain the source of truth; CSVs, DuckDB, reports, and
-dashboards are rebuildable analysis layers.
+Monitor. Raw attempts remain the source of truth; CSVs, optional DuckDB files,
+and reports are rebuildable analysis layers.
 
 ## Shared Terms
 
@@ -14,9 +14,9 @@ dashboards are rebuildable analysis layers.
 - Brand response hit: one SOV-eligible canonical brand appearing in one response.
   Multiple raw mentions of the same canonical brand in the same response are
   deduped.
-- Mention event grain: currently the same as brand response hit for exported
-  SOV fields. `sov_event_share` and `sov_response_share` intentionally overlap
-  until a future event-level metric migration is designed.
+- Published SOV uses response grain: a brand can contribute at most one hit per
+  eligible response. A future event-grain metric must use a new field and schema
+  version instead of overloading the response-share contract.
 - Query grain: planned query IDs from the job manifest or the preserved raw
   `query_meta` fallback.
 - Mock samples: excluded unless `analyze-job --include-mock` or the Python API
@@ -34,7 +34,7 @@ dashboards are rebuildable analysis layers.
 ## Facts Layer
 
 The analysis step also writes denominator facts. These files are the stable
-foundation for later intelligence scoring and DuckDB/dashboard views:
+foundation for later intelligence scoring and optional DuckDB views:
 
 | File | Grain | Purpose |
 |---|---|---|
@@ -55,24 +55,18 @@ Missing or unobservable values are N/A (empty CSV / SQL `NULL`), not zero.
 
 ## Brand Summary
 
-Exported in `brand_summary.csv`, `sov_summary.csv`, and
-`discovered_brands.csv`.
+Exported once in `brand_summary.csv`.
 
 | Metric | Numerator | Denominator / Grain |
 |---|---:|---|
 | `responses_mentioned` | Responses where the canonical brand appears | Response grain |
-| `response_mention_count` | Same as `responses_mentioned` | Response grain |
-| `mention_rate` | `responses_mentioned` | Successful analysis responses |
 | `response_mention_rate` | `responses_mentioned` | Successful analysis responses |
-| `query_coverage` | Planned queries where brand appears at least once | Query grain |
-| `query_coverage_count` | Same as `query_coverage` | Query grain |
-| `query_coverage_rate` | `query_coverage` | Planned query count |
+| `query_coverage_count` | Planned queries where brand appears at least once | Query grain |
+| `query_coverage_rate` | `query_coverage_count` | Planned query count |
 | `query_macro_mention_rate` | Mean per-query mention rate | For each planned query: mentioned repeats / expected repeats |
 | `sov_response_share` | Brand response hits for this brand | All brand response hits across brands |
-| `sov_event_share` | Currently compatible with `sov_response_share` | All brand response hits; reserved for a future true event-grain migration |
 | `recommended_count` | Responses where brand is mentioned and recommended | Brand response hits |
-| `recommended_rate` | `recommended_count` | Brand response hits for this brand |
-| `recommended_rate_when_mentioned` | Same as `recommended_rate` | Brand response hits for this brand |
+| `recommended_rate_when_mentioned` | `recommended_count` | Brand response hits for this brand |
 | `recommended_rate_over_success` | `recommended_count` | Successful analysis responses |
 | `rank_observed_count` | Brand response hits with a positive rank | Brand response hits |
 | `rank_observed_rate` | `rank_observed_count` | Brand response hits |
@@ -85,7 +79,6 @@ Exported in `brand_summary.csv`, `sov_summary.csv`, and
 | `sentiment_observed_rate` | Non-unknown sentiment events | Brand response hits with sentiment bucket |
 | `avg_confidence` | Mean retained extraction confidence | Rows with numeric confidence for this brand |
 | `is_target_brand` | 1 when canonical/raw names match target or aliases | Target alias normalization |
-| `target_brand_detected` | Same target flag, repeated for convenience | Target alias normalization |
 | `target_rank_by_sov` | Target brand rank by SOV | Only set on target rows |
 | `target_sov_gap_to_leader` | Leader SOV minus target SOV | Percentage points |
 | `target_sov_gap_to_top3_avg` | Top-3 average SOV minus target SOV | Percentage points |
@@ -99,8 +92,7 @@ Exported in `brand_by_query.csv`.
 | `responses_mentioned` | Repeats for this query where brand appears | Query/repeat grain |
 | `mention_rate_within_query` | `responses_mentioned` | Expected repeats for the query |
 | `recommended_responses` | Repeats where brand is recommended | Query/repeat grain |
-| `recommended_rate_within_query` | `recommended_responses` | Mentioned repeats for this query/brand |
-| `recommended_rate_when_mentioned_within_query` | Same as `recommended_rate_within_query` | Mentioned repeats for this query/brand |
+| `recommended_rate_when_mentioned_within_query` | `recommended_responses` | Mentioned repeats for this query/brand |
 | `recommended_rate_over_success_within_query` | `recommended_responses` | Expected repeats for the query |
 
 ## Query Stability
@@ -134,9 +126,9 @@ Exported in `source_domains.csv`, `source_urls.csv`, and
 | `repeat_coverage` | Repeats for a query where domain appears | Successful repeats for that query |
 | `repeat_coverage_rate` | `repeat_coverage` | Successful repeats for that query |
 
-`citation_occurrences`, `avg_rank`, and `best_rank` may appear internally as
-backward-compatible aliases, but the exported contract uses
-`parsed_source_occurrences`, `avg_source_order`, and `best_source_order`.
+The basic source-statistics contract uses the parsed-source field names above.
+Citation-intelligence tables separately use `citation_occurrences` for a real
+citation-count metric; it is not an alias for parsed source rows.
 
 ## Data Quality
 
@@ -156,7 +148,6 @@ Exported in `logs/data_quality.json` and summarized in
 | `contract_mismatches` | Stored raw request/attempt fields that differ from manifest expectations |
 | `raw_read_errors` | Malformed JSONL rows skipped during raw read |
 | `invalid_records` | Records lacking valid query/repeat identity |
-| `extraction_error_count` | Backward-compatible alias for response-level extraction error count |
 | `extraction_error_record_count` | Responses with at least one extraction error or quarantine row; used as the numerator for `extraction_error_rate` |
 | `extraction_error_row_count` | Extraction error detail rows logged for this analysis |
 | `extraction_error_rate` | `extraction_error_record_count` / `analysis_record_count`, capped naturally by response grain |

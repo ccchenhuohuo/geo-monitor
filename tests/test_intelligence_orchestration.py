@@ -109,7 +109,7 @@ def test_orchestration_builds_complete_traceable_intelligence_contract():
             "query_coverage_rate": "50.0%",
             "top3_rate": "100.0%",
             "avg_rank_position": 2,
-            "sov_event_share": "33.3%",
+            "sov_response_share": "33.3%",
             "sentiment_observed_rate": "100.0%",
         },
         {
@@ -118,7 +118,7 @@ def test_orchestration_builds_complete_traceable_intelligence_contract():
             "query_coverage_rate": "100.0%",
             "top3_rate": "100.0%",
             "avg_rank_position": 1,
-            "sov_event_share": "66.7%",
+            "sov_response_share": "66.7%",
             "sentiment_observed_rate": "100.0%",
         },
     ]

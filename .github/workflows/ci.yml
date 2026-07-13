@@ -59,7 +59,7 @@ jobs:
 
       - name: Install project and test dependencies
         run: >-
-          python -m pip install -e .
+          python -m pip install -e ".[duckdb]"
           "pytest>=8.0.0,<10"
           "pytest-cov>=5.0.0,<8"
 
@@ -93,11 +93,11 @@ jobs:
       - name: Verify the resolved SDK version
         run: python -c "import openai; assert openai.__version__ == '1.66.0', openai.__version__"
 
-      - name: Exercise adapter and client compatibility
+      - name: Exercise adapter and retry compatibility
         run: >-
           python -m pytest
           tests/test_adapter_profiles.py
-          tests/test_llm_client.py
+          tests/test_resilience.py
           tests/test_config.py
 
   package:
@@ -129,12 +129,12 @@ jobs:
           python -m venv /tmp/geo-monitor-wheel-smoke
           /tmp/geo-monitor-wheel-smoke/bin/python -m pip install dist/*.whl
 
-      - name: Smoke test installed CLI, API, resources, intelligence, and reports
+      - name: Smoke test lean wheel, CLI, API, intelligence, and reports
         run: |
           /tmp/geo-monitor-wheel-smoke/bin/geo-monitor --help
           cd /tmp
           /tmp/geo-monitor-wheel-smoke/bin/python - <<'PY'
-          from importlib import resources
+          import importlib.util
           from pathlib import Path
 
           from geo_monitor import run_geo_monitor
@@ -144,17 +144,7 @@ jobs:
 
           assert callable(run_geo_monitor)
           assert INTELLIGENCE_SCHEMA_VERSION == "geo-intelligence-v1"
-          checks = [
-              ("geo_monitor.data", "job_config.schema.json"),
-              ("geo_monitor.examples", "job_config.example.json"),
-              ("geo_monitor.docs", "README.zh-CN.md"),
-              ("geo_monitor.docs", "intelligence.md"),
-              ("geo_monitor.docs", "metrics.md"),
-              ("geo_monitor.docs", "providers.md"),
-          ]
-          for package, name in checks:
-              content = resources.files(package).joinpath(name).read_text(encoding="utf-8")
-              assert content.strip(), f"empty package resource: {package}/{name}"
+          assert importlib.util.find_spec("duckdb") is None
 
           model, reports = render_report_bundle(
               {
@@ -169,6 +159,14 @@ jobs:
           assert model.schema_version == REPORT_MODEL_SCHEMA_VERSION
           assert reports["markdown"].read_text(encoding="utf-8").startswith("# wheel smoke")
           assert reports["pdf"].read_bytes().startswith(b"%PDF-")
+
+          from geo_monitor.db import DuckDBError, build_duckdb
+          try:
+              build_duckdb(Path("/tmp/empty-runs"), Path("/tmp/empty.duckdb"))
+          except DuckDBError as exc:
+              assert "geo-monitor[duckdb]" in str(exc)
+          else:
+              raise AssertionError("DuckDB extension unexpectedly available in core wheel")
           PY
 
   # This network-backed dependency check is isolated from deterministic tests so

@@ -10,18 +10,15 @@ from pathlib import Path
 from typing import Iterable
 
 from .filesystem import ensure_private_directory, open_private_text, secure_private_file
-from .renderers import markdown_text, render_html, render_markdown, render_pdf, table_cell
+from .renderers import render_html, render_markdown, render_pdf
 from .renderers.pdf import PdfRenderError
 from .report_builder import build_report_model
 from .report_model import ReportModel
 
 __all__ = [
     "ReportRenderError",
-    "build_job_markdown",
-    "markdown_text",
     "normalize_report_formats",
     "render_report_bundle",
-    "table_cell",
 ]
 
 
@@ -88,12 +85,6 @@ def render_report_bundle(
         return model, files
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-
-
-def build_job_markdown(summary: dict) -> str:
-    """Backward-compatible pure Markdown entry point."""
-
-    return render_markdown(build_report_model(summary))
 
 
 def _write_text_atomic(path: Path, content: str) -> None:

@@ -3,12 +3,30 @@ from pathlib import Path
 
 import pytest
 
+from geo_monitor.adapters import OpenAICompatibleClientFactory
 from geo_monitor.adapters.registry import build_sampling_profile, get_adapter
 from geo_monitor.config import Settings
 from geo_monitor.db import build_duckdb, query_duckdb
 from geo_monitor.job import JobError, build_job_bundle, run_job_bundle
 from geo_monitor.request_fingerprint import REQUEST_FINGERPRINT_VERSION, request_fingerprint
 from geo_monitor.schemas import QueryRecord
+
+
+def test_adapter_client_factory_disables_sdk_retries(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("geo_monitor.adapters.base.OpenAI", FakeOpenAI)
+
+    client = OpenAICompatibleClientFactory(
+        Settings(llm_api_key="test", llm_base_url="https://provider.example/v1")
+    ).create()
+
+    assert isinstance(client, FakeOpenAI)
+    assert captured["max_retries"] == 0
 
 
 def test_openai_responses_payload_omits_legacy_limit_and_requires_search():
