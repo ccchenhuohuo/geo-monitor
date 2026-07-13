@@ -3,13 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..config import Settings
-from ..request_fingerprint import legacy_payload_hash
+from ..request_fingerprint import legacy_payload_hash, request_fingerprint
 from ..schemas import QueryRecord
 from .base import AdapterCapabilities, BaseAdapter, ProviderRequest
 
 
-class OpenAIResponsesWebSearchAdapter(BaseAdapter):
-    name = "openai_responses_web_search"
+class OpenAICompatibleResponsesWebSearchAdapter(BaseAdapter):
+    name = "openai_compatible_responses_web_search"
     provider = "openai_compatible"
     adapter_version = "1"
     capabilities = AdapterCapabilities(api_family="responses", source_grain="url")
@@ -64,11 +64,17 @@ class OpenAIResponsesWebSearchAdapter(BaseAdapter):
             "tools": [{"type": "web_search", "limit": limit_value}],
             "max_tool_calls": payload["max_tool_calls"],
         }
+        legacy_fingerprint_basis = self._fingerprint_basis(query_record, sampling_profile, payload)
+        legacy_fingerprint_basis["adapter"] = "openai_responses_web_search"
+        legacy_fingerprint_basis.pop("provider_sdk", None)
         return ProviderRequest(
             sampling_profile=sampling_profile,
             payload=payload,
             request_fingerprint_basis=self._fingerprint_basis(query_record, sampling_profile, payload),
-            legacy_request_hashes=(legacy_payload_hash(legacy_payload),),
+            legacy_request_hashes=(
+                legacy_payload_hash(legacy_payload),
+                request_fingerprint(legacy_fingerprint_basis),
+            ),
         )
 
     def send(self, client: Any, request: ProviderRequest) -> Any:
@@ -77,11 +83,11 @@ class OpenAIResponsesWebSearchAdapter(BaseAdapter):
         return client.responses.create(**request.payload)
 
 
-class OpenAIResponsesTextAdapter(BaseAdapter):
-    name = "openai_responses_text"
+class OpenAICompatibleResponsesTextAdapter(BaseAdapter):
+    name = "openai_compatible_responses_text"
     provider = "openai_compatible"
     adapter_version = "1"
-    capabilities = AdapterCapabilities(api_family="responses", source_grain="none")
+    capabilities = AdapterCapabilities(api_family="responses", source_grain="none", supports_text_analysis=True)
     allowed_options: set[str] = set()
 
     def build_request(

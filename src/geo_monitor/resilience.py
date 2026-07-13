@@ -16,10 +16,15 @@ T = TypeVar("T")
 def is_retryable_api_error(exc: BaseException) -> bool:
     """Return whether an API failure is safe to retry."""
 
-    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError, TimeoutError)):
+    if isinstance(
+        exc,
+        (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError, TimeoutError),
+    ):
         return True
     if isinstance(exc, APIStatusError):
         return exc.status_code in RETRYABLE_STATUS_CODES
+    if getattr(exc, "retryable", False) is True:
+        return True
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
         return status_code in RETRYABLE_STATUS_CODES

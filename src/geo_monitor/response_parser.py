@@ -10,7 +10,7 @@ from .schemas import SourceRecord
 URL_KEYS = ("url", "uri", "link")
 TITLE_KEYS = ("title", "site_name", "name")
 SNIPPET_KEYS = ("snippet", "summary", "text", "content")
-SOURCE_HINT_KEYS = {"citation", "annotations", "source", "sources", "web_search", "url_citation"}
+SOURCE_HINT_KEYS = {"citation", "annotations", "source", "sources", "search_info", "search_results", "web_search", "url_citation"}
 TRACKING_QUERY_KEYS = {
     "_ga",
     "_gl",
@@ -46,6 +46,9 @@ def extract_output_text(raw: dict[str, Any]) -> str | None:
 
     texts: list[str] = []
     choices = raw.get("choices")
+    output_mapping = raw.get("output") if isinstance(raw.get("output"), Mapping) else {}
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes, bytearray)):
+        choices = output_mapping.get("choices")
     if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes, bytearray)):
         for choice in choices:
             if not isinstance(choice, Mapping):
@@ -109,10 +112,13 @@ def extract_sources(raw: dict[str, Any]) -> list[SourceRecord]:
             item_dict = dict(node)
             source_type = str(item_dict.get("type", "")).lower()
             current_hinted = hinted or "citation" in source_type or "search" in source_type
-            if _looks_like_source(item_dict, hinted=current_hinted):
+            is_source = _looks_like_source(item_dict, hinted=current_hinted)
+            if is_source:
                 candidates.append(item_dict)
             for key, child in node.items():
-                visit(child, hinted=current_hinted or key in SOURCE_HINT_KEYS)
+                # Nested media or logo URLs describe an accepted citation; they
+                # are not additional source records.
+                visit(child, hinted=(current_hinted and not is_source) or key in SOURCE_HINT_KEYS)
         elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
             for child in node:
                 visit(child, hinted=hinted)

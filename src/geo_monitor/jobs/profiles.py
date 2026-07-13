@@ -6,29 +6,34 @@ import hashlib
 import json
 from typing import Any
 
-from ..adapters.registry import get_adapter
+from ..adapters.registry import get_adapter, validate_adapter_profile_identity
 from ..config import Settings
+from ..providers import get_provider
 from ..request_fingerprint import analysis_fingerprint, base_url_fingerprint
 from .contracts import JobError
 
 
 def build_analysis_profile(adapter_name: str, model: str, settings: Settings) -> dict[str, Any]:
     adapter = get_adapter(adapter_name)
-    if adapter.name != "openai_responses_text":
-        raise ValueError("analysis_adapter 目前只支持 openai_responses_text")
+    if not adapter.capabilities.supports_text_analysis:
+        raise ValueError(f"{adapter.name} 不是文本分析 adapter")
     model_text = str(model or "").strip()
     if not model_text:
         raise ValueError("analysis_model 不能为空")
     if not adapter.capabilities.supports_model(model_text):
         patterns = ", ".join(adapter.capabilities.supported_model_patterns)
         raise ValueError(f"{adapter.name} 不支持 analysis_model {model_text!r}；支持模式：{patterns}")
+    provider = get_provider(adapter.provider)
+    if adapter.provider != "openai_compatible":
+        provider.validate_endpoint(settings)
     profile = {
         "provider": adapter.provider,
         "adapter": adapter.name,
         "adapter_version": adapter.adapter_version,
         "api_family": adapter.capabilities.api_family,
+        "provider_sdk": provider.sdk_name,
         "model": model_text,
-        "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
+        "base_url_fingerprint": base_url_fingerprint(provider.endpoint_url(settings)),
         "max_output_tokens": settings.analysis_max_output_tokens,
     }
     profile["analysis_fingerprint"] = analysis_fingerprint(profile)
@@ -56,6 +61,10 @@ def validate_runtime_profile(
     require_endpoint_match: bool,
 ) -> None:
     profile = dict(manifest.get("sampling_profile") or {})
+    try:
+        adapter = validate_adapter_profile_identity(profile, purpose="sampling")
+    except ValueError as exc:
+        raise JobError(str(exc)) from exc
     effective = profile.get("effective_runtime")
     if require_request_match and isinstance(effective, dict):
         expected_max_tool_calls = effective.get("max_tool_calls")
@@ -69,7 +78,7 @@ def validate_runtime_profile(
             raise JobError("运行时 adapter_options 与 sampling_profile.effective_runtime.adapter_options 不一致")
     if require_endpoint_match:
         expected_endpoint = str(profile.get("base_url_fingerprint") or "")
-        actual_endpoint = base_url_fingerprint(settings.llm_base_url)
+        actual_endpoint = base_url_fingerprint(get_provider(adapter.provider).endpoint_url(settings))
         if expected_endpoint and expected_endpoint != actual_endpoint:
             raise JobError("运行时 LLM_BASE_URL 与 sampling_profile.base_url_fingerprint 不一致；请使用构建 job 时的 endpoint 或重新构建 job")
 

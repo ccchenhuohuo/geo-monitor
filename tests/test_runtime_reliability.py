@@ -21,14 +21,7 @@ class FakeStatusError(Exception):
 
 
 def _patch_live_client(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
-    class Factory:
-        def __init__(self, settings: Settings):
-            self.settings = settings
-
-        def create(self) -> object:
-            return client
-
-    monkeypatch.setattr("geo_monitor.runner.OpenAICompatibleClientFactory", Factory)
+    monkeypatch.setattr("geo_monitor.runner.create_runtime_client", lambda provider, settings, *, concurrency: client)
 
 
 def _write_single_unit_job(path: Path) -> None:
@@ -96,16 +89,44 @@ def test_production_runner_uses_configured_retry_policy(tmp_path, monkeypatch):
     assert result.provider_meta["retry_count"] == 2
 
 
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_runner_closes_provider_client_when_result_persistence_fails(tmp_path, monkeypatch, concurrency):
+    settings = Settings(llm_api_key=None)
+    queries = [QueryRecord(query_id="q1", query="one"), QueryRecord(query_id="q2", query="two")]
+
+    class CloseTrackingClient:
+        close_calls = 0
+
+        def create_response(self, payload):
+            return {"status": "completed", "output_text": "ok", "usage": {}}
+
+        def close(self):
+            self.close_calls += 1
+
+    client = CloseTrackingClient()
+    _patch_live_client(monkeypatch, client)
+
+    def fail_to_persist(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("geo_monitor.runner.append_jsonl", fail_to_persist)
+
+    with pytest.raises(OSError, match="disk full"):
+        MonitorRunner(settings).run(queries, output_path=tmp_path / "attempts.jsonl", concurrency=concurrency)
+
+    assert client.close_calls == 1
+
+
 def test_resume_retries_when_newer_terminal_record_is_error_across_timezones(tmp_path):
     settings = Settings(llm_api_key=None)
     query = load_queries(FIXTURES / "queries.small.csv")[0]
     profile = build_sampling_profile(
-        adapter_name="openai_responses_web_search",
+        adapter_name="openai_compatible_responses_web_search",
         model=settings.llm_model,
         settings=settings,
         web_search_limit=settings.web_search_limit,
     )
-    request = get_adapter("openai_responses_web_search").build_request(query, profile, settings, {})
+    request = get_adapter("openai_compatible_responses_web_search").build_request(query, profile, settings, {})
     output = tmp_path / "attempts.jsonl"
     common = {
         "run_id": "old",
@@ -232,7 +253,7 @@ def test_adapter_override_freezes_effective_max_tool_calls(tmp_path):
     data = json.loads(config.read_text(encoding="utf-8"))
     data.update(
         {
-            "adapter": "doubao_responses_web_search",
+            "adapter": "doubao_ark_responses_web_search",
             "adapter_options": {"max_tool_calls": 4},
         }
     )

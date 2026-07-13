@@ -4,6 +4,8 @@ import re
 from typer.testing import CliRunner
 
 from geo_monitor.cli import app
+from geo_monitor.config import Settings
+from geo_monitor.providers import ProviderDependencyError
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -39,6 +41,45 @@ def test_validate_job_config_cli_smoke(tmp_path):
 
     assert result.exit_code == 0
     assert "任务配置有效" in result.output
+
+
+def test_doctor_reports_native_endpoint_contract_errors(monkeypatch):
+    monkeypatch.setattr(
+        "geo_monitor.cli.get_settings",
+        lambda: Settings(dashscope_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    )
+
+    result = CliRunner().invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "qwen 原生 endpoint 配置无效" in _plain(result.output)
+    assert "/compatible-mode/v1" in _plain(result.output)
+
+
+def test_doctor_reports_missing_configured_native_provider_sdk(monkeypatch):
+    monkeypatch.setattr("geo_monitor.cli.get_settings", lambda: Settings(ark_api_key="configured-key"))
+    monkeypatch.setattr(
+        "geo_monitor.cli.provider_dependency_available",
+        lambda name: False if name == "doubao" else True,
+    )
+
+    result = CliRunner().invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "geo-monitor[doubao]" in _plain(result.output)
+
+
+def test_doctor_does_not_treat_empty_dedicated_key_as_native_provider_intent(monkeypatch):
+    monkeypatch.setattr(
+        "geo_monitor.cli.get_settings",
+        lambda: Settings(llm_api_key="generic-key", ark_api_key="", dashscope_api_key=""),
+    )
+    monkeypatch.setattr("geo_monitor.cli.provider_dependency_available", lambda name: False)
+
+    result = CliRunner().invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "provider SDK 未安装" not in _plain(result.output)
 
 
 def test_build_job_cli_requires_and_documents_explicit_output(tmp_path):
@@ -306,6 +347,31 @@ def test_run_job_cli_returns_nonzero_when_live_records_errors(tmp_path, monkeypa
     assert "live 错误" in result.output
 
 
+def test_run_job_cli_formats_missing_provider_sdk_without_traceback(tmp_path, monkeypatch):
+    def fake_estimate_job_run(bundle_dir, *, dry_run=False, mock=False, resume=True, limit=None, only_query_ids=None):
+        return {
+            "planned_units": 1,
+            "completed_units": 0,
+            "sampling_requests_remaining": 1,
+            "analysis_llm_requests_estimate": 0,
+            "concurrency": 1,
+            "start_interval_seconds": 0,
+            "sampling_profile": {"provider": "doubao"},
+        }
+
+    def fail_run(*args, **kwargs):
+        raise ProviderDependencyError("请安装 geo-monitor[doubao]")
+
+    monkeypatch.setattr("geo_monitor.cli.estimate_job_run", fake_estimate_job_run)
+    monkeypatch.setattr("geo_monitor.cli.run_job_bundle", fail_run)
+
+    result = CliRunner().invoke(app, ["run-job", str(tmp_path / "bundle"), "--confirm-cost"])
+
+    assert result.exit_code != 0
+    assert "geo-monitor[doubao]" in _plain(result.output)
+    assert "Traceback" not in result.output
+
+
 def test_run_job_cli_no_resume_requires_cost_confirmation_even_when_complete(tmp_path, monkeypatch):
     def fake_estimate_job_run(bundle_dir, *, dry_run=False, mock=False, resume=True, limit=None, only_query_ids=None):
         return {
@@ -335,3 +401,23 @@ def test_analyze_job_cli_requires_cost_confirmation_for_live_extraction(tmp_path
 
     assert result.exit_code != 0
     assert "--confirm-cost" in _plain(result.output)
+
+
+def test_analyze_job_cli_reports_analysis_model_and_provider_endpoint(tmp_path, monkeypatch):
+    def fake_estimate_job_analysis(bundle_dir, *, include_mock=False, refresh_extraction_cache=False):
+        return {
+            "analysis_record_count": 3,
+            "sample_mode": "live",
+            "analysis_llm_requests_estimate": 1,
+            "model": "deepseek-v4-flash",
+            "analysis_profile": {"provider": "deepseek"},
+        }
+
+    monkeypatch.setattr("geo_monitor.cli.estimate_job_analysis", fake_estimate_job_analysis)
+
+    result = CliRunner().invoke(app, ["analyze-job", str(tmp_path / "bundle")])
+    output = _plain(result.output)
+
+    assert result.exit_code != 0
+    assert "deepseek-v4-flash" in output
+    assert "https://api.deepseek.com" in output

@@ -14,14 +14,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _patch_live_client(monkeypatch, client):
-    class Factory:
-        def __init__(self, settings):
-            self.settings = settings
-
-        def create(self):
-            return client
-
-    monkeypatch.setattr("geo_monitor.runner.OpenAICompatibleClientFactory", Factory)
+    monkeypatch.setattr("geo_monitor.runner.create_runtime_client", lambda provider, settings, *, concurrency: client)
 
 
 def test_mock_repeats_create_expected_units(tmp_path):
@@ -180,15 +173,15 @@ def test_resume_recomputes_fingerprint_before_trusting_stored_hash(tmp_path):
     queries = load_queries(FIXTURES / "queries.small.csv")
     out = tmp_path / "basis_mismatch_resume.jsonl"
     runner = MonitorRunner(settings)
-    adapter = get_adapter("openai_responses_web_search")
+    adapter = get_adapter("openai_compatible_responses_web_search")
     old_profile = build_sampling_profile(
-        adapter_name="openai_responses_web_search",
+        adapter_name="openai_compatible_responses_web_search",
         model="old-model",
         settings=settings,
         web_search_limit=settings.web_search_limit,
     )
     new_profile = build_sampling_profile(
-        adapter_name="openai_responses_web_search",
+        adapter_name="openai_compatible_responses_web_search",
         model=settings.llm_model,
         settings=settings,
         web_search_limit=settings.web_search_limit,

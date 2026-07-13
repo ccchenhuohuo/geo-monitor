@@ -9,13 +9,14 @@ from rich.console import Console
 from rich.table import Table
 
 from .analysis import analyze_job_bundle, estimate_job_analysis
-from .config import get_settings, redact_url
+from .config import Settings, get_settings, live_endpoint_status, redact_url
 from .dataset import DatasetError
 from .exporters import export_csv, read_jsonl_with_errors
 from .fanout import FanoutError, build_query_manifest
 from .job import JobError, build_job_bundle, cleanup_job_bundle, estimate_job_run, run_job_bundle, validate_job_config
+from .providers import ProviderDependencyError, get_provider, provider_dependency_available
 
-app = typer.Typer(help="基于 OpenAI-compatible API 的 GEO 品牌分析与报告引擎")
+app = typer.Typer(help="支持通用兼容与原生 provider SDK 的 GEO 品牌分析与报告引擎")
 db_app = typer.Typer(help="DuckDB 轻量分析层")
 app.add_typer(db_app, name="db")
 console = Console()
@@ -39,14 +40,28 @@ def doctor() -> None:
     for key, value in settings.redacted().items():
         table.add_row(key, str(value))
     console.print(table)
-    if not settings.has_api_key:
-        console.print("[yellow]未检测到有效 LLM_API_KEY；dry-run 和 mock-run 可正常使用，真实调用需要配置 key。[/yellow]")
-    if settings.llm_base_url_status == "placeholder":
-        console.print("[yellow]LLM_BASE_URL 仍是默认示例 endpoint；live 调用会被拒绝，请配置真实 OpenAI-compatible endpoint。[/yellow]")
+    native_key_configured = any(settings.provider_api_key_status(name) == "configured" for name in ("doubao", "qwen", "deepseek"))
+    if not settings.has_api_key and not native_key_configured:
+        console.print("[yellow]未检测到有效 API key；dry-run 和 mock-run 可正常使用，真实调用需要配置 provider key。[/yellow]")
+    if settings.llm_base_url_status == "placeholder" and settings.has_api_key:
+        console.print("[yellow]通用 provider 的 LLM_BASE_URL 仍是示例值；原生 provider 不受此项影响。[/yellow]")
     elif settings.llm_base_url_status == "invalid":
         console.print("[yellow]LLM_BASE_URL 无效；请配置包含 http(s) scheme 和 host 的 endpoint。[/yellow]")
     elif settings.llm_base_url_status == "insecure":
         console.print("[yellow]LLM_BASE_URL 使用明文 HTTP；live 调用默认会被拒绝。[/yellow]")
+    for provider_name in ("doubao", "qwen", "deepseek"):
+        try:
+            get_provider(provider_name).validate_endpoint(settings)
+        except ValueError as exc:
+            console.print(f"[yellow]{provider_name} 原生 endpoint 配置无效：{exc}[/yellow]")
+        dedicated_key = {
+            "doubao": settings.ark_api_key,
+            "qwen": settings.dashscope_api_key,
+            "deepseek": settings.deepseek_api_key,
+        }[provider_name]
+        dedicated_key_value = dedicated_key.get_secret_value().strip() if dedicated_key is not None else ""
+        if dedicated_key_value and settings.provider_api_key_status(provider_name) == "configured" and not provider_dependency_available(provider_name):
+            console.print(f"{provider_name} provider SDK 未安装；请安装 geo-monitor[{provider_name}]。", markup=False)
     if not os.getenv("GEO_MONITOR_ENV_FILE"):
         console.print("[cyan]默认不再读取当前目录 .env；如需使用 .env，请设置 GEO_MONITOR_ENV_FILE=/abs/path/.env。[/cyan]")
     if not os.getenv("GEO_MONITOR_WORKSPACE") and _looks_like_project_root(Path.cwd()):
@@ -58,6 +73,12 @@ def doctor() -> None:
 
 def _looks_like_project_root(path: Path) -> bool:
     return (path / "pyproject.toml").exists() and (path / "src" / "geo_monitor").exists()
+
+
+def _profile_endpoint(profile: dict | None, settings: Settings) -> tuple[str, str]:
+    provider_name = str((profile or {}).get("provider") or "openai_compatible")
+    endpoint = get_provider(provider_name).endpoint_url(settings)
+    return endpoint, live_endpoint_status(endpoint)
 
 
 @app.command("export-csv")
@@ -151,17 +172,18 @@ def run_job_command(
             estimate_kwargs["query_manifest_path"] = query_manifest
         estimate = estimate_job_run(bundle_dir, **estimate_kwargs)
         settings = get_settings()
+        endpoint, endpoint_status = _profile_endpoint(estimate.get("sampling_profile"), settings)
         console.print(
             "预检："
             f"计划采样单元 {estimate['planned_units']}，已完成 {estimate['completed_units']}，"
             f"本次 live 采样请求预计 {estimate['sampling_requests_remaining']}，"
             f"后续分析 LLM 请求预计 {estimate['analysis_llm_requests_estimate']}，"
             f"模型 {estimate.get('model', 'unknown')}，web_search_limit {estimate.get('web_search_limit', 'unknown')}，"
-            f"endpoint {redact_url(settings.llm_base_url)}（{settings.llm_base_url_status}），"
+            f"endpoint {redact_url(endpoint)}（{endpoint_status}），"
             f"并发 {estimate['concurrency']}，启动间隔 {estimate['start_interval_seconds']}s。"
         )
         if not dry_run and not mock and estimate["sampling_requests_remaining"] > 0 and not confirm_cost:
-            raise typer.BadParameter(f"真实 live 调用会产生 API 成本；endpoint={redact_url(settings.llm_base_url)}；请确认预算后添加 --confirm-cost")
+            raise typer.BadParameter(f"真实 live 调用会产生 API 成本；endpoint={redact_url(endpoint)}；请确认预算后添加 --confirm-cost")
         run_kwargs = {
             "resume": resume,
             "dry_run": dry_run,
@@ -175,7 +197,7 @@ def run_job_command(
         if query_manifest is not None:
             run_kwargs["query_manifest_path"] = query_manifest
         result = run_job_bundle(bundle_dir, **run_kwargs)
-    except (DatasetError, JobError, ValueError) as exc:
+    except (DatasetError, JobError, ProviderDependencyError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if not dry_run and not mock and result["errors"]:
         console.print(
@@ -202,14 +224,15 @@ def analyze_job_command(
     try:
         estimate = estimate_job_analysis(bundle_dir, include_mock=include_mock, refresh_extraction_cache=refresh_extraction_cache)
         settings = get_settings()
+        endpoint, endpoint_status = _profile_endpoint(estimate.get("analysis_profile"), settings)
         console.print(
             "分析预检："
             f"可分析样本 {estimate['analysis_record_count']}，样本模式 {estimate['sample_mode']}，"
             f"分析 LLM 请求预计 {estimate['analysis_llm_requests_estimate']}，"
-            f"模型 {estimate.get('model', 'unknown')}，endpoint {redact_url(settings.llm_base_url)}（{settings.llm_base_url_status}）。"
+            f"模型 {estimate.get('model', 'unknown')}，endpoint {redact_url(endpoint)}（{endpoint_status}）。"
         )
         if estimate["analysis_llm_requests_estimate"] > 0 and not confirm_cost:
-            raise typer.BadParameter(f"分析阶段会产生 LLM API 成本；endpoint={redact_url(settings.llm_base_url)}；请确认预算后添加 --confirm-cost")
+            raise typer.BadParameter(f"分析阶段会产生 LLM API 成本；endpoint={redact_url(endpoint)}；请确认预算后添加 --confirm-cost")
         result = analyze_job_bundle(
             bundle_dir,
             keep_work=keep_work,
@@ -219,7 +242,7 @@ def analyze_job_command(
             write_aggregates=aggregate,
             report_formats=("markdown", "pdf", "html") if html_report else ("markdown", "pdf"),
         )
-    except (DatasetError, JobError, ValueError) as exc:
+    except (DatasetError, JobError, ProviderDependencyError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(
         f"[green]分析报告已生成：{result['report_files']['markdown']}；"

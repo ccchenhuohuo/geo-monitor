@@ -9,8 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..adapters.registry import build_sampling_profile
-from ..config import get_settings
+from ..adapters.registry import build_sampling_profile, validate_adapter_profile_identity
+from ..config import Settings, get_settings
 from ..filesystem import ensure_private_directory, open_private_text, secure_private_file
 from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, analysis_fingerprint, base_url_fingerprint
 from ..schemas import utc_now_iso
@@ -35,7 +35,7 @@ from .contracts import (
 from .profiles import build_analysis_profile, build_comparability_profile, query_rows_digest
 
 
-def load_job_manifest(bundle_dir: str | Path) -> dict[str, Any]:
+def load_job_manifest(bundle_dir: str | Path, *, settings: Settings | None = None) -> dict[str, Any]:
     root = Path(bundle_dir)
     path = root / JOB_MANIFEST
     if not path.exists():
@@ -44,14 +44,20 @@ def load_job_manifest(bundle_dir: str | Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema_version") not in {GEO_JOB_V1, GEO_JOB_V2, GEO_JOB_V3}:
         raise JobError("job_manifest schema_version 必须是 geo-job-v1、geo-job-v2 或 geo-job-v3")
-    data = normalize_job_manifest_profiles(data)
+    data = normalize_job_manifest_profiles(data, settings=settings)
     validate_job_manifest(data)
     return data
 
 
-def update_job_manifest(bundle_dir: str | Path, *, status: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+def update_job_manifest(
+    bundle_dir: str | Path,
+    *,
+    status: str | None = None,
+    extra: dict[str, Any] | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
     root = Path(bundle_dir)
-    manifest = load_job_manifest(root)
+    manifest = load_job_manifest(root, settings=settings)
     if status:
         manifest["status"] = status
     manifest["updated_at"] = utc_now_iso()
@@ -102,16 +108,23 @@ def manifest_paths() -> dict[str, str]:
     }
 
 
-def normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
+def normalize_job_manifest_profiles(data: dict[str, Any], *, settings: Settings | None = None) -> dict[str, Any]:
     normalized = dict(data)
-    settings = get_settings()
+    settings = settings or get_settings()
     legacy_schema = str(normalized.get("schema_version") or "") in {GEO_JOB_V1, GEO_JOB_V2}
     model = str(normalized.get("model") or settings.llm_model)
     web_search_limit = int(normalized.get("web_search_limit") or settings.web_search_limit)
-    adapter_name = str(normalized.get("adapter") or "openai_responses_web_search")
+    has_sampling_profile = isinstance(normalized.get("sampling_profile"), dict)
+    adapter_name = str(normalized.get("adapter") or "openai_compatible_responses_web_search")
+    if legacy_schema and not has_sampling_profile and adapter_name == "openai_responses_web_search":
+        # This rename preserves the same generic OpenAI-compatible transport.
+        # Provider-specific legacy names are not migrated because that would
+        # silently select a different SDK and request contract.
+        adapter_name = "openai_compatible_responses_web_search"
+        normalized["adapter"] = adapter_name
     if not isinstance(normalized.get("adapter_options"), dict):
         normalized["adapter_options"] = {}
-    if not isinstance(normalized.get("sampling_profile"), dict):
+    if not has_sampling_profile:
         try:
             normalized["sampling_profile"] = build_sampling_profile(
                 adapter_name=adapter_name,
@@ -125,9 +138,10 @@ def normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
         except ValueError:
             normalized["sampling_profile"] = {
                 "provider": "openai_compatible",
-                "adapter": "openai_responses_web_search",
+                "adapter": "openai_compatible_responses_web_search",
                 "adapter_version": "1",
                 "api_family": "responses",
+                "provider_sdk": "openai",
                 "model": model,
                 "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
                 "request_fingerprint_version": REQUEST_FINGERPRINT_VERSION,
@@ -141,15 +155,16 @@ def normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(normalized.get("analysis_profile"), dict):
         analysis_model = str(normalized.get("analysis_model") or model)
         try:
-            normalized["analysis_profile"] = build_analysis_profile("openai_responses_text", analysis_model, settings)
+            normalized["analysis_profile"] = build_analysis_profile("openai_compatible_responses_text", analysis_model, settings)
             if legacy_schema:
                 normalized["analysis_profile"]["inferred_from_legacy"] = True
         except ValueError:
             normalized["analysis_profile"] = {
                 "provider": "openai_compatible",
-                "adapter": "openai_responses_text",
+                "adapter": "openai_compatible_responses_text",
                 "adapter_version": "1",
                 "api_family": "responses",
+                "provider_sdk": "openai",
                 "model": analysis_model,
                 "base_url_fingerprint": base_url_fingerprint(settings.llm_base_url),
                 "analysis_fingerprint": "",
@@ -177,6 +192,28 @@ def normalize_job_manifest_profiles(data: dict[str, Any]) -> dict[str, Any]:
         normalized["sampling_profile"].setdefault("inferred_from_legacy", True)
         normalized["analysis_profile"].setdefault("inferred_from_legacy", True)
         normalized["comparability_profile"].setdefault("inferred_from_legacy", True)
+        # Legacy profile inference adds migration metadata after the original
+        # profile was built. Re-freeze the derived values so the normalized
+        # in-memory manifest is self-consistent before strict validation.
+        normalized["analysis_profile"]["analysis_fingerprint"] = analysis_fingerprint(normalized["analysis_profile"])
+        normalized["comparability_profile"].update(
+            build_comparability_profile(
+                normalized.get("query_manifest") if isinstance(normalized.get("query_manifest"), dict) else {},
+                normalized.get("queries") if isinstance(normalized.get("queries"), list) else [],
+                int(normalized.get("repeats") or 1),
+                normalized["sampling_profile"],
+                normalized["analysis_profile"],
+                target_brand=str(normalized.get("target_brand") or ""),
+                target_aliases=string_list(normalized.get("target_aliases"), "target_aliases")
+                if isinstance(normalized.get("target_aliases"), list)
+                else [],
+                owned_domains=domain_list(normalized.get("owned_domains"), "owned_domains")
+                if isinstance(normalized.get("owned_domains"), list)
+                else [],
+                industry=str(normalized.get("industry") or ""),
+                market=str(normalized.get("market") or ""),
+            )
+        )
     return normalized
 
 
@@ -229,25 +266,38 @@ def validate_job_manifest(data: dict[str, Any]) -> None:
     non_negative_float(data.get("start_interval_seconds", 0.0), "start_interval_seconds")
     if not str(data.get("model") or "").strip():
         raise JobError("model 不能为空")
+    sampling_profile_required = [
+        "provider",
+        "adapter",
+        "adapter_version",
+        "api_family",
+        "provider_sdk",
+        "model",
+        "base_url_fingerprint",
+        "request_fingerprint_version",
+        "web_search_required",
+        "source_grain",
+        "web_search_limit",
+        "web_search_limit_effective",
+        "max_output_tokens",
+    ]
+    if schema_version == GEO_JOB_V3:
+        sampling_profile_required.append("effective_runtime")
+    validate_profile_object(data.get("sampling_profile"), "sampling_profile", sampling_profile_required)
     validate_profile_object(
-        data.get("sampling_profile"),
-        "sampling_profile",
+        data.get("analysis_profile"),
+        "analysis_profile",
         [
             "provider",
             "adapter",
             "adapter_version",
             "api_family",
+            "provider_sdk",
             "model",
             "base_url_fingerprint",
-            "request_fingerprint_version",
-            "web_search_required",
-            "source_grain",
+            "max_output_tokens",
+            "analysis_fingerprint",
         ],
-    )
-    validate_profile_object(
-        data.get("analysis_profile"),
-        "analysis_profile",
-        ["provider", "adapter", "adapter_version", "api_family", "model", "base_url_fingerprint", "analysis_fingerprint"],
     )
     validate_profile_object(
         data.get("comparability_profile"),
@@ -274,6 +324,39 @@ def validate_profile_object(value: Any, name: str, required: list[str]) -> None:
 
 def validate_manifest_profile_consistency(data: dict[str, Any]) -> None:
     profile = data["sampling_profile"]
+    analysis_profile = data["analysis_profile"]
+    comparability_profile = data["comparability_profile"]
+    try:
+        validate_adapter_profile_identity(profile, purpose="sampling")
+        validate_adapter_profile_identity(analysis_profile, purpose="analysis")
+    except ValueError as exc:
+        raise JobError(str(exc)) from exc
+
+    expected_analysis_fingerprint = analysis_fingerprint(analysis_profile)
+    if analysis_profile.get("analysis_fingerprint") != expected_analysis_fingerprint:
+        raise JobError("analysis_profile.analysis_fingerprint 与 profile 内容不一致")
+
+    query_manifest_info = data.get("query_manifest") if isinstance(data.get("query_manifest"), dict) else {}
+    queries = data.get("queries") if isinstance(data.get("queries"), list) else []
+    expected_comparability = build_comparability_profile(
+        query_manifest_info,
+        queries,
+        int(data.get("repeats") or 0),
+        profile,
+        analysis_profile,
+        target_brand=str(data.get("target_brand") or ""),
+        target_aliases=string_list(data.get("target_aliases"), "target_aliases") if isinstance(data.get("target_aliases"), list) else [],
+        owned_domains=domain_list(data.get("owned_domains"), "owned_domains") if isinstance(data.get("owned_domains"), list) else [],
+        industry=str(data.get("industry") or ""),
+        market=str(data.get("market") or ""),
+    )
+    comparability_keys = ["query_manifest_sha256", "repeats", "analysis_fingerprint", "source_grain"]
+    if data.get("schema_version") == GEO_JOB_V3:
+        comparability_keys.extend(["study_fingerprint", "sampling_fingerprint"])
+    for key in comparability_keys:
+        if comparability_profile.get(key) != expected_comparability[key]:
+            raise JobError(f"comparability_profile.{key} 与 job manifest/profile 内容不一致")
+
     checks = {
         "adapter": str(data.get("adapter") or ""),
         "model": str(data.get("model") or ""),
@@ -287,6 +370,12 @@ def validate_manifest_profile_consistency(data: dict[str, Any]) -> None:
         return
     if not isinstance(effective, dict):
         raise JobError("sampling_profile.effective_runtime 必须是对象")
+    required_effective = {"adapter_options", "max_output_tokens"}
+    if str(profile.get("api_family") or "") == "responses":
+        required_effective.add("max_tool_calls")
+    missing_effective = sorted(required_effective - set(effective))
+    if missing_effective:
+        raise JobError(f"sampling_profile.effective_runtime 缺少字段：{', '.join(missing_effective)}")
     if "max_tool_calls" in effective:
         effective_max_tool_calls = positive_int(effective.get("max_tool_calls"), "sampling_profile.effective_runtime.max_tool_calls")
         if "max_tool_calls" in profile and profile.get("max_tool_calls") != effective_max_tool_calls:

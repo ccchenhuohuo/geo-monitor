@@ -5,13 +5,15 @@ import math
 import re
 import time
 import unicodedata
+from contextlib import suppress
 from typing import Any, Callable
 from uuid import uuid4
 
-from .adapters import OpenAICompatibleClientFactory, build_sampling_profile, get_adapter
+from .adapters import build_sampling_profile, get_adapter
 from .config import Settings, redact_secret
+from .providers import get_provider
 from .resilience import retry_api_call
-from .response_parser import parse_response, response_to_dict
+from .response_parser import parse_response
 from .schemas import QueryRecord, utc_now_iso
 
 BrandMentionExtractor = Callable[[dict], tuple[list[dict[str, Any]], dict[str, Any] | None]]
@@ -81,22 +83,24 @@ class LLMBrandExtractor:
         settings: Settings,
         *,
         model: str | None = None,
-        adapter_name: str = "openai_responses_text",
+        adapter_name: str = "openai_compatible_responses_text",
         analysis_run_id: str | None = None,
+        analysis_fingerprint: str = "",
     ):
         self.settings = settings
         self.model = model or settings.llm_model
         self.adapter = get_adapter(adapter_name)
-        if self.adapter.name != "openai_responses_text":
-            raise ValueError("analysis extractor 目前只支持 openai_responses_text")
+        if not self.adapter.capabilities.supports_text_analysis:
+            raise ValueError(f"{self.adapter.name} 不是文本分析 adapter")
         self.analysis_profile = build_sampling_profile(
             adapter_name=self.adapter.name,
             model=self.model,
             settings=settings,
             web_search_required=False,
         )
-        self.client = OpenAICompatibleClientFactory(settings).create()
+        self.client = get_provider(self.adapter.provider).create_client(settings)
         self.analysis_run_id = analysis_run_id or f"analysis_{uuid4().hex}"
+        self.analysis_fingerprint = analysis_fingerprint
         self.audit_events: list[dict[str, Any]] = []
 
     def extract_record(self, record: dict) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -193,17 +197,18 @@ class LLMBrandExtractor:
 
         try:
             response = retry_api_call(send_request, self.settings)
+            normalized = self.adapter.normalize_response(response, request)
             audit.update(
                 {
                     "status": "success",
                     "api_attempt_count": api_attempt_count,
                     "retry_count": max(0, api_attempt_count - 1),
-                    "raw_response": response_to_dict(response),
+                    "raw_response": normalized.raw,
                     "completed_at": utc_now_iso(),
                     "latency_ms": int((time.perf_counter() - start) * 1_000),
                 }
             )
-            return response
+            return normalized.raw
         except Exception as exc:
             audit.update(
                 {
@@ -224,6 +229,12 @@ class LLMBrandExtractor:
         if hasattr(self, "audit_events"):
             self.audit_events.clear()
         return events
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
 
 
 def parse_json_payload(text: str) -> dict[str, Any]:

@@ -123,7 +123,7 @@ def validate_job_spec(
     model = str(config.get("model") or settings.llm_model).strip()
     if not model:
         raise JobError("model 不能为空")
-    adapter_name = str(config.get("adapter") or "openai_responses_web_search").strip()
+    adapter_name = str(config.get("adapter") or "openai_compatible_responses_web_search").strip()
     adapter_options = object_dict(config.get("adapter_options"), "adapter_options")
     try:
         adapter = get_adapter(adapter_name)
@@ -139,7 +139,7 @@ def validate_job_spec(
         analysis_model = str(config.get("analysis_model") or model).strip()
         if not analysis_model:
             raise JobError("analysis_model 不能为空")
-        analysis_adapter = str(config.get("analysis_adapter") or "openai_responses_text").strip()
+        analysis_adapter = str(config.get("analysis_adapter") or "openai_compatible_responses_text").strip()
         analysis_profile = build_analysis_profile(analysis_adapter, analysis_model, settings)
     except ValueError as exc:
         raise JobError(str(exc)) from exc

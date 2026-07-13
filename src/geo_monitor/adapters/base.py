@@ -4,9 +4,7 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any, Protocol
 
-from openai import OpenAI
-
-from ..config import LiveSettingsError, Settings, validate_live_settings
+from ..config import Settings
 from ..request_fingerprint import REQUEST_FINGERPRINT_VERSION, request_fingerprint
 from ..response_parser import parse_response, response_to_dict
 from ..schemas import QueryRecord, SourceRecord
@@ -38,6 +36,8 @@ class AdapterCapabilities:
     supports_sources: bool | str = "partial"
     supports_search_trace: bool | str = "partial"
     source_grain: str = "url"
+    supports_text_analysis: bool = False
+    supports_search_limit: bool = False
 
     def supports_model(self, model: str) -> bool:
         text = str(model or "").strip()
@@ -97,23 +97,6 @@ class ProviderAdapter(Protocol):
     def send(self, client: Any, request: ProviderRequest) -> Any: ...
 
     def normalize_response(self, response: Any, request: ProviderRequest) -> NormalizedProviderResponse: ...
-
-
-class OpenAICompatibleClientFactory:
-    def __init__(self, settings: Settings):
-        try:
-            validate_live_settings(settings)
-        except LiveSettingsError as exc:
-            raise ValueError(str(exc)) from exc
-        self.settings = settings
-
-    def create(self) -> OpenAI:
-        return OpenAI(
-            base_url=self.settings.llm_base_url,
-            api_key=self.settings.llm_api_key.get_secret_value(),  # type: ignore[union-attr]
-            timeout=self.settings.request_timeout_seconds,
-            max_retries=0,
-        )
 
 
 class BaseAdapter:
@@ -202,6 +185,7 @@ class BaseAdapter:
             "adapter": sampling_profile.get("adapter"),
             "adapter_version": sampling_profile.get("adapter_version"),
             "api_family": sampling_profile.get("api_family"),
+            "provider_sdk": sampling_profile.get("provider_sdk"),
             "base_url_fingerprint": sampling_profile.get("base_url_fingerprint"),
             "model": sampling_profile.get("model"),
             "query_id": query_record.query_id,
@@ -247,6 +231,8 @@ def infer_web_search_status(raw: dict[str, Any], payload: dict[str, Any], sampli
 
 
 def request_has_web_search(payload: dict[str, Any]) -> bool:
+    if payload.get("enable_search") is True:
+        return True
     for tool in payload.get("tools", []) or []:
         if isinstance(tool, dict) and str(tool.get("type") or "") == "web_search":
             return True
@@ -268,6 +254,9 @@ def _has_web_search_call(raw: Any) -> bool:
     if isinstance(raw, dict):
         if raw.get("type") == "web_search_call":
             return True
+        search_info = raw.get("search_info")
+        if isinstance(search_info, dict) and isinstance(search_info.get("search_results"), list):
+            return True
         return any(_has_web_search_call(value) for value in raw.values())
     if isinstance(raw, list):
         return any(_has_web_search_call(item) for item in raw)
@@ -278,6 +267,7 @@ def _web_search_tool_count(raw: dict[str, Any]) -> int:
     total = 0
     for path in [
         ("x_tools", "web_search", "count"),
+        ("usage", "tool_usage", "web_search"),
         ("usage", "plugins", "web_search", "count"),
         ("plugins", "web_search", "count"),
     ]:

@@ -1,7 +1,7 @@
 [project]
 name = "geo-monitor"
-version = "0.2.0"
-description = "Audit-first GEO analysis and report engine for OpenAI-compatible APIs"
+version = "0.3.0"
+description = "Audit-first GEO analysis and report engine with native provider SDK boundaries"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -37,6 +37,16 @@ Issues = "https://github.com/ccchenhuohuo/geo-monitor/issues"
 [project.optional-dependencies]
 duckdb = [
   "duckdb>=1.0.0,<2",
+]
+doubao = [
+  "volcengine-python-sdk[ark]>=5.0.40,<6",
+]
+qwen = [
+  "dashscope>=1.26.3,<2",
+]
+providers-all = [
+  "dashscope>=1.26.3,<2",
+  "volcengine-python-sdk[ark]>=5.0.40,<6",
 ]
 dev = [
   "build>=1.2.0,<2",

@@ -61,6 +61,7 @@ def extraction_cache_entry(
     record: dict[str, Any],
     schema_version: str,
     extractor_model: str,
+    analysis_fingerprint: str = "",
     rows: list[dict[str, Any]],
     error: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -70,11 +71,13 @@ def extraction_cache_entry(
             response_text_hash_value=response_hash,
             schema_version=schema_version,
             extractor_model=extractor_model,
+            analysis_fingerprint=analysis_fingerprint,
         ),
         "cache_type": "brand_extraction",
         "response_text_hash": response_hash,
         "extraction_schema_version": schema_version,
         "extractor_model": extractor_model,
+        "analysis_fingerprint": analysis_fingerprint,
         "prompt_version": EXTRACTION_PROMPT_VERSION,
         "query_id": record.get("query_id"),
         "repeat_index": record.get("repeat_index") or 1,
@@ -88,12 +91,14 @@ def extraction_cache_key(
     response_text_hash_value: str,
     schema_version: str,
     extractor_model: str,
+    analysis_fingerprint: str = "",
 ) -> str:
     return _hash_parts(
         "brand_extraction",
         response_text_hash_value,
         schema_version,
         extractor_model,
+        analysis_fingerprint,
         EXTRACTION_PROMPT_VERSION,
     )
 
@@ -106,6 +111,7 @@ def canonicalization_cache_entry(
     *,
     raw_names: list[str],
     canonicalizer_model: str,
+    analysis_fingerprint: str = "",
     canonical_map: dict[str, str],
 ) -> dict[str, Any]:
     names_hash = raw_names_hash(raw_names)
@@ -113,20 +119,23 @@ def canonicalization_cache_entry(
         "cache_key": canonicalization_cache_key(
             sorted_raw_names_hash=names_hash,
             canonicalizer_model=canonicalizer_model,
+            analysis_fingerprint=analysis_fingerprint,
         ),
         "cache_type": "brand_canonicalization",
         "sorted_raw_names_hash": names_hash,
         "canonicalizer_model": canonicalizer_model,
+        "analysis_fingerprint": analysis_fingerprint,
         "prompt_version": CANONICALIZATION_PROMPT_VERSION,
         "canonical_map": canonical_map,
     }
 
 
-def canonicalization_cache_key(*, sorted_raw_names_hash: str, canonicalizer_model: str) -> str:
+def canonicalization_cache_key(*, sorted_raw_names_hash: str, canonicalizer_model: str, analysis_fingerprint: str = "") -> str:
     return _hash_parts(
         "brand_canonicalization",
         sorted_raw_names_hash,
         canonicalizer_model,
+        analysis_fingerprint,
         CANONICALIZATION_PROMPT_VERSION,
     )
 

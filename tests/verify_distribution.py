@@ -67,6 +67,26 @@ JOB_MODULES = {
     "runtime.py",
 }
 
+ADAPTER_MODULES = {
+    "__init__.py",
+    "base.py",
+    "deepseek_chat.py",
+    "doubao_responses.py",
+    "openai_responses.py",
+    "qwen_dashscope.py",
+    "registry.py",
+}
+
+PROVIDER_MODULES = {
+    "__init__.py",
+    "base.py",
+    "deepseek.py",
+    "doubao.py",
+    "openai_compatible.py",
+    "qwen.py",
+    "registry.py",
+}
+
 REPORT_MODULES = {
     "geo_monitor/report_builder.py",
     "geo_monitor/report_model.py",
@@ -132,6 +152,13 @@ def _assert_wheel(wheel: Path) -> None:
         if missing_report_modules:
             raise AssertionError(f"wheel missing report modules: {', '.join(missing_report_modules)}")
 
+        for package, expected in (("adapters", ADAPTER_MODULES), ("providers", PROVIDER_MODULES)):
+            prefix = f"geo_monitor/{package}/"
+            packaged = {name.removeprefix(prefix) for name in names if name.startswith(prefix) and name.endswith(".py")}
+            missing = sorted(expected - packaged)
+            if missing:
+                raise AssertionError(f"wheel missing {package} modules: {', '.join(missing)}")
+
         analysis_prefix = "geo_monitor/analysis/"
         analysis_modules = {
             name.removeprefix(analysis_prefix) for name in names if name.startswith(analysis_prefix) and "/" not in name.removeprefix(analysis_prefix)
@@ -165,12 +192,15 @@ def _assert_wheel(wheel: Path) -> None:
         metadata = archive.read(metadata_name).decode("utf-8")
         if "Requires-Python: >=3.11" not in metadata:
             raise AssertionError("wheel metadata does not declare Python >=3.11")
-        if "Version: 0.2.0" not in metadata:
-            raise AssertionError("wheel metadata does not declare version 0.2.0")
+        if "Version: 0.3.0" not in metadata:
+            raise AssertionError("wheel metadata does not declare version 0.3.0")
         if not re.search(r"^Requires-Dist: openai.*>=1\.66\.0", metadata, re.MULTILINE):
             raise AssertionError("wheel metadata does not retain the OpenAI SDK >=1.66.0 floor")
         if not re.search(r"^Requires-Dist: reportlab.*>=4\.2\.0", metadata, re.MULTILINE | re.IGNORECASE):
             raise AssertionError("wheel metadata does not declare ReportLab as a core dependency")
+        for extra in ("doubao", "qwen", "providers-all"):
+            if f"Provides-Extra: {extra}" not in metadata:
+                raise AssertionError(f"wheel metadata is missing the {extra} provider extra")
         duckdb_requirements = [line for line in metadata.splitlines() if line.lower().startswith("requires-dist: duckdb")]
         if len(duckdb_requirements) != 1 or 'extra == "duckdb"' not in duckdb_requirements[0]:
             raise AssertionError("DuckDB must be declared exactly once and only under the duckdb extra")
@@ -196,6 +226,12 @@ def _assert_sdist(sdist: Path) -> None:
     missing_report_modules = sorted({f"src/{name}" for name in REPORT_MODULES} - names)
     if missing_report_modules:
         raise AssertionError(f"sdist missing report modules: {', '.join(missing_report_modules)}")
+    for package, expected in (("adapters", ADAPTER_MODULES), ("providers", PROVIDER_MODULES)):
+        prefix = f"src/geo_monitor/{package}/"
+        packaged = {name.removeprefix(prefix) for name in names if name.startswith(prefix) and name.endswith(".py")}
+        missing = sorted(expected - packaged)
+        if missing:
+            raise AssertionError(f"sdist missing {package} modules: {', '.join(missing)}")
     analysis_prefix = "src/geo_monitor/analysis/"
     analysis_modules = {
         name.removeprefix(analysis_prefix) for name in names if name.startswith(analysis_prefix) and "/" not in name.removeprefix(analysis_prefix)

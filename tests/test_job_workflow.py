@@ -917,6 +917,55 @@ def test_analyze_job_bundle_live_extraction_requires_confirm_cost(tmp_path):
     assert manifest["status"] == "analysis_failed"
 
 
+def test_analyze_job_closes_owned_extractor_when_pipeline_fails(tmp_path, monkeypatch):
+    config_path = tmp_path / "job_config.json"
+    bundle = tmp_path / "bundle"
+    _write_job_config(config_path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["queries"] = ["best local providers"]
+    data["repeats"] = 1
+    config_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    build_job_bundle(config_path, bundle, settings=_live_test_settings())
+    row = {
+        "run_id": "r",
+        "query_id": "q001",
+        "repeat_index": 1,
+        "repeat_total": 1,
+        "model": "test-model",
+        "input_query": "best local providers",
+        "status": "success",
+        "response_text": "TestStudio",
+        "sources": [],
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:01+00:00",
+    }
+    _make_contract_valid(row)
+    (bundle / "raw" / "attempts.jsonl").write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+    close_calls = []
+
+    class FakeLLMBrandExtractor:
+        def __init__(self, settings, *, model=None, analysis_run_id=None, adapter_name=None, analysis_fingerprint=""):
+            self.model = model or "test-model"
+
+        def extract_record(self, record):
+            return [], None
+
+        def close(self):
+            close_calls.append(True)
+
+    def fail_extraction(**kwargs):
+        raise RuntimeError("pipeline failed")
+
+    monkeypatch.setattr("geo_monitor.analysis.orchestrator.LLMBrandExtractor", FakeLLMBrandExtractor)
+    monkeypatch.setattr("geo_monitor.analysis.orchestrator.extract_mentions", fail_extraction)
+
+    with pytest.raises(RuntimeError, match="pipeline failed"):
+        analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
+
+    assert close_calls == [True]
+    assert load_job_manifest(bundle)["status"] == "analysis_failed"
+
+
 def test_analyze_job_reuses_live_extraction_and_canonicalization_cache(tmp_path, monkeypatch):
     config_path = tmp_path / "job_config.json"
     bundle = tmp_path / "bundle"
@@ -944,8 +993,9 @@ def test_analyze_job_reuses_live_extraction_and_canonicalization_cache(tmp_path,
     calls = {"extract": 0, "canonicalize": 0}
 
     class FakeLLMBrandExtractor:
-        def __init__(self, settings, *, model=None, analysis_run_id=None):
+        def __init__(self, settings, *, model=None, analysis_run_id=None, adapter_name=None, analysis_fingerprint=""):
             self.model = model or "test-model"
+            self.analysis_fingerprint = analysis_fingerprint
 
         def extract_record(self, record):
             calls["extract"] += 1
@@ -1010,8 +1060,9 @@ def test_analyze_job_cache_invalidates_when_response_text_changes(tmp_path, monk
     raw_path.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
 
     class FakeLLMBrandExtractor:
-        def __init__(self, settings, *, model=None, analysis_run_id=None):
+        def __init__(self, settings, *, model=None, analysis_run_id=None, adapter_name=None, analysis_fingerprint=""):
             self.model = model or "test-model"
+            self.analysis_fingerprint = analysis_fingerprint
 
         def extract_record(self, record):
             return [
@@ -1086,8 +1137,9 @@ def test_extraction_cache_rebinds_record_context_for_identical_response_text(tmp
     calls = {"extract": 0, "canonicalize": 0}
 
     class FakeLLMBrandExtractor:
-        def __init__(self, settings, *, model=None, analysis_run_id=None):
+        def __init__(self, settings, *, model=None, analysis_run_id=None, adapter_name=None, analysis_fingerprint=""):
             self.model = model or "test-model"
+            self.analysis_fingerprint = analysis_fingerprint
 
         def extract_record(self, record):
             calls["extract"] += 1

@@ -87,6 +87,35 @@ def test_parse_response_does_not_leak_source_context_to_siblings():
     assert [source.url for source in sources] == ["https://docs.example.com/a"]
 
 
+def test_parse_response_does_not_promote_ark_citation_media_to_sources():
+    payload = {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "answer",
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "title": "Article",
+                                "url": "https://news.example.com/article",
+                                "cover_image": {"url": "https://cdn.example.com/cover.jpg", "width": 640, "height": 360},
+                                "logo_url": "https://cdn.example.com/logo.png",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    _, sources, _, _ = parse_response(payload)
+
+    assert [source.url for source in sources] == ["https://news.example.com/article"]
+
+
 def test_extract_output_text_returns_none_when_empty():
     payload = {"status": "completed", "output_text": "   ", "output": []}
     assert extract_output_text(payload) is None
