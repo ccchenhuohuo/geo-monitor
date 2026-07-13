@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .config import LiveSettingsError, Settings, get_settings, validate_live_settings, workspace_root
+from .config import LiveSettingsError, Settings, get_settings, validate_live_settings, validate_provider_settings, workspace_root
 from .dataset import load_queries, select_queries
 from .filesystem import UnsafeOutputPathError, ensure_private_directory, prepare_private_output, secure_private_file
 from .jobs.cleanup import cleanup_job_bundle, cleanup_job_work_dir_unlocked
@@ -239,7 +239,7 @@ def run_job_bundle(
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     root = Path(bundle_dir)
-    manifest = load_job_manifest(root)
+    manifest = load_job_manifest(root, settings=settings)
     raw_path = root / RAW_ATTEMPTS
     started_at = utc_now_iso()
     run_execution_id = make_run_id()
@@ -265,7 +265,11 @@ def run_job_bundle(
             raise JobError("真实 live 调用会产生 API 成本；请确认预算后显式传入 confirm_cost=True")
         if live_remaining:
             try:
-                validate_live_settings(settings)
+                provider_name = str(manifest["sampling_profile"].get("provider") or "openai_compatible")
+                if provider_name == "openai_compatible":
+                    validate_live_settings(settings)
+                else:
+                    validate_provider_settings(settings, provider_name)
             except LiveSettingsError as exc:
                 raise JobError(str(exc)) from exc
         runner = MonitorRunner(settings)
@@ -278,6 +282,7 @@ def run_job_bundle(
                 diagnostic_generation += 1
                 manifest = update_job_manifest(
                     root,
+                    settings=settings,
                     extra={
                         "diagnostic_generation": diagnostic_generation,
                         "last_diagnostic_execution_id": run_execution_id,
@@ -291,6 +296,7 @@ def run_job_bundle(
                 manifest = update_job_manifest(
                     root,
                     status="running",
+                    settings=settings,
                     extra={
                         "run_generation": run_generation,
                         "last_run_execution_id": run_execution_id,
@@ -323,6 +329,7 @@ def run_job_bundle(
                 if diagnostic_mode and previous_status.startswith("analyzed"):
                     update_job_manifest(
                         root,
+                        settings=settings,
                         extra={
                             "last_diagnostic_execution_id": run_execution_id,
                             "last_diagnostic_interrupted_at": utc_now_iso(),
@@ -332,6 +339,7 @@ def run_job_bundle(
                     update_job_manifest(
                         root,
                         status="interrupted",
+                        settings=settings,
                         extra={
                             "run_generation": run_generation,
                             "last_run_execution_id": run_execution_id,
@@ -343,6 +351,7 @@ def run_job_bundle(
                 if diagnostic_mode and previous_status.startswith("analyzed"):
                     update_job_manifest(
                         root,
+                        settings=settings,
                         extra={
                             "last_diagnostic_execution_id": run_execution_id,
                             "last_diagnostic_failed_at": utc_now_iso(),
@@ -352,6 +361,7 @@ def run_job_bundle(
                     update_job_manifest(
                         root,
                         status="run_failed",
+                        settings=settings,
                         extra={"last_run_execution_id": run_execution_id, "last_run_failed_at": utc_now_iso()},
                     )
                 raise
@@ -395,6 +405,7 @@ def run_job_bundle(
         if diagnostic_mode and previous_status.startswith("analyzed"):
             update_job_manifest(
                 root,
+                settings=settings,
                 extra={
                     "diagnostic_generation": diagnostic_generation,
                     "last_diagnostic_execution_id": run_execution_id,
@@ -405,6 +416,7 @@ def run_job_bundle(
             update_job_manifest(
                 root,
                 status=status,
+                settings=settings,
                 extra={
                     "diagnostic_generation": diagnostic_generation,
                     "last_diagnostic_execution_id": run_execution_id,
@@ -415,6 +427,7 @@ def run_job_bundle(
             update_job_manifest(
                 root,
                 status=status,
+                settings=settings,
                 extra={
                     "run_generation": run_generation,
                     "last_run_completed_at": completed_at,
@@ -449,7 +462,7 @@ def estimate_job_run(
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     root = Path(bundle_dir)
-    manifest = load_job_manifest(root)
+    manifest = load_job_manifest(root, settings=settings)
     if query_manifest_path is not None:
         ensure_manifest_file_fingerprint(Path(query_manifest_path), manifest)
         all_queries = load_queries(query_manifest_path)

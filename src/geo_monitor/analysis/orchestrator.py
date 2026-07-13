@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from ..brand_extraction import (
     LLMBrandExtractor,
     fallback_canonicalize,
 )
-from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings
+from ..config import LiveSettingsError, Settings, get_settings, redact_secret, validate_live_settings, validate_provider_settings
 from ..exporters import (
     latest_live_terminal_records,
     latest_records,
@@ -26,6 +27,7 @@ from ..jobs.layout import logs_dir, raw_attempts_path, result_dir, work_dir
 from ..jobs.locking import job_bundle_lock
 from ..jobs.manifest import load_job_manifest, query_set_hash, update_job_manifest
 from ..jobs.query_manifest import load_job_queries
+from ..providers import get_provider
 from ..query_meta import query_metadata_json, tags_text
 from ..reporting import render_report_bundle
 from ..request_fingerprint import base_url_fingerprint
@@ -58,6 +60,20 @@ from .quality import apply_extraction_quality, evaluate_data_quality, records_fo
 from .source_metrics import compute_source_stats
 
 
+class _CloseOnce:
+    """Own a closeable resource without assuming that close itself is idempotent."""
+
+    def __init__(self, resource: Any):
+        self._resource = resource
+
+    def close(self) -> None:
+        resource, self._resource = self._resource, None
+        close = getattr(resource, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
+
+
 def _analysis_terminal_records(raw_records: list[dict[str, Any]], *, include_mock: bool) -> list[dict[str, Any]]:
     live_terminal = latest_live_terminal_records(raw_records)
     if live_terminal:
@@ -68,9 +84,15 @@ def _analysis_terminal_records(raw_records: list[dict[str, Any]], *, include_moc
     return live_terminal
 
 
-def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False, refresh_extraction_cache: bool = False) -> dict[str, Any]:
+def estimate_job_analysis(
+    bundle_dir: str | Path,
+    *,
+    include_mock: bool = False,
+    refresh_extraction_cache: bool = False,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
     root = Path(bundle_dir)
-    manifest = load_job_manifest(root)
+    manifest = load_job_manifest(root, settings=settings)
     raw_path = raw_attempts_path(root)
     if not raw_path.exists():
         raise ValueError(f"缺少 raw attempts：{raw_path}")
@@ -89,6 +111,7 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
             logs_dir(root),
             live_records,
             extractor_model=str(analysis_profile.get("model") or manifest.get("model") or ""),
+            analysis_fingerprint=str(analysis_profile.get("analysis_fingerprint") or ""),
             refresh_extraction_cache=refresh_extraction_cache,
         )
         extraction_requests = cache_estimate["extraction_cache_misses"]
@@ -114,7 +137,7 @@ def estimate_job_analysis(bundle_dir: str | Path, *, include_mock: bool = False,
         "analysis_llm_requests_estimate": extraction_requests + canonicalization_requests,
         "extraction_requests_estimate": extraction_requests,
         "canonicalization_requests_estimate": canonicalization_requests,
-        "model": manifest.get("model"),
+        "model": analysis_profile.get("model"),
         "analysis_profile": analysis_profile,
         "cache": cache_estimate,
     }
@@ -133,25 +156,28 @@ def analyze_job_bundle(
     write_aggregates: bool = False,
     report_formats: tuple[str, ...] = ("markdown", "pdf"),
 ) -> dict[str, Any]:
+    settings = settings or get_settings()
     root = Path(bundle_dir)
     with job_bundle_lock(root):
-        update_job_manifest(root, status="analyzing")
+        update_job_manifest(root, status="analyzing", settings=settings)
         try:
-            return _analyze_job_bundle_unlocked(
-                root,
-                settings=settings,
-                extractor=extractor,
-                canonicalizer=canonicalizer,
-                keep_work=keep_work,
-                include_mock=include_mock,
-                confirm_cost=confirm_cost,
-                refresh_extraction_cache=refresh_extraction_cache,
-                write_aggregates=write_aggregates,
-                report_formats=report_formats,
-            )
+            with ExitStack() as owned_resources:
+                return _analyze_job_bundle_unlocked(
+                    root,
+                    settings=settings,
+                    extractor=extractor,
+                    canonicalizer=canonicalizer,
+                    keep_work=keep_work,
+                    include_mock=include_mock,
+                    confirm_cost=confirm_cost,
+                    refresh_extraction_cache=refresh_extraction_cache,
+                    write_aggregates=write_aggregates,
+                    report_formats=report_formats,
+                    owned_resources=owned_resources,
+                )
         except Exception:
             try:
-                update_job_manifest(root, status="analysis_failed")
+                update_job_manifest(root, status="analysis_failed", settings=settings)
             except Exception:
                 pass
             raise
@@ -169,10 +195,10 @@ def _analyze_job_bundle_unlocked(
     refresh_extraction_cache: bool = False,
     write_aggregates: bool = False,
     report_formats: tuple[str, ...] = ("markdown", "pdf"),
+    owned_resources: ExitStack,
 ) -> dict[str, Any]:
-    settings = settings or get_settings()
     root = Path(bundle_dir)
-    manifest = load_job_manifest(root)
+    manifest = load_job_manifest(root, settings=settings)
     raw_path = raw_attempts_path(root)
     if not raw_path.exists():
         raise ValueError(f"缺少 raw attempts：{raw_path}")
@@ -216,23 +242,36 @@ def _analyze_job_bundle_unlocked(
     preflight_cache_stats = empty_cache_stats()
     cache_stats = empty_cache_stats()
     extractor_obj = None
+    owned_extractor = None
     if sample_mode == "live" and success_records_for_stats and extractor is None:
         preflight_cache_stats = estimate_live_cache_requests(
             logs,
             success_records_for_stats,
             extractor_model=analysis_model,
+            analysis_fingerprint=str(analysis_profile.get("analysis_fingerprint") or ""),
             refresh_extraction_cache=refresh_extraction_cache,
         )
         if preflight_cache_stats["analysis_llm_requests_remaining"] > 0 and not confirm_cost:
             raise ValueError("分析阶段会产生 LLM API 成本；请确认预算后显式传入 confirm_cost=True")
         if preflight_cache_stats["analysis_llm_requests_remaining"] > 0:
             try:
-                validate_live_settings(settings)
+                provider_name = str(analysis_profile.get("provider") or "openai_compatible")
+                if provider_name == "openai_compatible":
+                    validate_live_settings(settings)
+                else:
+                    validate_provider_settings(settings, provider_name)
             except LiveSettingsError as exc:
                 raise ValueError(str(exc)) from exc
             _validate_analysis_runtime_profile(analysis_profile, settings)
     if extractor is None and success_records_for_stats and sample_mode == "live" and preflight_cache_stats["analysis_llm_requests_remaining"] > 0:
-        extractor_obj = LLMBrandExtractor(settings, model=analysis_model)
+        extractor_obj = LLMBrandExtractor(
+            settings,
+            model=analysis_model,
+            adapter_name=str(analysis_profile.get("adapter") or "openai_compatible_responses_text"),
+            analysis_fingerprint=str(analysis_profile.get("analysis_fingerprint") or ""),
+        )
+        owned_extractor = _CloseOnce(extractor_obj)
+        owned_resources.callback(owned_extractor.close)
         extractor_obj.analysis_run_id = f"{manifest.get('job_id', 'job')}_analysis_g{manifest.get('run_generation', 0)}_{time.time_ns()}"
     active_extractor = extractor or (extractor_obj.extract_record if extractor_obj else None)
     if active_extractor is None and sample_mode == "mock":
@@ -252,6 +291,7 @@ def _analyze_job_bundle_unlocked(
             logs=logs,
             cache_enabled=sample_mode == "live" and extractor is None,
             extractor_model=analysis_model,
+            analysis_fingerprint=str(analysis_profile.get("analysis_fingerprint") or ""),
             refresh_extraction_cache=refresh_extraction_cache,
         )
         merge_cache_stats(cache_stats, extraction_cache_stats)
@@ -273,6 +313,7 @@ def _analyze_job_bundle_unlocked(
         canonical_map, canonical_error, canonical_cache_stats = canonicalize_from_cache_only(
             raw_names=raw_names,
             canonicalizer_model=analysis_model,
+            analysis_fingerprint=str(analysis_profile.get("analysis_fingerprint") or ""),
             logs=logs,
             refresh_extraction_cache=refresh_extraction_cache,
         )
@@ -286,6 +327,8 @@ def _analyze_job_bundle_unlocked(
         error_rows.append(canonical_error_row)
     analysis_audit_path = logs / "analysis_attempts.jsonl"
     analysis_audit_events = extractor_obj.drain_audit_events() if extractor_obj and hasattr(extractor_obj, "drain_audit_events") else []
+    if owned_extractor:
+        owned_extractor.close()
     if analysis_audit_events:
         if analysis_audit_path.is_symlink():
             raise ValueError(f"analysis audit log 不能是 symlink：{analysis_audit_path}")
@@ -412,7 +455,7 @@ def _analyze_job_bundle_unlocked(
         if legacy_path.is_file() or legacy_path.is_symlink():
             legacy_path.unlink()
     analysis_status = "analyzed_partial" if data_quality.get("conclusion_strength") == "observational" or error_rows else "analyzed"
-    update_job_manifest(root, status=analysis_status)
+    update_job_manifest(root, status=analysis_status, settings=settings)
     if write_aggregates:
         try:
             committed_aggregates = update_cross_job_aggregates(root, summary)
@@ -503,7 +546,7 @@ def _analysis_profile(manifest: dict[str, Any]) -> dict[str, Any]:
         return profile
     return {
         "provider": "openai_compatible",
-        "adapter": "openai_responses_text",
+        "adapter": "openai_compatible_responses_text",
         "adapter_version": "1",
         "api_family": "responses",
         "model": str(manifest.get("model") or ""),
@@ -514,7 +557,8 @@ def _analysis_profile(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def _validate_analysis_runtime_profile(profile: dict[str, Any], settings: Settings) -> None:
     expected_endpoint = str(profile.get("base_url_fingerprint") or "")
-    actual_endpoint = base_url_fingerprint(settings.llm_base_url)
+    provider_name = str(profile.get("provider") or "openai_compatible")
+    actual_endpoint = base_url_fingerprint(get_provider(provider_name).endpoint_url(settings))
     if expected_endpoint and expected_endpoint != actual_endpoint:
         raise ValueError("分析运行时 LLM_BASE_URL 与 frozen analysis_profile 不一致；请使用构建 job 时的 endpoint")
     expected_tokens = profile.get("max_output_tokens")

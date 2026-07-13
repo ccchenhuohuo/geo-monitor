@@ -117,7 +117,7 @@ def run_geo_monitor(
             fanout_result = {"output": str(manifest_path), "action": "reused"}
     if bundle_dir is not None:
         existing_bundle = Path(bundle_dir)
-        existing_manifest = load_job_manifest(existing_bundle)
+        existing_manifest = load_job_manifest(existing_bundle, settings=settings)
         bundle = {**existing_manifest, "bundle_dir": str(existing_bundle)}
     else:
         assert config_path is not None
@@ -153,7 +153,7 @@ def run_geo_monitor(
             report_formats=report_formats,
             settings=settings,
         )
-    final_manifest = load_job_manifest(bundle["bundle_dir"])
+    final_manifest = load_job_manifest(bundle["bundle_dir"], settings=settings)
     status = str(final_manifest.get("status") or ("dry_run" if dry_run else "ran"))
     bundle_dir = Path(bundle["bundle_dir"])
     artifact_paths = {"bundle_dir": str(bundle_dir)}

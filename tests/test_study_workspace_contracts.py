@@ -74,8 +74,8 @@ def test_external_manifest_job_manifest_does_not_store_query_rows(tmp_path):
     manifest = json.loads((bundle / "job_manifest.json").read_text(encoding="utf-8"))
 
     assert manifest["schema_version"] == "geo-job-v3"
-    assert manifest["sampling_profile"]["adapter"] == "openai_responses_web_search"
-    assert manifest["analysis_profile"]["adapter"] == "openai_responses_text"
+    assert manifest["sampling_profile"]["adapter"] == "openai_compatible_responses_web_search"
+    assert manifest["analysis_profile"]["adapter"] == "openai_compatible_responses_text"
     assert manifest["comparability_profile"]["query_manifest_sha256"]
     assert "queries" not in manifest
     assert manifest["target_brand"] == "ExampleBrand"

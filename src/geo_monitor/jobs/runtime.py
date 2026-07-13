@@ -48,7 +48,7 @@ def resume_matched_unit_count(raw_path: Path, queries: list[QueryRecord], manife
     count = 0
     repeats = int(manifest["repeats"])
     sampling_profile = dict(manifest.get("sampling_profile") or {})
-    adapter = get_adapter(str(sampling_profile.get("adapter") or "openai_responses_web_search"))
+    adapter = get_adapter(str(sampling_profile.get("adapter") or "openai_compatible_responses_web_search"))
     adapter_options = dict(manifest.get("adapter_options") or {})
     for query in queries:
         provider_request = adapter.build_request(query, sampling_profile, settings, adapter_options)

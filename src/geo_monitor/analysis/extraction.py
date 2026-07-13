@@ -69,6 +69,7 @@ def estimate_live_cache_requests(
     records: list[dict[str, Any]],
     *,
     extractor_model: str,
+    analysis_fingerprint: str = "",
     refresh_extraction_cache: bool,
 ) -> dict[str, Any]:
     stats = empty_cache_stats()
@@ -84,6 +85,7 @@ def estimate_live_cache_requests(
                     response_text_hash_value=response_text_hash(record),
                     schema_version=EXTRACTION_SCHEMA_VERSION,
                     extractor_model=extractor_model,
+                    analysis_fingerprint=analysis_fingerprint,
                 )
             )
         if entry is not None:
@@ -110,6 +112,7 @@ def estimate_live_cache_requests(
                     canonicalization_cache_key(
                         sorted_raw_names_hash=raw_names_hash(raw_names),
                         canonicalizer_model=extractor_model,
+                        analysis_fingerprint=analysis_fingerprint,
                     )
                 )
             if entry is not None and is_valid_canonical_map(entry.get("canonical_map"), raw_names):
@@ -131,6 +134,7 @@ def extract_mentions(
     logs: Path,
     cache_enabled: bool,
     extractor_model: str,
+    analysis_fingerprint: str = "",
     refresh_extraction_cache: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     rows_out: list[dict[str, Any]] = []
@@ -148,6 +152,7 @@ def extract_mentions(
                     response_text_hash_value=response_text_hash(record),
                     schema_version=EXTRACTION_SCHEMA_VERSION,
                     extractor_model=extractor_model,
+                    analysis_fingerprint=analysis_fingerprint,
                 )
             )
         if entry is not None:
@@ -182,6 +187,7 @@ def extract_mentions(
                     record=record,
                     schema_version=EXTRACTION_SCHEMA_VERSION,
                     extractor_model=extractor_model,
+                    analysis_fingerprint=analysis_fingerprint,
                     rows=rows,
                     error=error,
                 )
@@ -226,6 +232,7 @@ def canonicalize_with_cache(
     key = canonicalization_cache_key(
         sorted_raw_names_hash=raw_names_hash(raw_names),
         canonicalizer_model=extractor_obj.model,
+        analysis_fingerprint=extractor_obj.analysis_fingerprint,
     )
     if not refresh_extraction_cache:
         entry = cache.get(key)
@@ -242,6 +249,7 @@ def canonicalize_with_cache(
             canonicalization_cache_entry(
                 raw_names=raw_names,
                 canonicalizer_model=extractor_obj.model,
+                analysis_fingerprint=extractor_obj.analysis_fingerprint,
                 canonical_map=canonical_map,
             )
         )
@@ -255,6 +263,7 @@ def canonicalize_from_cache_only(
     *,
     raw_names: list[str],
     canonicalizer_model: str,
+    analysis_fingerprint: str = "",
     logs: Path,
     refresh_extraction_cache: bool,
 ) -> tuple[dict[str, str], dict[str, Any] | None, dict[str, Any]]:
@@ -266,6 +275,7 @@ def canonicalize_from_cache_only(
             canonicalization_cache_key(
                 sorted_raw_names_hash=raw_names_hash(raw_names),
                 canonicalizer_model=canonicalizer_model,
+                analysis_fingerprint=analysis_fingerprint,
             )
         )
     if entry is not None and is_valid_canonical_map(entry.get("canonical_map"), raw_names):

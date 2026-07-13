@@ -20,7 +20,7 @@ def test_public_api_facade_exports_stable_symbols():
     assert set(geo_monitor.__all__) == {"__version__", *PUBLIC_API}
     assert set(geo_monitor.api.__all__) == PUBLIC_API
     assert "_analyze_job_bundle_unlocked" not in geo_monitor.__all__
-    assert geo_monitor.__version__ == "0.2.0"
+    assert geo_monitor.__version__ == "0.3.0"
 
 
 def test_geo_monitor_result_serializes_to_json():
@@ -42,7 +42,7 @@ def test_run_geo_monitor_can_resume_existing_bundle_without_rebuilding(tmp_path,
     bundle = tmp_path / "runs" / "job-existing"
     bundle.mkdir(parents=True)
     manifest = {"job_id": "job-existing", "status": "analyzed"}
-    monkeypatch.setattr(geo_monitor.api, "load_job_manifest", lambda path: manifest)
+    monkeypatch.setattr(geo_monitor.api, "load_job_manifest", lambda path, **kwargs: manifest)
     monkeypatch.setattr(
         geo_monitor.api,
         "build_job_bundle",
@@ -65,7 +65,7 @@ def test_run_geo_monitor_reports_only_artifacts_that_were_rendered(tmp_path, mon
     bundle = tmp_path / "runs" / "job-existing"
     bundle.mkdir(parents=True)
     manifest = {"job_id": "job-existing", "status": "analyzed"}
-    monkeypatch.setattr(geo_monitor.api, "load_job_manifest", lambda path: manifest)
+    monkeypatch.setattr(geo_monitor.api, "load_job_manifest", lambda path, **kwargs: manifest)
     monkeypatch.setattr(geo_monitor.api, "run_job_bundle", lambda path, **kwargs: {"run_id": "job-existing", "errors": 0})
 
     def fake_analyze(path, **kwargs):
@@ -87,7 +87,11 @@ def test_run_geo_monitor_reports_only_artifacts_that_were_rendered(tmp_path, mon
 def test_run_geo_monitor_rejects_blank_query_filter_before_execution(tmp_path, monkeypatch):
     bundle = tmp_path / "runs" / "job-existing"
     bundle.mkdir(parents=True)
-    monkeypatch.setattr(geo_monitor.api, "load_job_manifest", lambda path: {"job_id": "job-existing", "status": "built"})
+    monkeypatch.setattr(
+        geo_monitor.api,
+        "load_job_manifest",
+        lambda path, **kwargs: {"job_id": "job-existing", "status": "built"},
+    )
     monkeypatch.setattr(
         geo_monitor.api,
         "run_job_bundle",

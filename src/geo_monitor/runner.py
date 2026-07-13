@@ -3,15 +3,17 @@ from __future__ import annotations
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
 from uuid import uuid4
 
-from .adapters import OpenAICompatibleClientFactory, ProviderRequest, build_sampling_profile, get_adapter
+from .adapters import ProviderRequest, build_sampling_profile, get_adapter, validate_adapter_profile_identity
 from .config import Settings, redact_secret
 from .exporters import append_jsonl, successful_result_hashes
 from .mock_client import build_mock_response
+from .providers import create_runtime_client, get_provider
 from .query_meta import query_record_meta
 from .request_fingerprint import base_url_fingerprint, legacy_payload_hash
 from .resilience import retry_api_call
@@ -135,7 +137,7 @@ class MonitorRunner:
         actual_diagnostic_generation = (diagnostic_generation or 1) if execution_mode != "live" else None
         actual_job_id = job_id
         actual_sampling_profile = sampling_profile or build_sampling_profile(
-            adapter_name="openai_responses_web_search",
+            adapter_name="openai_compatible_responses_web_search",
             model=model or self.settings.llm_model,
             settings=self.settings,
             web_search_limit=web_search_limit,
@@ -148,7 +150,8 @@ class MonitorRunner:
             settings=self.settings,
             adapter_options=actual_adapter_options,
         )
-        adapter = get_adapter(str(actual_sampling_profile.get("adapter") or "openai_responses_web_search"))
+        adapter = get_adapter(str(actual_sampling_profile.get("adapter") or "openai_compatible_responses_web_search"))
+        validate_adapter_profile_identity(actual_sampling_profile, purpose="sampling")
         adapter.validate_options(actual_adapter_options)
         done_hashes = successful_result_hashes(output_path) if resume else {}
         work_items = []
@@ -189,92 +192,93 @@ class MonitorRunner:
         if dry_run or mock:
             client = None
         else:
-            _validate_runtime_endpoint(actual_sampling_profile, self.settings)
-            client = OpenAICompatibleClientFactory(self.settings).create()
-        if actual_concurrency == 1 or len(work_items) <= 1:
-            for item in work_items:
-                result = self._run_one(
-                    item["query"],
-                    job_id=actual_job_id,
-                    run_id=actual_run_id,
-                    run_execution_id=actual_run_execution_id,
-                    run_generation=run_generation,
-                    diagnostic_generation=actual_diagnostic_generation,
-                    execution_mode=execution_mode,
-                    client=client,
-                    dry_run=dry_run,
-                    mock=mock,
-                    model=model,
-                    web_search_limit=web_search_limit,
-                    adapter=adapter,
-                    repeat_index=item["repeat_index"],
-                    repeat_total=repeats,
-                    provider_request=item["provider_request"],
-                    request_hash=item["request_hash"],
-                )
-                append_jsonl(output_path, result)
-                results.append(result)
-                if breaker.observe(result):
-                    break
-                if sleep_seconds:
-                    time.sleep(sleep_seconds)
-            self.last_run_info = breaker.summary(planned=len(work_items), executed=len(results))
-            return results
-
-        with ThreadPoolExecutor(max_workers=actual_concurrency) as executor:
-            pending = set()
-            next_index = 0
-
-            def fill_available_slots() -> None:
-                nonlocal next_index
-                while next_index < len(work_items) and len(pending) < actual_concurrency and not breaker.tripped:
-                    if next_index > 0 and start_interval_seconds:
-                        time.sleep(start_interval_seconds)
-                    item = work_items[next_index]
-                    next_index += 1
-                    pending.add(
-                        executor.submit(
-                            self._run_one_with_sleep,
-                            item["query"],
-                            job_id=actual_job_id,
-                            run_id=actual_run_id,
-                            run_execution_id=actual_run_execution_id,
-                            run_generation=run_generation,
-                            diagnostic_generation=actual_diagnostic_generation,
-                            execution_mode=execution_mode,
-                            client=client,
-                            dry_run=dry_run,
-                            mock=mock,
-                            model=model,
-                            web_search_limit=web_search_limit,
-                            adapter=adapter,
-                            repeat_index=item["repeat_index"],
-                            repeat_total=repeats,
-                            provider_request=item["provider_request"],
-                            request_hash=item["request_hash"],
-                            sleep_seconds=sleep_seconds,
-                        )
+            _validate_runtime_endpoint(actual_sampling_profile, self.settings, adapter=adapter)
+            client = create_runtime_client(get_provider(adapter.provider), self.settings, concurrency=actual_concurrency)
+        with _managed_provider_client(client):
+            if actual_concurrency == 1 or len(work_items) <= 1:
+                for item in work_items:
+                    result = self._run_one(
+                        item["query"],
+                        job_id=actual_job_id,
+                        run_id=actual_run_id,
+                        run_execution_id=actual_run_execution_id,
+                        run_generation=run_generation,
+                        diagnostic_generation=actual_diagnostic_generation,
+                        execution_mode=execution_mode,
+                        client=client,
+                        dry_run=dry_run,
+                        mock=mock,
+                        model=model,
+                        web_search_limit=web_search_limit,
+                        adapter=adapter,
+                        repeat_index=item["repeat_index"],
+                        repeat_total=repeats,
+                        provider_request=item["provider_request"],
+                        request_hash=item["request_hash"],
                     )
-
-            fill_available_slots()
-            while pending:
-                # Observe a bounded batch before submitting more work. Refilling
-                # after a single completion can overshoot a tripped breaker by an
-                # unbounded stream of fast failures while slower calls remain.
-                done, pending = wait(pending)
-                for future in done:
-                    result = future.result()
                     append_jsonl(output_path, result)
                     results.append(result)
-                    breaker.observe(result)
-                if breaker.tripped:
-                    for future in list(pending):
-                        if future.cancel():
-                            pending.remove(future)
-                else:
-                    fill_available_slots()
-        self.last_run_info = breaker.summary(planned=len(work_items), executed=len(results))
-        return results
+                    if breaker.observe(result):
+                        break
+                    if sleep_seconds:
+                        time.sleep(sleep_seconds)
+                self.last_run_info = breaker.summary(planned=len(work_items), executed=len(results))
+                return results
+
+            with ThreadPoolExecutor(max_workers=actual_concurrency) as executor:
+                pending = set()
+                next_index = 0
+
+                def fill_available_slots() -> None:
+                    nonlocal next_index
+                    while next_index < len(work_items) and len(pending) < actual_concurrency and not breaker.tripped:
+                        if next_index > 0 and start_interval_seconds:
+                            time.sleep(start_interval_seconds)
+                        item = work_items[next_index]
+                        next_index += 1
+                        pending.add(
+                            executor.submit(
+                                self._run_one_with_sleep,
+                                item["query"],
+                                job_id=actual_job_id,
+                                run_id=actual_run_id,
+                                run_execution_id=actual_run_execution_id,
+                                run_generation=run_generation,
+                                diagnostic_generation=actual_diagnostic_generation,
+                                execution_mode=execution_mode,
+                                client=client,
+                                dry_run=dry_run,
+                                mock=mock,
+                                model=model,
+                                web_search_limit=web_search_limit,
+                                adapter=adapter,
+                                repeat_index=item["repeat_index"],
+                                repeat_total=repeats,
+                                provider_request=item["provider_request"],
+                                request_hash=item["request_hash"],
+                                sleep_seconds=sleep_seconds,
+                            )
+                        )
+
+                fill_available_slots()
+                while pending:
+                    # Observe a bounded batch before submitting more work. Refilling
+                    # after a single completion can overshoot a tripped breaker by an
+                    # unbounded stream of fast failures while slower calls remain.
+                    done, pending = wait(pending)
+                    for future in done:
+                        result = future.result()
+                        append_jsonl(output_path, result)
+                        results.append(result)
+                        breaker.observe(result)
+                    if breaker.tripped:
+                        for future in list(pending):
+                            if future.cancel():
+                                pending.remove(future)
+                    else:
+                        fill_available_slots()
+            self.last_run_info = breaker.summary(planned=len(work_items), executed=len(results))
+            return results
 
     def _run_one_with_sleep(
         self,
@@ -346,7 +350,7 @@ class MonitorRunner:
         start = time.perf_counter()
         if provider_request is None:
             sampling_profile = build_sampling_profile(
-                adapter_name="openai_responses_web_search",
+                adapter_name="openai_compatible_responses_web_search",
                 model=model or self.settings.llm_model,
                 settings=self.settings,
                 web_search_limit=web_search_limit,
@@ -421,7 +425,7 @@ class MonitorRunner:
                 )
 
             if client is None:
-                raise RuntimeError("真实调用需要 OpenAI-compatible client")
+                raise RuntimeError(f"真实调用需要 {adapter.provider} provider client")
 
             def send_request() -> Any:
                 nonlocal api_attempt_count
@@ -505,9 +509,9 @@ def _validate_sampling_profile_inputs(
             raise ValueError("sampling_profile.effective_runtime.adapter_options 与运行参数不一致")
 
 
-def _validate_runtime_endpoint(sampling_profile: dict[str, Any], settings: Settings) -> None:
+def _validate_runtime_endpoint(sampling_profile: dict[str, Any], settings: Settings, *, adapter: Any) -> None:
     expected = str(sampling_profile.get("base_url_fingerprint") or "")
-    actual = base_url_fingerprint(settings.llm_base_url)
+    actual = base_url_fingerprint(get_provider(adapter.provider).endpoint_url(settings))
     if expected and expected != actual:
         raise ValueError("运行时 LLM_BASE_URL 与 sampling_profile.base_url_fingerprint 不一致；请重新构建 job")
 
@@ -529,3 +533,18 @@ def _iter_units(
 
 def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def _close_provider_client(client: Any | None) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
+
+
+@contextmanager
+def _managed_provider_client(client: Any | None) -> Iterable[None]:
+    try:
+        yield
+    finally:
+        _close_provider_client(client)

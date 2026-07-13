@@ -100,9 +100,33 @@ jobs:
           tests/test_resilience.py
           tests/test_config.py
 
+  native-provider-sdks:
+    name: Native provider SDK contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install native provider SDKs
+        run: >-
+          python -m pip install -e ".[providers-all]"
+          "pytest>=8.0.0,<10"
+
+      - name: Verify SDK imports and provider contracts
+        run: |
+          python -c "from dashscope import Generation; from volcenginesdkarkruntime import Ark; assert Generation and Ark"
+          python -m pytest tests/test_provider_backends.py tests/test_adapter_profiles.py
+
   package:
     name: Build and wheel smoke
-    needs: [lint, test, minimum-openai]
+    needs: [lint, test, minimum-openai, native-provider-sdks]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -186,17 +210,18 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Install audit tool
-        run: python -m pip install "pip-audit>=2.7.0,<3"
+      - name: Install project providers and audit tool
+        run: python -m pip install ".[providers-all]" "pip-audit>=2.7.0,<3"
 
       - name: Audit resolved project dependencies
-        run: >-
-          python -m pip_audit
-          --strict
-          --progress-spinner off
-          --format json
-          --output pip-audit.json
-          .
+        run: |
+          python -m pip freeze --exclude geo-monitor > audit-requirements.txt
+          python -m pip_audit \
+            --strict \
+            --progress-spinner off \
+            --format json \
+            --output pip-audit.json \
+            --requirement audit-requirements.txt
 
       - name: Upload audit evidence
         if: always()

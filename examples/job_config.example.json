@@ -7,6 +7,9 @@
   "queries": ["example fallback query"],
   "repeats": 1,
   "model": "test-model",
+  "adapter": "openai_compatible_responses_web_search",
+  "analysis_model": "test-model",
+  "analysis_adapter": "openai_compatible_responses_text",
   "web_search_limit": 5,
   "concurrency": 1,
   "start_interval_seconds": 0

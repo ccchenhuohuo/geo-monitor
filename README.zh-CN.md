@@ -12,7 +12,7 @@ LLM 回答、分析品牌可见性，并生成可复现的本地报告。
 
 ## 项目状态
 
-0.2 已收敛为稳定、报告优先的本地引擎：
+0.3 已收敛为稳定、报告优先，并具有明确 Provider SDK 边界的本地引擎：
 
 - persona fan-out 生成 frozen query manifest；
 - job-based sampling 和 raw JSONL audit log；
@@ -40,8 +40,12 @@ LLM 回答、分析品牌可见性，并生成可复现的本地报告。
   `sov_summary.csv` 与同义指标别名已删除；重新分析旧 bundle 时也会清理这些文件。
 - Wheel 不再携带重复的源码文档和 examples；这些文件保留在仓库和 sdist。
 
-已有 `geo-job-v1`/`v2` bundle 与 legacy request hash 仍可读取，避免丢弃历史付费样本
-或破坏断点续跑。
+未冻结已删除 adapter identity 的 `geo-job-v1`/`v2` manifest 会在读取时规范化，legacy
+request hash 仍用于安全的断点续跑匹配。若旧 bundle 已明确冻结被删除的 adapter 名称，
+则会 fail closed；应新建 0.3 job，不能静默改变其 SDK transport。
+
+0.3 的 adapter 名称会同时明确 provider 与 API family。原生 Ark、DashScope、
+DeepSeek provider 边界及 adapter 名称迁移见 [Provider 与 adapter 契约](docs/providers.md)。
 
 ## 这个项目解决什么问题
 
@@ -55,7 +59,7 @@ GEO Brand Monitor 用来回答：
 - 样本是否完整、质量是否足够可信？
 
 它不声称衡量市场份额、事实正确性、原生 App 排名或 SEO 效果。它衡量的是在受控 query
-manifest 下，OpenAI-compatible Responses API 返回的回答样本。
+manifest 下，各受支持 provider API 返回的回答样本。
 
 ## 核心功能
 
@@ -88,7 +92,7 @@ flowchart LR
     Job --> Work["work/query_manifest.csv<br/>temporary runner input"]
 
     Work --> Runner["sampling runner"]
-    Runner --> API["OpenAI-compatible<br/>Responses API"]
+    Runner --> API["Provider SDK<br/>API"]
     API --> Raw["raw/attempts.jsonl<br/>query + query_meta snapshot"]
 
     Raw --> Analyze["analyze-job"]
@@ -215,10 +219,9 @@ geo-monitor analyze-job "$JOB_DIR" --include-mock
 
 ## 真实 API 配置
 
-通过环境变量配置 OpenAI-compatible Responses API；如果要使用 env file，需要显式指定。
-CLI 默认不信任当前工作目录中的 `.env`。`openai_responses_web_search` 是通用 adapter；
-`doubao_responses_web_search` 使用相同的兼容 SDK transport，但保留豆包 / 火山 Ark 的
-web-search 请求和 trace 语义。
+通过环境变量配置 provider API；如果要使用 env file，需要显式指定。CLI 默认不信任当前
+工作目录中的 `.env`。通用 adapter 使用 `openai`；豆包使用官方 Ark runtime SDK；千问使用
+官方 DashScope SDK。
 
 ```bash
 cp .env.example /tmp/geo-monitor.env
@@ -229,6 +232,9 @@ export GEO_MONITOR_ENV_FILE=/tmp/geo-monitor.env
 LLM_API_KEY=
 LLM_BASE_URL=https://api.example.com/v1
 LLM_MODEL=provider-model
+ARK_API_KEY=
+DASHSCOPE_API_KEY=
+DEEPSEEK_API_KEY=
 WEB_SEARCH_LIMIT=5
 MAX_TOOL_CALLS=2
 MAX_OUTPUT_TOKENS=2000
@@ -241,16 +247,18 @@ MAX_CONSECUTIVE_ERRORS=5
 MAX_ERROR_RATE=0.5
 ```
 
-`https://api.example.com/v1` 是示例 endpoint。只有 `LLM_BASE_URL` 指向真实 `http(s)`
-endpoint 且 `LLM_API_KEY` 已配置时，live 命令才会继续执行。可以用 `geo-monitor doctor`
-查看当前 endpoint、API key 状态和 env file 来源。
+`https://api.example.com/v1` 是通用 provider 的示例 endpoint。原生 provider 始终默认使用
+各自官方 endpoint，与 key 来自专用变量还是 `LLM_API_KEY` 回退无关；只有
+`ARK_BASE_URL`、`DASHSCOPE_BASE_URL`、`DEEPSEEK_BASE_URL` 会覆盖它。可用
+`geo-monitor doctor` 查看脱敏后的有效配置。
+原生 endpoint 覆盖仍必须位于对应 provider 的官方 HTTPS 域名；代理或自定义 host 应使用
+通用兼容 adapter。
 
 豆包 Ark 使用下面的 key/model 占位符，不要把密钥写入 job config：
 
 ```bash
-export LLM_API_KEY='<ARK_API_KEY>'
-export LLM_BASE_URL='https://ark.cn-beijing.volces.com/api/v3'
-export LLM_MODEL='<ARK_MODEL_OR_ENDPOINT_ID>'
+pip install -e '.[doubao]'
+export ARK_API_KEY='<ARK_API_KEY>'
 ```
 
 在 job config 中选择一个 adapter：
@@ -258,16 +266,15 @@ export LLM_MODEL='<ARK_MODEL_OR_ENDPOINT_ID>'
 ```json
 {
   "model": "<ARK_MODEL_OR_ENDPOINT_ID>",
-  "adapter": "doubao_responses_web_search",
+  "adapter": "doubao_ark_responses_web_search",
   "analysis_model": "<ARK_MODEL_OR_ENDPOINT_ID>",
-  "analysis_adapter": "openai_responses_text"
+  "analysis_adapter": "doubao_ark_responses_text"
 }
 ```
 
-`WEB_SEARCH_LIMIT` 仍是经过校验的历史兼容字段，但当前没有 adapter 能把它实现成跨 provider
-等价的结果数量限制；manifest 会记录 `web_search_limit_effective=false`。
-`MAX_TOOL_CALLS`、输出 token 上限和 adapter options 才是实际请求条件，并会冻结到审计与
-comparability fingerprint 中。
+Ark 原生 adapter 会发送 `WEB_SEARCH_LIMIT` 并记录
+`web_search_limit_effective=true`；其他 adapter 没有等价结果数参数，因此记录为 `false`。
+所有有效请求条件都会冻结到审计与 comparability fingerprint 中。
 
 真实采样和真实 LLM extraction 可能产生 provider 成本。会产生 live 成本的命令需要显式
 传入 `--confirm-cost`。
@@ -526,7 +533,7 @@ print(result.artifact_paths)
 
 高层 API 需要显式传入 `study_dir` 或 `runs_dir`。显式路径优先。`query_manifest_path`
 不会从 study directory 自动猜测。`geo_monitor.api` 是 canonical implementation module；
-`geo_monitor` 会为了方便进行 re-export。0.1 的兼容 import 路径不再属于 0.2 API。
+`geo_monitor` 会为了方便进行 re-export。0.1 的兼容 import 路径不再属于当前 API。
 
 Schema、example 和 reference document 只保留在顶层 `data/`、`examples/`、`docs/`
 作为单一事实源并进入 sdist；wheel 只包含运行时代码。
@@ -593,7 +600,8 @@ tests/
 - **Lightweight**：本地文件、CLI 命令、小模块。
 - **Audit-first**：raw attempts 和 quality logs 是事实源。
 - **Engine-first**：不做用户系统、SaaS dashboard 或调度系统。
-- **Provider-neutral**：面向 OpenAI-compatible Responses APIs。
+- **Provider 模块化**：通用兼容接口、Ark 与 DashScope 原生边界，以及按 DeepSeek 官方建议
+  transport 实现的独立 DeepSeek provider。
 - **Study workspace boundary**：长期业务数据不进入项目仓库。
 - **Human-like prompt boundary**：模型只收到 query text。
 - **Open discovery**：竞品从回答中发现，而不是来自内置 alias list。

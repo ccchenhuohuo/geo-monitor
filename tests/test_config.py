@@ -1,4 +1,4 @@
-from geo_monitor.config import Settings, get_settings, redact_secret, redact_url, validate_live_settings
+from geo_monitor.config import Settings, get_settings, redact_secret, redact_url, validate_live_settings, validate_provider_settings
 
 
 def test_default_settings_do_not_load_cwd_dotenv(tmp_path, monkeypatch):
@@ -56,6 +56,19 @@ def test_redact_secret_keeps_key_out_of_errors():
     settings = Settings(llm_api_key="super-secret", llm_base_url="https://provider.example/v1")
 
     assert redact_secret("token=super-secret", settings) == "token=***"
+
+
+def test_provider_specific_settings_default_to_official_endpoints_and_redact_keys():
+    settings = Settings(ark_api_key="ark-secret", dashscope_api_key="qwen-secret", deepseek_api_key="deepseek-secret")
+
+    validate_provider_settings(settings, "doubao")
+    validate_provider_settings(settings, "qwen")
+    validate_provider_settings(settings, "deepseek")
+    assert settings.provider_base_url("doubao").endswith("/api/v3")
+    assert settings.provider_base_url("qwen").endswith("/api/v1")
+    assert settings.provider_base_url("deepseek") == "https://api.deepseek.com"
+    redacted = redact_secret("ark-secret qwen-secret deepseek-secret", settings)
+    assert redacted == "*** *** ***"
 
 
 def test_endpoint_validation_and_display_redaction_are_total_and_secret_safe():

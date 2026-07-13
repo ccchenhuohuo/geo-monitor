@@ -14,7 +14,8 @@ study workspace.
 
 ## Project Status
 
-Version 0.2 is a stabilized local engine with a report-first core:
+Version 0.3 is a stabilized local engine with a report-first core and explicit
+provider SDK boundaries:
 
 - persona fan-out to frozen query manifests;
 - job-based sampling with raw JSONL audit logs;
@@ -46,8 +47,14 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
 - Wheel installs no longer contain duplicated source docs/examples. Use the
   repository or sdist for those files.
 
-Existing `geo-job-v1`/`v2` bundles and legacy request hashes remain readable so
-historical paid samples and resumable runs are not discarded.
+Legacy `geo-job-v1`/`v2` manifests that do not freeze a removed adapter identity
+are normalized on read, and legacy request hashes remain available for safe
+resume matching. Bundles that explicitly freeze a removed adapter name fail
+closed; create a new 0.3 job instead of silently changing their SDK transport.
+
+Version 0.3 adapter names are intentionally explicit about both provider and
+API family. See [Provider and adapter contract](docs/providers.md) for native
+Ark/DashScope providers, the DeepSeek boundary, and the adapter-name migration.
 
 ## What It Does
 
@@ -61,8 +68,8 @@ GEO Brand Monitor helps answer:
 - Are the samples complete and trustworthy enough to interpret?
 
 It does **not** claim market share, factual correctness, native app ranking, or
-SEO performance. It measures responses produced by an OpenAI-compatible
-Responses API under a controlled query manifest.
+SEO performance. It measures responses produced by supported provider APIs
+under a controlled query manifest.
 
 ## Core Features
 
@@ -99,7 +106,7 @@ flowchart LR
     Job --> Work["work/query_manifest.csv<br/>temporary runner input"]
 
     Work --> Runner["sampling runner"]
-    Runner --> API["OpenAI-compatible<br/>Responses API"]
+    Runner --> API["Provider SDK<br/>API"]
     API --> Raw["raw/attempts.jsonl<br/>query + query_meta snapshot"]
 
     Raw --> Analyze["analyze-job"]
@@ -240,12 +247,10 @@ default workflow.
 
 ## Live API Configuration
 
-Configure an OpenAI-compatible Responses API through environment variables, or
-opt in to an explicit env file. The CLI does not trust a `.env` file from the
-current working directory by default. `openai_responses_web_search` is the
-generic adapter; `doubao_responses_web_search` preserves Doubao/Volcengine Ark
-web-search request and trace semantics while using the same compatible SDK
-transport.
+Configure provider APIs through environment variables, or opt in to an explicit
+env file. The CLI does not trust a `.env` file from the current working
+directory by default. The generic adapter uses `openai`; Doubao uses the
+official Ark runtime SDK, and Qwen uses the official DashScope SDK.
 
 ```bash
 cp .env.example /tmp/geo-monitor.env
@@ -256,6 +261,9 @@ export GEO_MONITOR_ENV_FILE=/tmp/geo-monitor.env
 LLM_API_KEY=
 LLM_BASE_URL=https://api.example.com/v1
 LLM_MODEL=provider-model
+ARK_API_KEY=
+DASHSCOPE_API_KEY=
+DEEPSEEK_API_KEY=
 WEB_SEARCH_LIMIT=5
 MAX_TOOL_CALLS=2
 MAX_OUTPUT_TOKENS=2000
@@ -268,18 +276,20 @@ MAX_CONSECUTIVE_ERRORS=5
 MAX_ERROR_RATE=0.5
 ```
 
-`https://api.example.com/v1` is a placeholder endpoint. Live commands refuse to
-run until `LLM_BASE_URL` points at a real `http(s)` endpoint and `LLM_API_KEY` is
-configured. Run `geo-monitor doctor` to inspect the active endpoint, API key
-status, and env-file source.
+`https://api.example.com/v1` is a placeholder for the generic provider.
+Native providers use their official endpoints by default, independently of
+which key variable supplies the credential. They may be overridden only with
+`ARK_BASE_URL`, `DASHSCOPE_BASE_URL`, or `DEEPSEEK_BASE_URL`.
+Native overrides must remain on the provider's official HTTPS domains; use the
+generic adapter for a proxy or custom host.
+Run `geo-monitor doctor` to inspect the redacted configuration.
 
 For Doubao Ark, use key/model placeholders rather than putting secrets in a
 config file:
 
 ```bash
-export LLM_API_KEY='<ARK_API_KEY>'
-export LLM_BASE_URL='https://ark.cn-beijing.volces.com/api/v3'
-export LLM_MODEL='<ARK_MODEL_OR_ENDPOINT_ID>'
+pip install -e '.[doubao]'
+export ARK_API_KEY='<ARK_API_KEY>'
 ```
 
 Select one adapter in the job config:
@@ -287,17 +297,16 @@ Select one adapter in the job config:
 ```json
 {
   "model": "<ARK_MODEL_OR_ENDPOINT_ID>",
-  "adapter": "doubao_responses_web_search",
+  "adapter": "doubao_ark_responses_web_search",
   "analysis_model": "<ARK_MODEL_OR_ENDPOINT_ID>",
-  "analysis_adapter": "openai_responses_text"
+  "analysis_adapter": "doubao_ark_responses_text"
 }
 ```
 
-`WEB_SEARCH_LIMIT` remains a validated compatibility field but no current
-adapter can enforce it as a provider-independent result count; manifests record
-`web_search_limit_effective=false`. `MAX_TOOL_CALLS`, output-token limits, and
-adapter options are effective request conditions and are frozen into audit and
-comparability fingerprints.
+The native Ark adapter sends `WEB_SEARCH_LIMIT` and records
+`web_search_limit_effective=true`; other adapters record `false` because they
+have no equivalent result-count control. Effective request conditions are
+frozen into audit and comparability fingerprints.
 
 Live sampling and live LLM extraction may incur provider costs. Commands that
 can produce live costs require explicit `--confirm-cost`.
@@ -576,7 +585,7 @@ High-level API calls require either `study_dir` or `runs_dir`. Explicit paths
 win. `query_manifest_path` is never guessed from a study directory.
 `geo_monitor.api` is the canonical implementation module; `geo_monitor`
 re-exports it for convenience. Removed 0.1 compatibility import paths are not
-part of the 0.2 API.
+part of the current API.
 
 Schemas, examples, and reference documents have one source of truth in the
 top-level `data/`, `examples/`, and `docs/` directories and are included in the
@@ -644,7 +653,9 @@ tests/
 - **Lightweight**: local files, CLI commands, and small modules.
 - **Audit-first**: raw attempts and quality logs remain the source of truth.
 - **Engine-first**: no user system, hosted SaaS dashboard, or scheduler.
-- **Provider-neutral**: targets OpenAI-compatible Responses APIs.
+- **Provider-modular**: generic compatibility plus native Ark and DashScope
+  boundaries, with a distinct DeepSeek provider using its officially prescribed
+  transport.
 - **Study workspace boundary**: long-running business data stays outside the
   project repository.
 - **Human-like prompt boundary**: the model receives only the query text.

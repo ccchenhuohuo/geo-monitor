@@ -113,12 +113,11 @@
     "adapter": {
       "type": "string",
       "enum": [
-        "openai_responses_web_search",
-        "doubao_responses_web_search",
-        "qwen_responses_web_search_basic",
-        "qwen_chat_enable_search"
+        "openai_compatible_responses_web_search",
+        "doubao_ark_responses_web_search",
+        "qwen_dashscope_generation_web_search"
       ],
-      "default": "openai_responses_web_search"
+      "default": "openai_compatible_responses_web_search"
     },
     "adapter_options": {
       "type": "object",
@@ -131,8 +130,13 @@
     },
     "analysis_adapter": {
       "type": "string",
-      "enum": ["openai_responses_text"],
-      "default": "openai_responses_text"
+      "enum": [
+        "openai_compatible_responses_text",
+        "doubao_ark_responses_text",
+        "qwen_dashscope_generation_text",
+        "deepseek_chat_completions_text"
+      ],
+      "default": "openai_compatible_responses_text"
     },
     "web_search_limit": {
       "description": "Integer from 1 to 20. Runtime also accepts integer-like strings for CLI/agent convenience.",
