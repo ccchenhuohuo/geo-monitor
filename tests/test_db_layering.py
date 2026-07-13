@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from geo_monitor.analysis.pipeline import analyze_job_bundle
+from geo_monitor.analysis import analyze_job_bundle
 from geo_monitor.config import Settings
 from geo_monitor.db import INTELLIGENCE_CSV_STEMS, build_duckdb, connect_readonly, query_duckdb, validate_schema
 from geo_monitor.job import build_job_bundle, run_job_bundle

@@ -27,7 +27,7 @@ class LiveSettingsError(ValueError):
 
 
 def workspace_root() -> Path:
-    value = os.getenv("GEO_MONITOR_WORKSPACE") or os.getenv("GEO_MONITOR_HOME")
+    value = os.getenv("GEO_MONITOR_WORKSPACE")
     if value:
         return Path(value).expanduser().resolve()
     return Path.cwd().resolve()

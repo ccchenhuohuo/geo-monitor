@@ -5,21 +5,20 @@ from pathlib import Path
 
 import pytest
 
+from geo_monitor import run_geo_monitor
+from geo_monitor.analysis import analyze_job_bundle
 from geo_monitor.config import Settings
 from geo_monitor.db import build_duckdb, query_duckdb
 from geo_monitor.exporters import read_jsonl
 from geo_monitor.fanout import build_query_manifest
 from geo_monitor.job import (
     JobError,
-    _resolve_query_manifest_source,
-    _trusted_query_manifest_roots,
     build_job_bundle,
     estimate_job_run,
     run_job_bundle,
     validate_job_config,
 )
-from geo_monitor.job_analysis import analyze_job_bundle
-from geo_monitor.tool import run_geo_monitor
+from geo_monitor.jobs.query_manifest import resolve_query_manifest_source, trusted_query_manifest_roots
 
 
 def _write_config(path):
@@ -202,9 +201,9 @@ def test_job_manifest_source_uri_outside_study_is_rejected_without_replacement(t
 def test_query_manifest_trusted_roots_do_not_degrade_to_filesystem_root():
     bundle = Path("/tmp/geo-monitor-shallow-bundle")
 
-    assert Path("/") not in _trusted_query_manifest_roots(bundle)
+    assert Path("/") not in trusted_query_manifest_roots(bundle)
     with pytest.raises(JobError, match="--query-manifest"):
-        _resolve_query_manifest_source({"query_manifest": {"source_type": "external_file", "source_uri": "/etc/passwd"}}, bundle_dir=bundle)
+        resolve_query_manifest_source({"query_manifest": {"source_type": "external_file", "source_uri": "/etc/passwd"}}, bundle_dir=bundle)
 
 
 def test_legacy_config_queries_still_write_query_meta(tmp_path):
@@ -360,24 +359,8 @@ def test_duckdb_skips_aggregate_auxiliary_directory(tmp_path):
     assert rows == []
 
 
-def test_tool_api_build_dashboard_true_and_seed_requires_manifest(tmp_path):
-    pytest.importorskip("duckdb")
+def test_public_api_seed_requires_explicit_manifest_path(tmp_path):
     study, _, manifest, config, _ = _build_external_job(tmp_path)
-
-    result = run_geo_monitor(
-        config_path=config,
-        study_dir=study,
-        query_manifest_path=manifest,
-        mock=True,
-        build_db=True,
-        build_dashboard=True,
-    )
-
-    assert result.dashboard_path
-    assert Path(result.dashboard_path).exists()
-    html = Path(result.dashboard_path).read_text(encoding="utf-8")
-    for text in ["GEO Monitor Dashboard", "Overview", "Runs", "Comparison Cohorts", "Quality", "Top Brands"]:
-        assert text in html
 
     try:
         run_geo_monitor(config_path=config, study_dir=study, seed_prompts_path=study / "seed_prompts.yaml", mock=True)
@@ -385,30 +368,6 @@ def test_tool_api_build_dashboard_true_and_seed_requires_manifest(tmp_path):
         assert "query_manifest_path" in str(exc)
     else:
         raise AssertionError("expected ValueError")
-
-
-def test_tool_api_builds_dashboard_from_existing_db_without_rebuilding_db(tmp_path):
-    pytest.importorskip("duckdb")
-    study, _, manifest, config, _ = _build_external_job(tmp_path)
-
-    first = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_db=True)
-    assert first.db_path
-    second = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_db=False, build_dashboard=True)
-
-    assert second.db_path == first.db_path
-    assert second.dashboard_path
-    assert Path(second.dashboard_path).exists()
-
-
-def test_tool_api_build_dashboard_without_db_fails_fast(tmp_path):
-    study, _, manifest, config, _ = _build_external_job(tmp_path)
-    db = study / "geo.duckdb"
-    assert not db.exists()
-
-    with pytest.raises(ValueError, match="build_db"):
-        run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, build_db=False, build_dashboard=True)
-
-    assert not db.exists()
 
 
 def test_tool_api_fanout_force_overwrites_existing_manifest(tmp_path):
@@ -440,7 +399,6 @@ seeds:
         query_manifest_path=manifest,
         fanout_force=True,
         mock=True,
-        build_db=False,
     )
 
     assert result.metrics["fanout"]["action"] == "overwritten"
@@ -480,7 +438,6 @@ personas:
         query_manifest_path=manifest,
         persona_template_registry_path=registry,
         mock=True,
-        build_db=False,
     )
     bundle = Path(result.artifact_paths["bundle_dir"])
     raw_rows = read_jsonl(bundle / "raw" / "attempts.jsonl")
@@ -531,7 +488,6 @@ seeds:
         query_manifest_path=manifest,
         fanout_force=False,
         mock=True,
-        build_db=False,
     )
 
     assert result.metrics["fanout"]["action"] == "reused"
@@ -541,7 +497,7 @@ seeds:
 def test_tool_api_status_matches_partial_cleaned_manifest(tmp_path):
     study, _, manifest, config, _ = _build_external_job(tmp_path)
 
-    result = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, limit=1, build_db=False)
+    result = run_geo_monitor(config_path=config, study_dir=study, query_manifest_path=manifest, mock=True, limit=1)
     final_manifest = json.loads((Path(result.artifact_paths["bundle_dir"]) / "job_manifest.json").read_text(encoding="utf-8"))
 
     assert result.status == final_manifest["status"]

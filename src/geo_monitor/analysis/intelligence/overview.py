@@ -26,15 +26,15 @@ def compute_overview_scores(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for source in rows:
         row = dict(source)
-        mention = _ratio(row, "mention_rate", "response_mention_rate") or 0.0
-        query_coverage = _ratio(row, "query_coverage_rate", "query_coverage") or 0.0
+        mention = _ratio(row, "response_mention_rate") or 0.0
+        query_coverage = _ratio(row, "query_coverage_rate") or 0.0
         rank = _rank_score(row)
         top3 = _ratio(row, "top3_rate")
         prominence = _ratio(row, "prominence_score")
         if prominence is None:
             prominence = mean([top3, rank])
         prominence = prominence or 0.0
-        sov = _ratio(row, "sov_response_share", "sov_event_share", "sov_score") or 0.0
+        sov = _ratio(row, "sov_response_share", "sov_score") or 0.0
         visibility_components = {
             "mention_rate": mention,
             "query_coverage": query_coverage,
@@ -44,7 +44,7 @@ def compute_overview_scores(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         visibility = sum(VISIBILITY_WEIGHTS[name] * value for name, value in visibility_components.items())
 
-        conversion = _ratio(row, "recommendation_conversion", "recommended_rate_when_mentioned", "recommended_rate")
+        conversion = _ratio(row, "recommendation_conversion", "recommended_rate_when_mentioned")
         weighted = _ratio(row, "weighted_recommendation_score", "weighted_recommendation_strength")
         recommendation_values = [value for value in (conversion, weighted) if value is not None]
         recommendation = mean(recommendation_values)

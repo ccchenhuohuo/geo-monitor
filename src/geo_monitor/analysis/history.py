@@ -7,9 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..config import workspace_root
-from ..db import validate_analysis_commit
-from ..job import RUNS_DIR
+from ..jobs.layout import runs_root_for_bundle
+from .artifact_commit import validate_analysis_commit
 
 
 def load_intelligence_history(
@@ -19,7 +18,7 @@ def load_intelligence_history(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Load only committed, comparable sibling analyses."""
 
-    runs_root = _runs_root_for_bundle(bundle_dir)
+    runs_root = runs_root_for_bundle(bundle_dir)
     overview_rows: list[dict[str, Any]] = []
     visibility_rows: list[dict[str, Any]] = []
     if not runs_root.exists():
@@ -69,17 +68,6 @@ def _comparable_history_run(
         str(current_profile.get(key) or "") == str(sibling_profile.get(key) or "")
         for key in ("study_fingerprint", "sampling_fingerprint", "analysis_fingerprint")
     )
-
-
-def _runs_root_for_bundle(bundle_dir: Path) -> Path:
-    if bundle_dir.parent.name in {RUNS_DIR, "runs"}:
-        return bundle_dir.parent
-    project_runs = workspace_root() / RUNS_DIR
-    try:
-        bundle_dir.resolve().relative_to(project_runs.resolve())
-        return project_runs
-    except (OSError, ValueError):
-        return bundle_dir.parent / RUNS_DIR
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:

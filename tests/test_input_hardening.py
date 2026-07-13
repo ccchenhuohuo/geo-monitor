@@ -3,10 +3,8 @@ import json
 
 import pytest
 
-import geo_monitor.dashboard as dashboard_module
 from geo_monitor.adapters import build_sampling_profile, get_adapter
 from geo_monitor.config import Settings
-from geo_monitor.dashboard import DashboardError, build_dashboard
 from geo_monitor.dataset import DatasetError, load_queries
 from geo_monitor.fanout import FanoutError, build_query_manifest
 from geo_monitor.renderers import render_html
@@ -138,27 +136,3 @@ def test_html_renderer_escapes_report_model_text_once():
     assert "<script>" not in rendered
     assert "&amp;lt;script&amp;gt;" not in rendered
     assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt; &amp; copy" in rendered
-
-
-def test_dashboard_missing_db_does_not_create_output_directory(tmp_path):
-    out = tmp_path / "nested" / "dashboard"
-
-    with pytest.raises(DashboardError, match="DuckDB 不存在"):
-        build_dashboard(tmp_path / "missing.duckdb", out)
-
-    assert not out.exists()
-    assert not out.parent.exists()
-
-
-def test_dashboard_render_failure_removes_new_empty_output_directory(tmp_path, monkeypatch):
-    out = tmp_path / "dashboard"
-    monkeypatch.setattr(dashboard_module, "_load_dashboard_data", lambda db: {})
-
-    def fail_render(data):
-        raise RuntimeError("render failed")
-
-    monkeypatch.setattr(dashboard_module, "_render_html", fail_render)
-    with pytest.raises(RuntimeError, match="render failed"):
-        build_dashboard(tmp_path / "unused.duckdb", out)
-
-    assert not out.exists()

@@ -1,7 +1,7 @@
 [project]
 name = "geo-monitor"
-version = "0.1.0"
-description = "OpenAI-compatible Responses API GEO monitoring MVP"
+version = "0.2.0"
+description = "Audit-first GEO analysis and report engine for OpenAI-compatible APIs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -26,7 +26,6 @@ dependencies = [
   "rich>=13.7.0",
   "tenacity>=8.2.0",
   "PyYAML>=6.0.0",
-  "duckdb>=1.0.0,<2",
   "reportlab>=4.2.0,<5",
 ]
 
@@ -36,6 +35,9 @@ Repository = "https://github.com/ccchenhuohuo/geo-monitor"
 Issues = "https://github.com/ccchenhuohuo/geo-monitor/issues"
 
 [project.optional-dependencies]
+duckdb = [
+  "duckdb>=1.0.0,<2",
+]
 dev = [
   "build>=1.2.0,<2",
   "pytest>=8.0.0,<10",
@@ -52,14 +54,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-geo_monitor = [
-  "data/*.json",
-  "examples/*.json",
-  "examples/*.yaml",
-  "docs/*.md",
-]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

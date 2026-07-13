@@ -11,10 +11,10 @@ from uuid import uuid4
 from .adapters import OpenAICompatibleClientFactory, ProviderRequest, build_sampling_profile, get_adapter
 from .config import Settings, redact_secret
 from .exporters import append_jsonl, successful_result_hashes
-from .llm_client import retry_api_call
 from .mock_client import build_mock_response
 from .query_meta import query_record_meta
 from .request_fingerprint import base_url_fingerprint, legacy_payload_hash
+from .resilience import retry_api_call
 from .schemas import ErrorRecord, MonitorResult, QueryRecord, utc_now_iso
 
 RepeatOrder = Literal["round-robin", "grouped"]

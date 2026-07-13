@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from .adapters import OpenAICompatibleClientFactory, build_sampling_profile, get_adapter
 from .config import Settings, redact_secret
-from .llm_client import retry_api_call
+from .resilience import retry_api_call
 from .response_parser import parse_response, response_to_dict
 from .schemas import QueryRecord, utc_now_iso
 

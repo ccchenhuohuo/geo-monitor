@@ -12,12 +12,9 @@ from geo_monitor.analysis.cache import (
     raw_names_hash,
     response_text_hash,
 )
-from geo_monitor.analysis.pipeline import (
-    EXTRACTION_SCHEMA_VERSION,
-    _estimate_live_cache_requests,
-    _extract_mentions,
-    _validate_analysis_runtime_profile,
-)
+from geo_monitor.analysis.contracts import EXTRACTION_SCHEMA_VERSION
+from geo_monitor.analysis.extraction import estimate_live_cache_requests, extract_mentions
+from geo_monitor.analysis.orchestrator import _validate_analysis_runtime_profile
 from geo_monitor.api import run_geo_monitor
 from geo_monitor.brand_extraction import LLMBrandExtractor
 from geo_monitor.config import Settings
@@ -124,7 +121,7 @@ def test_malformed_extraction_cache_is_a_miss_and_never_trusted(tmp_path):
         encoding="utf-8",
     )
 
-    result = _estimate_live_cache_requests(
+    result = estimate_live_cache_requests(
         logs,
         [record],
         extractor_model="test-model",
@@ -171,7 +168,7 @@ def test_incomplete_canonicalization_cache_is_not_accepted(tmp_path):
         encoding="utf-8",
     )
 
-    result = _estimate_live_cache_requests(
+    result = estimate_live_cache_requests(
         logs,
         [record],
         extractor_model="test-model",
@@ -190,7 +187,7 @@ def test_analysis_extraction_circuit_breaker_marks_unstarted_records(tmp_path):
     def failing_extractor(record):
         return [], {"type": "ProviderError", "message": "failed", "query_id": record["query_id"]}
 
-    _, errors, stats = _extract_mentions(
+    _, errors, stats = extract_mentions(
         records=records,
         active_extractor=failing_extractor,
         settings=Settings(max_consecutive_errors=2, max_error_rate=1.0),
@@ -271,10 +268,4 @@ def test_public_api_rejects_study_bundle_split_brain(tmp_path):
             bundle_dir=bundle,
             study_dir=tmp_path / "study-b",
             dry_run=True,
-            build_db=False,
         )
-
-
-def test_packaged_and_source_job_schemas_are_identical():
-    root = __import__("pathlib").Path(__file__).resolve().parents[1]
-    assert (root / "data" / "job_config.schema.json").read_bytes() == (root / "src" / "geo_monitor" / "data" / "job_config.schema.json").read_bytes()

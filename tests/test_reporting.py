@@ -3,17 +3,14 @@ import json
 import pytest
 
 import geo_monitor.reporting as reporting_module
-from geo_monitor.renderers import render_html
+from geo_monitor.renderers import markdown_text, render_html, table_cell
 from geo_monitor.renderers.pdf import PdfRenderError
 from geo_monitor.report_builder import build_report_model
 from geo_monitor.report_model import REPORT_MODEL_SCHEMA_VERSION
 from geo_monitor.reporting import (
     ReportRenderError,
-    build_job_markdown,
-    markdown_text,
     normalize_report_formats,
     render_report_bundle,
-    table_cell,
 )
 
 
@@ -27,7 +24,7 @@ def _summary() -> dict:
         "brand_summary": [
             {
                 "brand_name_canonical": "TestBrand",
-                "sov_event_share": "100.0%",
+                "sov_response_share": "100.0%",
                 "query_coverage_rate": "100.0%",
                 "sov_rank": 1,
                 "response_mention_rate": "100.0%",
@@ -36,7 +33,7 @@ def _summary() -> dict:
         ],
         "target_diagnosis": {
             "target_detected": True,
-            "target_sov_event_share": "100.0%",
+            "target_sov_response_share": "100.0%",
             "target_rank_by_sov": 1,
             "target_query_coverage_rate": "100.0%",
             "missing_queries": [],
@@ -48,7 +45,7 @@ def _summary() -> dict:
         "expected_repeats": 1,
         "expected_units": 1,
         "extracted_mention_count": 1,
-        "extraction_error_count": 0,
+        "extraction_error_record_count": 0,
         "data_quality": {"conclusion_strength": "strong", "partial_sample": False, "planned_units": 1},
         "source_domains": [],
         "brand_by_query": [],
@@ -103,7 +100,9 @@ def test_markdown_and_html_render_same_report_model_without_raw_html():
     summary["title"] = "<script>bad</script>"
     summary["brand_summary"][0]["brand_name_canonical"] = "<img src=x onerror=alert(1)>"
 
-    markdown = build_job_markdown(summary)
+    from geo_monitor.renderers import render_markdown
+
+    markdown = render_markdown(build_report_model(summary))
     html = render_html(build_report_model(summary))
 
     assert "<script>" not in markdown

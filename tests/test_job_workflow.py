@@ -4,15 +4,15 @@ from pathlib import Path
 
 import pytest
 
+from geo_monitor.analysis import analyze_job_bundle
 from geo_monitor.analysis.cache import extraction_cache_key, response_text_hash
-from geo_monitor.analysis.pipeline import EXTRACTION_SCHEMA_VERSION
+from geo_monitor.analysis.contracts import CSV_FIELD_SCHEMAS, EXTRACTION_SCHEMA_VERSION
 from geo_monitor.config import Settings
 from geo_monitor.db import build_duckdb, query_duckdb
 from geo_monitor.exporters import read_jsonl
 from geo_monitor.job import (
     BUNDLE_LOCK,
     JobError,
-    _job_lock,
     build_job_bundle,
     cleanup_job_bundle,
     estimate_job_run,
@@ -20,7 +20,7 @@ from geo_monitor.job import (
     run_job_bundle,
     validate_job_config,
 )
-from geo_monitor.job_analysis import CSV_FIELD_SCHEMAS, analyze_job_bundle
+from geo_monitor.jobs.locking import JobBundleLock
 from geo_monitor.runner import compute_request_hash
 
 
@@ -166,6 +166,32 @@ def test_validate_job_config_reports_planned_units(tmp_path):
     assert result["query_count"] == 2
     assert result["planned_units"] == 4
     assert result["market"] == "TestMarket"
+
+
+def test_build_and_validate_job_share_canonical_config_resolution(tmp_path):
+    config_path = tmp_path / "job_config.json"
+    _write_job_config(config_path)
+
+    validated = validate_job_config(config_path, settings=Settings(llm_api_key=None))
+    built = build_job_bundle(config_path, tmp_path / "bundle", settings=Settings(llm_api_key=None))
+
+    shared_keys = {
+        "target_brand",
+        "target_aliases",
+        "owned_domains",
+        "industry",
+        "market",
+        "repeats",
+        "model",
+        "web_search_limit",
+        "adapter",
+        "sampling_profile",
+        "analysis_profile",
+        "comparability_profile",
+        "concurrency",
+        "start_interval_seconds",
+    }
+    assert {key: validated[key] for key in shared_keys} == {key: built[key] for key in shared_keys}
 
 
 def test_build_job_preserves_query_metadata_and_target_aliases(tmp_path):
@@ -377,17 +403,12 @@ def test_build_job_allows_missing_market(tmp_path):
     assert "未指定市场" not in query_manifest
 
 
-def test_build_job_defaults_to_runs_root(tmp_path, monkeypatch):
+def test_build_job_requires_explicit_output_root(tmp_path):
     config_path = tmp_path / "job_config.json"
     _write_job_config(config_path)
-    monkeypatch.chdir(tmp_path)
 
-    result = build_job_bundle(config_path, settings=Settings(llm_api_key=None))
-
-    bundle = Path(result["bundle_dir"])
-    assert bundle.parent == tmp_path / ".runs"
-    assert bundle.name.startswith("job_")
-    assert (bundle / "work" / "query_manifest.csv").exists()
+    with pytest.raises(JobError, match="--out-dir.*--runs-dir"):
+        build_job_bundle(config_path, settings=Settings(llm_api_key=None))
 
 
 def test_run_job_mock_uses_only_query_text_in_raw_request(tmp_path):
@@ -549,7 +570,7 @@ def test_bundle_lock_blocks_run_analyze_and_cleanup(tmp_path):
     bundle = tmp_path / "bundle"
     _write_job_config(config_path)
     build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
-    with _job_lock(bundle / BUNDLE_LOCK):
+    with JobBundleLock(bundle / BUNDLE_LOCK):
         for action in [
             lambda: run_job_bundle(bundle, mock=True, settings=Settings(llm_api_key=None)),
             lambda: analyze_job_bundle(bundle, settings=Settings(llm_api_key=None)),
@@ -569,7 +590,7 @@ def test_build_job_force_respects_bundle_lock(tmp_path):
     _write_job_config(config_path)
     build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None))
 
-    with _job_lock(bundle / BUNDLE_LOCK):
+    with JobBundleLock(bundle / BUNDLE_LOCK):
         try:
             build_job_bundle(config_path, bundle, settings=Settings(llm_api_key=None), force=True)
         except JobError as exc:
@@ -771,7 +792,9 @@ def test_analyze_job_with_injected_extractor_does_not_need_alias(tmp_path):
     assert (bundle / "result" / "report.md").exists()
     assert (bundle / "logs" / "analysis_summary.json").exists()
     assert result["brand_summary"][0]["brand_name_canonical"] == "TestStudio"
-    assert (bundle / "result" / "sov_summary.csv").exists()
+    assert (bundle / "result" / "brand_summary.csv").exists()
+    assert not (bundle / "result" / "sov_summary.csv").exists()
+    assert not (bundle / "result" / "discovered_brands.csv").exists()
     assert "Brand Visibility / SOV" in (bundle / "result" / "report.md").read_text(encoding="utf-8")
 
 
@@ -944,7 +967,7 @@ def test_analyze_job_reuses_live_extraction_and_canonicalization_cache(tmp_path,
             calls["canonicalize"] += 1
             return {name: name for name in names}, None
 
-    monkeypatch.setattr("geo_monitor.analysis.pipeline.LLMBrandExtractor", FakeLLMBrandExtractor)
+    monkeypatch.setattr("geo_monitor.analysis.orchestrator.LLMBrandExtractor", FakeLLMBrandExtractor)
 
     first = analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
     second = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None))
@@ -1008,7 +1031,7 @@ def test_analyze_job_cache_invalidates_when_response_text_changes(tmp_path, monk
         def canonicalize(self, names):
             return {name: name for name in names}, None
 
-    monkeypatch.setattr("geo_monitor.analysis.pipeline.LLMBrandExtractor", FakeLLMBrandExtractor)
+    monkeypatch.setattr("geo_monitor.analysis.orchestrator.LLMBrandExtractor", FakeLLMBrandExtractor)
     analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
     row["response_text"] = "ChangedBrand is mentioned."
     _make_contract_valid(row)
@@ -1086,7 +1109,7 @@ def test_extraction_cache_rebinds_record_context_for_identical_response_text(tmp
             calls["canonicalize"] += 1
             return {name: name for name in names}, None
 
-    monkeypatch.setattr("geo_monitor.analysis.pipeline.LLMBrandExtractor", FakeLLMBrandExtractor)
+    monkeypatch.setattr("geo_monitor.analysis.orchestrator.LLMBrandExtractor", FakeLLMBrandExtractor)
 
     result = analyze_job_bundle(bundle, settings=_live_test_settings(), confirm_cost=True)
 
@@ -1254,7 +1277,7 @@ def test_analyze_job_logs_traceability_quarantine_rows(tmp_path):
     assert result["data_quality"]["extraction_error_record_count"] == 1
     assert result["data_quality"]["extraction_error_row_count"] == 3
     assert result["data_quality"]["extraction_error_rate"] == "100.0%"
-    assert result["extraction_error_count"] == 1
+    assert result["extraction_error_record_count"] == 1
     assert result["extraction_error_row_count"] == 3
     assert len(errors) == 3
     assert errors[0]["brand_name_raw"] == "HallucinatedBrandA"
@@ -1383,18 +1406,22 @@ def test_analyze_job_computes_sov_and_upserts_cross_job_aggregates(tmp_path):
             }
         ], None
 
+    (bundle / "result" / "discovered_brands.csv").write_text("legacy\n", encoding="utf-8")
+    (bundle / "result" / "sov_summary.csv").write_text("legacy\n", encoding="utf-8")
+
     first = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor, write_aggregates=True)
     second = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor, write_aggregates=True)
 
     target = next(row for row in second["brand_summary"] if row["brand_name_canonical"] == "TestAEntity")
     assert target["sov_response_share"] == "50.0%"
-    assert target["sov_event_share"] == "50.0%"
     assert target["recommended_rate_when_mentioned"] == "50.0%"
     assert target["recommended_rate_over_success"] == "33.3%"
     assert target["avg_rank_position"] == 1
     assert second["target_diagnosis"]["target_rank_by_sov"] == 1
     assert second["target_diagnosis"]["target_sov_gap_to_leader"] == "0.0pp"
-    assert (bundle / "result" / "sov_summary.csv").exists()
+    assert (bundle / "result" / "brand_summary.csv").exists()
+    assert not (bundle / "result" / "discovered_brands.csv").exists()
+    assert not (bundle / "result" / "sov_summary.csv").exists()
 
     index_rows = read_jsonl(runs_root / "index.jsonl")
     assert len(index_rows) == 1
@@ -1404,7 +1431,6 @@ def test_analyze_job_computes_sov_and_upserts_cross_job_aggregates(tmp_path):
     target_trends = _read_csv(runs_root / "aggregate" / "target_brand_trends.csv")
     assert len(target_trends) == 1
     assert target_trends[0]["sov_response_share"] == "50.0%"
-    assert target_trends[0]["sov_event_share"] == "50.0%"
     assert "neutral_rate" in target_trends[0]
     assert "target_sov_gap_to_leader" in target_trends[0]
 
@@ -1444,7 +1470,8 @@ def test_cross_job_brand_trends_has_stable_header_when_no_brands(tmp_path):
 
     header = (runs_root / "aggregate" / "brand_trends.csv").read_text(encoding="utf-8-sig").splitlines()[0]
     assert "job_id" in header
-    assert "sov_event_share" in header
+    assert "sov_response_share" in header
+    assert "sov_event_share" not in header
     assert header != "empty"
 
 
@@ -1534,7 +1561,7 @@ def test_analyze_job_uses_target_aliases_and_filters_source_entities(tmp_path):
 
     result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
 
-    assert result["target_brand_detected"] is True
+    assert result["target_detected"] is True
     assert [row["brand_name_canonical"] for row in result["brand_summary"]] == ["TestAEntity"]
     source_mentions = _read_csv(bundle / "result" / "source_entity_mentions.csv")
     assert source_mentions[0]["brand_name_raw"] == "TestSourceEntity"
@@ -1599,7 +1626,7 @@ def test_target_alias_canonicalization_merges_entire_llm_group(tmp_path):
     result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor, canonicalizer=canonicalizer)
 
     assert [row["brand_name_canonical"] for row in result["brand_summary"]] == ["TestAEntity"]
-    assert result["brand_summary"][0]["response_mention_count"] == 1
+    assert result["brand_summary"][0]["responses_mentioned"] == 1
 
 
 def test_analyze_job_dedupes_canonical_brand_event_within_response(tmp_path):
@@ -2165,7 +2192,7 @@ def test_analyze_job_downgrades_on_extraction_errors(tmp_path):
     result = analyze_job_bundle(bundle, settings=Settings(llm_api_key=None), extractor=extractor)
 
     assert result["data_quality"]["conclusion_strength"] == "observational"
-    assert result["data_quality"]["extraction_error_count"] == 1
+    assert result["data_quality"]["extraction_error_record_count"] == 1
     report = (bundle / "result" / "report.md").read_text(encoding="utf-8")
     assert "抽取质量不足" in report
     header = (bundle / "result" / "brand_summary.csv").read_text(encoding="utf-8-sig").splitlines()[0]

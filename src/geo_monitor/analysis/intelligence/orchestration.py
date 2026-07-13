@@ -63,7 +63,7 @@ INTELLIGENCE_BASE_FIELDS: dict[str, list[str]] = {
         "quality_score",
         "completed_at",
     ],
-    "visibility_summary": ["job_id", "brand_name_canonical", "response_mention_rate", "query_coverage_rate", "sov_event_share", "eligible_attempts"],
+    "visibility_summary": ["job_id", "brand_name_canonical", "response_mention_rate", "query_coverage_rate", "sov_response_share", "eligible_attempts"],
     "recommendations": ["job_id", "query_id", "repeat_index", "attempt_id", "brand_name_canonical", "recommendation_type", "evidence", "confidence"],
     "recommendation_summary": [
         "job_id",
@@ -536,14 +536,12 @@ def _visibility_rows(
             {
                 "brand_name_canonical": target,
                 "is_target_brand": 1,
-                "target_brand_detected": 0,
                 "responses_mentioned": 0,
                 "response_mention_rate": "0.0%",
                 "query_coverage_count": 0,
                 "query_coverage_rate": "0.0%",
                 "query_macro_mention_rate": "0.0%",
                 "sov_response_share": "0.0%",
-                "sov_event_share": "0.0%",
                 "top3_rate": "0.0%",
                 "avg_rank_position": "",
                 "sentiment_observed_rate": None,

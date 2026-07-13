@@ -9,12 +9,12 @@ reports.
 It is designed as an engine, CLI, Python package, and agent/tool building block.
 It is **not** a GEO SaaS product, not a scheduler, and not a data warehouse. The
 repository contains reusable engine code only; business queries, brand data, raw
-runs, and optional DuckDB/dashboard artifacts belong in a user-owned external
+runs and optional DuckDB artifacts belong in a user-owned external
 study workspace.
 
 ## Project Status
 
-Early engine. The core workflow is usable locally:
+Version 0.2 is a stabilized local engine with a report-first core:
 
 - persona fan-out to frozen query manifests;
 - job-based sampling with raw JSONL audit logs;
@@ -23,10 +23,31 @@ Early engine. The core workflow is usable locally:
 - an explainable intelligence layer for overview, competitor, citation,
   situation, perception, trends, and rule-based opportunities;
 - Markdown and PDF reports rendered from one versioned report model;
-- optional rebuildable DuckDB cache and static HTML views;
+- optional rebuildable DuckDB cache and ReportModel-derived static HTML;
 - embeddable Python API for Plugin / Skill / Agent workflows.
 
 Licensed under the MIT License. See [LICENSE](LICENSE).
+
+### Migrating From 0.1
+
+- Import the high-level API from `geo_monitor`, not the removed
+  `geo_monitor.tool` compatibility path.
+- Import advanced analysis entry points from `geo_monitor.analysis`, not
+  `geo_monitor.job_analysis` or the removed pipeline module.
+- Replace `build_dashboard=True` with `report_formats=("markdown", "pdf",
+  "html")` or CLI `--html-report`.
+- Build DuckDB explicitly through `geo-monitor db build` after installing
+  `geo-monitor[duckdb]`; it is no longer part of `run_geo_monitor`.
+- Pass either `--runs-dir` or `--out-dir` to `build-job`; 0.2 no longer writes
+  an implicit repository-local `.runs` workspace.
+- Use the canonical `brand_summary.csv` contract. Duplicate
+  `discovered_brands.csv` / `sov_summary.csv` outputs and synonymous metric
+  aliases were removed; re-analysis also deletes those stale files.
+- Wheel installs no longer contain duplicated source docs/examples. Use the
+  repository or sdist for those files.
+
+Existing `geo-job-v1`/`v2` bundles and legacy request hashes remain readable so
+historical paid samples and resumable runs are not discarded.
 
 ## What It Does
 
@@ -60,8 +81,8 @@ Responses API under a controlled query manifest.
   the same versioned semantic model.
 - **Explainable intelligence**: five independent overview scores, explicit
   denominators/N-A semantics, macro-by-query segments, and traceable gap tables.
-- **Optional analysis extensions**: DuckDB, cross-run aggregates, and static
-  HTML are opt-in and remain outside the core reporting path.
+- **Optional analysis extensions**: DuckDB, cross-run aggregates, and
+  ReportModel-derived HTML are opt-in and remain outside the core path.
 - **Python API**: structured result object for external agents and workflows.
 
 ## Architecture
@@ -92,7 +113,7 @@ flowchart LR
 
     Raw -. "optional" .-> DuckDB["geo.duckdb<br/>external analysis cache"]
     CSV -. "optional" .-> DuckDB
-    DuckDB -.-> Dashboard["optional static dashboard"]
+    DuckDB -.-> DBAPI["explicit SQL / Python analysis"]
     Report --> API2["people / Python API / agent tools"]
 ```
 
@@ -115,7 +136,6 @@ study workspace
   manifests/query_manifest.v1.csv
   runs/{job_id}/...
   geo.duckdb             # optional
-  dashboard/             # optional
 ```
 
 `work/query_manifest.csv` may be deleted after execution. Long-term analysis is
@@ -126,7 +146,7 @@ custom manifest metadata preserved in `query_metadata_json`.
 
 A job is a single-adapter experiment. A cross-provider study is a set of sibling
 jobs over the same frozen `query_manifest.csv`; comparison strength is computed
-later in DuckDB/dashboard cohorts using provider, adapter, API family, sampling
+later in DuckDB cohorts using provider, adapter, API family, sampling
 fingerprint, and analysis fingerprint.
 
 For real studies, prefer a directory outside the repository. The repository also
@@ -215,8 +235,8 @@ The primary outputs are:
 ```
 
 Add `--html-report` only when a temporary self-contained HTML report is useful.
-DuckDB and the separate static dashboard are optional extensions described
-below; neither is created by the default workflow.
+DuckDB is an optional extension described below and is not created by the
+default workflow.
 
 ## Live API Configuration
 
@@ -392,11 +412,9 @@ runs/{job_id}/
     raw_read_errors.jsonl
     cleanup_summary.json
   result/
-    discovered_brands.csv
     brand_mentions_extracted.csv
     brand_canonical_map.csv
     brand_summary.csv
-    sov_summary.csv
     brand_by_query.csv
     query_stability.csv
     source_entity_mentions.csv
@@ -465,7 +483,7 @@ self-contained; use `run_geo_monitor(..., write_aggregates=True)` when needed.
 flowchart LR
     RawAnswer["response_text"] --> Mentions["brand/entity mentions"]
     Mentions --> Eligible{"SOV eligible?"}
-    Eligible -->|yes| BrandMetrics["brand_summary.csv<br/>sov_summary.csv"]
+    Eligible -->|yes| BrandMetrics["brand_summary.csv"]
     Eligible -->|no| SourceEntities["source_entity_mentions.csv"]
     BrandMetrics --> QueryMetrics["brand_by_query.csv<br/>query_stability.csv"]
     RawAnswer --> Sources["source URLs/domains"]
@@ -475,14 +493,12 @@ flowchart LR
 
 See [docs/metrics.md](docs/metrics.md) for metric denominators, latest-terminal
 attempt semantics, mock/live rules, partial-sample caveats, denominator facts,
-and the current compatible meaning of `sov_event_share`.
+and the response-grain meaning of `sov_response_share`.
 
 Current metrics include:
 
 - **Mention rate**: responses mentioning a brand / successful responses.
 - **SOV response share**: responses mentioning a brand / all brand response hits.
-- **SOV event share**: currently compatible with SOV response share; reserved
-  for a future true event-grain migration.
 - **Query coverage**: queries where a brand appeared / planned query count.
 - **Recommendation rates**: recommendation signals over mentions and samples.
 - **Rank signals**: observed ranks, average rank, and top-3 presence.
@@ -504,10 +520,16 @@ carries its eligible/planned denominator and trace IDs. See
 [docs/intelligence.md](docs/intelligence.md) for formulas, all stable CSV names,
 eligibility gates, N/A rules, and interpretation limits.
 
-## Optional DuckDB And Dashboard
+## Optional DuckDB
 
 DuckDB is an opt-in, rebuildable analysis cache. It does not replace raw JSONL
 and is not required to generate reports.
+
+Install the extension explicitly:
+
+```bash
+pip install "geo-monitor[duckdb]"
+```
 
 ```bash
 geo-monitor db build --runs ./study/runs --output ./study/geo.duckdb
@@ -530,17 +552,8 @@ exposed as read-only views named after each CSV stem (for example,
 `geo_overview_scores`, `visibility_by_persona`, and `competitor_edges`). The DB
 builder ignores stale or generation-mismatched analysis files.
 
-Build a static dashboard:
-
-```bash
-geo-monitor dashboard build \
-  --db ./study/geo.duckdb \
-  --out ./study/dashboard
-```
-
-The dashboard is a secondary static HTML export. It does not require a backend
-service, login, React/Vue app, or hosted database, and it is intentionally not
-part of the default report workflow.
+Temporary HTML is generated directly from the same `ReportModel` as Markdown
+and PDF via `analyze-job --html-report`; there is no separate dashboard stack.
 
 ## Python API
 
@@ -561,14 +574,13 @@ print(result.artifact_paths)
 
 High-level API calls require either `study_dir` or `runs_dir`. Explicit paths
 win. `query_manifest_path` is never guessed from a study directory.
-`geo_monitor.api` is the canonical implementation module; `geo_monitor` re-
-exports it for convenience. `geo_monitor.tool` remains available only as a
-backward-compatible import shim.
+`geo_monitor.api` is the canonical implementation module; `geo_monitor`
+re-exports it for convenience. Removed 0.1 compatibility import paths are not
+part of the 0.2 API.
 
-Installed wheels include packaged copies of the job config schema, examples,
-metrics reference, and Simplified Chinese README under `geo_monitor/data`,
-`geo_monitor/examples`, and `geo_monitor/docs`. Source checkouts can keep using
-the top-level `data/`, `examples/`, and `docs/` paths shown above.
+Schemas, examples, and reference documents have one source of truth in the
+top-level `data/`, `examples/`, and `docs/` directories and are included in the
+source distribution. Wheels contain runtime code only.
 
 ## CLI Reference
 
@@ -582,7 +594,6 @@ analyze-job
 cleanup-job
 export-csv
 db build / db inspect / db query
-dashboard build
 ```
 
 ## Repository Layout
@@ -590,25 +601,32 @@ dashboard build
 ```text
 src/geo_monitor/
   cli.py                 # public CLI commands
+  api.py                 # stable public Python API
   config.py              # runtime settings and workspace root
   dataset.py             # query manifest loading
   fanout.py              # seed prompt -> persona query manifest
-  job.py                 # build/run/cleanup job lifecycle
+  job.py                 # stable job facade and lifecycle orchestration
+  jobs/                  # job contracts, validated config, manifests, layout, locks, cleanup
   runner.py              # repeated sampling, resume, concurrency
-  analysis/              # orchestration, stable contracts, history adapter
+  analysis/              # report-analysis pipeline
+    orchestrator.py      # coordinates one analysis transaction
+    extraction.py        # extraction and canonicalization flow
+    brand_metrics.py     # brand, query, and target metrics
+    denominator_facts.py # attempt/query quality denominator facts
+    source_metrics.py    # source domain and URL metrics
+    quality.py           # sample and extraction quality gates
+    artifacts.py         # atomic CSV/JSON artifact writes
     intelligence/        # pure overview/recommendation/competitor/gap functions
   report_model.py        # versioned renderer-neutral report contract
   report_builder.py      # analysis summary -> ReportModel
   renderers/             # Markdown, PDF, optional static HTML
-  job_analysis.py        # compatibility facade for analysis imports
   brand_extraction.py    # LLM extraction schema and canonicalization
   response_parser.py     # response text/source parsing
   exporters.py           # JSONL/CSV utilities
   reporting.py           # small report bundle facade
-  db.py                  # optional DuckDB analysis cache
-  dashboard.py           # optional legacy static dashboard
-  api.py                 # stable public Python API implementation
-  tool.py                # backward-compatible API import shim
+  db.py                  # stable optional DuckDB facade
+  duckdb_store/          # lazy DuckDB schema, ingest, and query internals
+  resilience.py          # shared retry policy
 
 data/
   job_config.schema.json
